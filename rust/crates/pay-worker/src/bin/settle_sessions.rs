@@ -470,10 +470,14 @@ impl SettlementRuntime {
                 "PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS",
                 DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS,
             )?);
-            let snapshot_max_age = Duration::from_secs(parse_u64_env(
+            let snapshot_max_age_seconds = require_positive_u64(
                 "PAY_X402_SNAPSHOT_MAX_AGE_SECS",
-                DEFAULT_X402_SNAPSHOT_MAX_AGE_SECONDS,
-            )?);
+                parse_u64_env(
+                    "PAY_X402_SNAPSHOT_MAX_AGE_SECS",
+                    DEFAULT_X402_SNAPSHOT_MAX_AGE_SECONDS,
+                )?,
+            )?;
+            let snapshot_max_age = Duration::from_secs(snapshot_max_age_seconds);
             let reconciliation_concurrency = parse_u64_env(
                 "PAY_X402_RECONCILIATION_CONCURRENCY",
                 DEFAULT_X402_RECONCILIATION_CONCURRENCY,
@@ -2317,6 +2321,15 @@ fn parse_u64_env(name: &str, default: u64) -> Result<u64, JobError> {
     }
 }
 
+fn require_positive_u64(name: &str, value: u64) -> Result<u64, JobError> {
+    if value == 0 {
+        return Err(JobError::Config(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    Ok(value)
+}
+
 fn parse_optional_positive_u64_env(name: &str) -> Result<Option<u64>, JobError> {
     let Some(value) = optional_env(name) else {
         return Ok(None);
@@ -2398,6 +2411,19 @@ mod tests {
             schema_version: pay_kit::mpp::CHANNEL_STATE_SCHEMA_VERSION,
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn snapshot_max_age_must_be_positive() {
+        let error = require_positive_u64("PAY_X402_SNAPSHOT_MAX_AGE_SECS", 0).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "config error: PAY_X402_SNAPSHOT_MAX_AGE_SECS must be greater than zero"
+        );
+        assert_eq!(
+            require_positive_u64("PAY_X402_SNAPSHOT_MAX_AGE_SECS", 30).unwrap(),
+            30
+        );
     }
 
     #[test]

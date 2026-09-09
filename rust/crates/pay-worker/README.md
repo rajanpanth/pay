@@ -49,7 +49,7 @@ hand-copied program logic or account layout.
 | `PAY_X402_SETTLE_ACTIVE_CHANNELS` | no | `false` | Include active channels with positive off-chain watermarks in every worker run. Keep false for idle-only production reconciliation; enable it for an explicitly scheduled full-fleet sweep. |
 | `PAY_X402_DISTRIBUTION_THRESHOLD_BASE_UNITS` | no | unset | Per-channel claimed-but-undistributed token balance that triggers distribution from an open channel. Must be greater than zero. Unset keeps intermediate claims in escrow; closing and sealed channels are still finalized regardless. |
 | `PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS` | no | `300` | Settle a positive residual after the channel has remained untouched for this long. Closing and sealed channels are never deferred. |
-| `PAY_X402_SNAPSHOT_MAX_AGE_SECS` | no | `30` | Maximum age of the cached on-chain state before the worker refreshes it, including fully settled channels that may have been closed directly on-chain. |
+| `PAY_X402_SNAPSHOT_MAX_AGE_SECS` | no | `30` | Maximum age of the cached on-chain state before the worker refreshes it, including fully settled channels that may have been closed directly on-chain. Must be greater than zero. |
 | `PAY_X402_RECONCILIATION_CONCURRENCY` | no | `64` | Maximum concurrent x402 on-chain reconciliation plans. Work is streamed through this bound rather than spawned all at once. |
 | `SETTLEMENT_LOCK_TTL_SECONDS` | no | `300` | TTL for each scheme's independent reconciliation lease. |
 | `RUN_ONCE` | no | `true` | Keep one-shot behavior for manual Cloud Run Job executions. Set to `false` for the continuous worker. |
