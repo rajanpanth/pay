@@ -41,11 +41,15 @@ hand-copied program logic or account layout.
 | `PAY_MPP_REDIS_URL` | one settlement store | — | MPP Redis URL shared with the gateway. At least this or `PAY_X402_REDIS_URL` is required. |
 | `PAY_MPP_REDIS_PREFIX` | no | `pay:session:v1:` | MPP session channel key namespace. |
 | `PAY_MPP_FINALIZED_RETENTION_SECONDS` | no | `604800` (7 days) | Retain a fully finalized MPP session record for reconciliation/debugging before Redis expires it. |
+| `PAY_SESSION_REDIS_URL` | no | — | Legacy fallback for `PAY_MPP_REDIS_URL`. |
+| `PAY_SESSION_REDIS_PREFIX` | no | — | Legacy fallback for `PAY_MPP_REDIS_PREFIX`. |
+| `PAY_SESSION_FINALIZED_RETENTION_SECONDS` | no | — | Legacy fallback for `PAY_MPP_FINALIZED_RETENTION_SECONDS`. |
 | `PAY_X402_REDIS_URL` | no | MPP Redis URL | x402 Redis URL shared with the gateway. |
 | `PAY_X402_REDIS_PREFIX` | no | `pay:batch:v1:` | x402 batch channel key namespace; must match the gateway. |
 | `PAY_X402_SETTLE_ACTIVE_CHANNELS` | no | `false` | Include active channels with positive off-chain watermarks in every worker run. Keep false for idle-only production reconciliation; enable it for an explicitly scheduled full-fleet sweep. |
 | `PAY_X402_DISTRIBUTION_THRESHOLD_BASE_UNITS` | no | unset | Per-channel claimed-but-undistributed token balance that triggers distribution from an open channel. Must be greater than zero. Unset keeps intermediate claims in escrow; closing and sealed channels are still finalized regardless. |
 | `PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS` | no | `300` | Settle a positive residual after the channel has remained untouched for this long. Closing and sealed channels are never deferred. |
+| `PAY_X402_SNAPSHOT_MAX_AGE_SECS` | no | `30` | Maximum age of the cached on-chain state before the worker refreshes it, including fully settled channels that may have been closed directly on-chain. |
 | `PAY_X402_RECONCILIATION_CONCURRENCY` | no | `64` | Maximum concurrent x402 on-chain reconciliation plans. Work is streamed through this bound rather than spawned all at once. |
 | `SETTLEMENT_LOCK_TTL_SECONDS` | no | `300` | TTL for each scheme's independent reconciliation lease. |
 | `RUN_ONCE` | no | `true` | Keep one-shot behavior for manual Cloud Run Job executions. Set to `false` for the continuous worker. |

@@ -1737,9 +1737,10 @@ fn pay_upto_and_retry(
 /// A one-shot CLI run has nowhere to keep a channel between invocations, so it
 /// opens one, escrows exactly this request's price, and spends it. The scheme
 /// pays off in a long-lived host — the MCP server keeps its channels for the
-/// life of the connection and amortizes one deposit over many calls. The escrow
-/// is never stranded either way: the payer can force-close and recover whatever
-/// is unspent after the advertised `withdrawDelay`.
+/// life of the connection, but currently tops up one request at a time. A
+/// larger deposit option can amortize funding transactions in a follow-up. The
+/// escrow is never stranded either way: the payer can force-close and recover
+/// whatever is unspent after the advertised `withdrawDelay`.
 fn pay_batch_and_retry(
     challenge: &x402::BatchChallenge,
     resource_url: &str,

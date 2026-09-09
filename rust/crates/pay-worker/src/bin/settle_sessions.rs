@@ -38,6 +38,7 @@ const SESSION_SETTLEMENT_LOCK_KEY: &str = "pay:jobs:settle-sessions:lock";
 const BATCH_SETTLEMENT_LOCK_KEY: &str = "pay:jobs:settle-batch:lock";
 const DEFAULT_RECONCILIATION_INTERVAL_SECONDS: u64 = 10;
 const DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS: u64 = 300;
+const DEFAULT_X402_SNAPSHOT_MAX_AGE_SECONDS: u64 = 30;
 const DEFAULT_X402_RECONCILIATION_CONCURRENCY: u64 = 64;
 const DEFAULT_PORT: u64 = 8080;
 
@@ -383,22 +384,32 @@ struct BatchRuntime {
     settle_active_channels: bool,
     distribution_threshold_base_units: Option<u64>,
     settlement_max_idle: Duration,
+    snapshot_max_age: Duration,
     reconciliation_concurrency: usize,
 }
 
 impl SettlementRuntime {
     async fn load() -> Result<Self, JobError> {
-        let session_redis_url = optional_env("PAY_MPP_REDIS_URL");
+        let session_redis_url =
+            optional_env("PAY_MPP_REDIS_URL").or_else(|| optional_env("PAY_SESSION_REDIS_URL"));
         let batch_redis_url = optional_env("PAY_X402_REDIS_URL");
         if session_redis_url.is_none() && batch_redis_url.is_none() {
             return Err(JobError::Config(
-                "PAY_MPP_REDIS_URL or PAY_X402_REDIS_URL is required".into(),
+                "PAY_MPP_REDIS_URL, PAY_SESSION_REDIS_URL, or PAY_X402_REDIS_URL is required"
+                    .into(),
             ));
         }
-        let finalized_retention = Duration::from_secs(parse_u64_env(
-            "PAY_MPP_FINALIZED_RETENTION_SECONDS",
-            DEFAULT_FINALIZED_CHANNEL_RETENTION.as_secs(),
-        )?);
+        let finalized_retention_seconds = match optional_env("PAY_MPP_FINALIZED_RETENTION_SECONDS")
+        {
+            Some(value) => value.parse().map_err(|_| {
+                JobError::Config("PAY_MPP_FINALIZED_RETENTION_SECONDS must be an integer".into())
+            })?,
+            None => parse_u64_env(
+                "PAY_SESSION_FINALIZED_RETENTION_SECONDS",
+                DEFAULT_FINALIZED_CHANNEL_RETENTION.as_secs(),
+            )?,
+        };
+        let finalized_retention = Duration::from_secs(finalized_retention_seconds);
         let dry_run = parse_bool_env("DRY_RUN", true)?;
         let lock_ttl = parse_u64_env("SETTLEMENT_LOCK_TTL_SECONDS", 300)?;
         let network = std::env::var("NETWORK")
@@ -421,6 +432,7 @@ impl SettlementRuntime {
 
         let session = if let Some(redis_url) = session_redis_url.as_ref() {
             let redis_prefix = optional_env("PAY_MPP_REDIS_PREFIX")
+                .or_else(|| optional_env("PAY_SESSION_REDIS_PREFIX"))
                 .unwrap_or_else(|| DEFAULT_REDIS_PREFIX.to_string());
             let store = RedisChannelStore::connect_with_finalized_retention(
                 redis_url,
@@ -458,6 +470,10 @@ impl SettlementRuntime {
                 "PAY_X402_SETTLEMENT_MAX_IDLE_SECONDS",
                 DEFAULT_X402_SETTLEMENT_MAX_IDLE_SECONDS,
             )?);
+            let snapshot_max_age = Duration::from_secs(parse_u64_env(
+                "PAY_X402_SNAPSHOT_MAX_AGE_SECS",
+                DEFAULT_X402_SNAPSHOT_MAX_AGE_SECONDS,
+            )?);
             let reconciliation_concurrency = parse_u64_env(
                 "PAY_X402_RECONCILIATION_CONCURRENCY",
                 DEFAULT_X402_RECONCILIATION_CONCURRENCY,
@@ -476,6 +492,7 @@ impl SettlementRuntime {
                 settle_active_channels,
                 distribution_threshold_base_units,
                 settlement_max_idle,
+                snapshot_max_age,
                 reconciliation_concurrency,
             })
         };
@@ -876,6 +893,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
         settle_active_channels = batch.settle_active_channels,
         distribution_threshold_base_units = batch.distribution_threshold_base_units,
         settlement_max_idle_seconds = batch.settlement_max_idle.as_secs(),
+        snapshot_max_age_seconds = batch.snapshot_max_age.as_secs(),
         reconciliation_concurrency = batch.reconciliation_concurrency,
         "x402 batch-settlement reconciliation starting"
     );
@@ -914,6 +932,7 @@ async fn run_batch(runtime: &SettlementRuntime) -> Result<SettleSessionsMetrics,
             &state,
             now,
             batch.settlement_max_idle,
+            batch.snapshot_max_age,
             batch.settle_active_channels,
             batch.distribution_threshold_base_units,
         ) {
@@ -1412,6 +1431,7 @@ fn batch_reconciliation_due(
     state: &ChannelState,
     now: i64,
     max_idle: Duration,
+    snapshot_max_age: Duration,
     settle_active: bool,
     distribution_threshold_base_units: Option<u64>,
 ) -> bool {
@@ -1427,8 +1447,11 @@ fn batch_reconciliation_due(
     }) {
         return true;
     }
-    let unsettled = state.cumulative > state.settled_on_chain;
     let now_seconds = u64::try_from(now).unwrap_or_default();
+    if now_seconds.saturating_sub(state.onchain_checked_at) >= snapshot_max_age.as_secs() {
+        return true;
+    }
+    let unsettled = state.cumulative > state.settled_on_chain;
     unsettled
         && (settle_active
             || now_seconds.saturating_sub(state.last_activity_at) >= max_idle.as_secs())
@@ -2386,6 +2409,7 @@ mod tests {
             &state,
             1_000,
             Duration::from_secs(300),
+            Duration::from_secs(2_000),
             false,
             None,
         ));
@@ -2393,6 +2417,7 @@ mod tests {
             &state,
             1_000,
             Duration::from_secs(300),
+            Duration::from_secs(2_000),
             true,
             None,
         ));
@@ -2402,6 +2427,7 @@ mod tests {
             &state,
             1_000,
             Duration::from_secs(300),
+            Duration::from_secs(2_000),
             true,
             None,
         ));
@@ -2416,6 +2442,7 @@ mod tests {
             &state,
             1_000,
             Duration::from_secs(300),
+            Duration::from_secs(2_000),
             false,
             None,
         ));
@@ -2426,6 +2453,7 @@ mod tests {
             &state,
             1_000,
             Duration::from_secs(300),
+            Duration::from_secs(2_000),
             false,
             None,
         ));
@@ -2442,6 +2470,7 @@ mod tests {
             &state,
             1_000,
             Duration::from_secs(300),
+            Duration::from_secs(2_000),
             false,
             Some(1_000),
         ));
@@ -2450,8 +2479,36 @@ mod tests {
             &state,
             1_000,
             Duration::from_secs(300),
+            Duration::from_secs(2_000),
             false,
             Some(1_000),
+        ));
+    }
+
+    #[test]
+    fn batch_reconciliation_refreshes_stale_fully_settled_channels() {
+        let mut state = channel_state();
+        state.cumulative = 1_000;
+        state.settled_on_chain = 1_000;
+        state.onchain_checked_at = 969;
+
+        assert!(batch_reconciliation_due(
+            &state,
+            1_000,
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+            false,
+            None,
+        ));
+
+        state.onchain_checked_at = 971;
+        assert!(!batch_reconciliation_due(
+            &state,
+            1_000,
+            Duration::from_secs(300),
+            Duration::from_secs(30),
+            false,
+            None,
         ));
     }
 

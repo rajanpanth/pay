@@ -215,9 +215,16 @@ async fn run() -> Result<usize, JobError> {
     let redis_url = if dry_run {
         None
     } else {
-        Some(std::env::var("PAY_MPP_REDIS_URL").map_err(|_| {
-            JobError::Config("PAY_MPP_REDIS_URL is required when DRY_RUN=false".into())
-        })?)
+        Some(
+            std::env::var("PAY_MPP_REDIS_URL")
+                .or_else(|_| std::env::var("PAY_SESSION_REDIS_URL"))
+                .map_err(|_| {
+                    JobError::Config(
+                        "PAY_MPP_REDIS_URL or PAY_SESSION_REDIS_URL is required when DRY_RUN=false"
+                            .into(),
+                    )
+                })?,
+        )
     };
     let network = std::env::var("NETWORK")
         .ok()

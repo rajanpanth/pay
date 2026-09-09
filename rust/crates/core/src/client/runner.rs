@@ -91,8 +91,8 @@ pub enum RunOutcome {
     ///
     /// Like an MPP session, and unlike `upto`, this is stateful: the caller
     /// keeps the channel in a [`crate::client::batch::BatchChannelCache`] and
-    /// reuses it across requests, so a long-lived host amortizes one deposit
-    /// over many calls.
+    /// reuses it across requests. Callers can choose a larger deposit to
+    /// amortize funding transactions across many calls.
     X402BatchChallenge {
         challenge: Box<x402::BatchChallenge>,
         advertised_challenges: DecodedPaymentChallenges,

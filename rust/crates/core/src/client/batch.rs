@@ -6,10 +6,10 @@
 //! per channel, how much the server has confirmed charging.
 //!
 //! [`BatchChannelCache`] is that memory. It lives for the life of the process,
-//! which is the same shape as the MPP session cache the MCP server keeps: a
-//! long-lived host (the MCP server, a proxy) amortizes one deposit over many
-//! requests, while a one-shot `pay curl` opens a channel, spends it, and can
-//! force-close to recover the remainder.
+//! which is the same shape as the MPP session cache the MCP server keeps. A
+//! long-lived host reuses the channel and can choose a deposit large enough to
+//! amortize funding across many requests, while a one-shot `pay curl` opens a
+//! channel, spends it, and can force-close to recover the remainder.
 //!
 //! The watermark advances only when the server's `PAYMENT-RESPONSE` confirms
 //! the exact commitment that was sent — see

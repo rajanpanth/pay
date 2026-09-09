@@ -71,15 +71,16 @@ fn default_bind() -> String {
 /// would read each other's channels.
 async fn channel_store(
     url_vars: &[&str],
-    prefix_var: &str,
+    prefix_vars: &[&str],
     default_prefix: &str,
     label: &str,
 ) -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
-    let redis_url = url_vars
-        .iter()
-        .find_map(|var| std::env::var(var).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let redis_url = url_vars.iter().find_map(|var| {
+        std::env::var(var)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
 
     let Some(redis_url) = redis_url else {
         return Ok((
@@ -90,10 +91,14 @@ async fn channel_store(
 
     #[cfg(feature = "redis-session-store")]
     {
-        let prefix = std::env::var(prefix_var)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        let prefix = prefix_vars
+            .iter()
+            .find_map(|var| {
+                std::env::var(var)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
             .unwrap_or_else(|| default_prefix.to_string());
         let store = pay_kit::mpp::store::RedisChannelStore::connect(&redis_url, prefix)
             .await
@@ -108,7 +113,7 @@ async fn channel_store(
 
     #[cfg(not(feature = "redis-session-store"))]
     {
-        let _ = (redis_url, prefix_var, default_prefix);
+        let _ = (redis_url, prefix_vars, default_prefix);
         Err(pay_core::Error::Config(format!(
             "a {label} Redis URL is set, but this pay binary was built without the \
              redis-session-store feature"
@@ -119,8 +124,8 @@ async fn channel_store(
 async fn session_channel_store()
 -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
     channel_store(
-        &["PAY_MPP_REDIS_URL"],
-        "PAY_MPP_REDIS_PREFIX",
+        &["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"],
+        &["PAY_MPP_REDIS_PREFIX", "PAY_SESSION_REDIS_PREFIX"],
         "pay:session:v1:",
         "MPP sessions",
     )
@@ -134,12 +139,17 @@ async fn session_channel_store()
 /// the chain, so losing it means the operator either forfeits the revenue or
 /// invents a charge. Memory is fine for a local `pay serve`; a deployment that
 /// takes real money wants `PAY_X402_REDIS_URL` (falling back to the MPP
-/// Redis URL).
+/// Redis URL). The legacy session URL remains a final fallback for existing
+/// deployments.
 async fn batch_channel_store()
 -> pay_core::Result<(Arc<dyn pay_kit::mpp::store::ChannelStore>, bool)> {
     channel_store(
-        &["PAY_X402_REDIS_URL", "PAY_MPP_REDIS_URL"],
-        "PAY_X402_REDIS_PREFIX",
+        &[
+            "PAY_X402_REDIS_URL",
+            "PAY_MPP_REDIS_URL",
+            "PAY_SESSION_REDIS_URL",
+        ],
+        &["PAY_X402_REDIS_PREFIX"],
         "pay:batch:v1:",
         "x402 batch-settlement",
     )

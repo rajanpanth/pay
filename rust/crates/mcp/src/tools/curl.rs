@@ -27,9 +27,9 @@ pub(crate) struct SessionCache {
     ///
     /// Batch-settlement is stateful in the same way an MPP session is: one
     /// escrow channel backs many requests and the client tracks the cumulative
-    /// amount the server has confirmed charging. Holding it here is what lets a
-    /// long-lived MCP connection amortize a single deposit over many calls
-    /// instead of opening a channel per request.
+    /// amount the server has confirmed charging. Holding it here lets a
+    /// long-lived MCP connection reuse one channel instead of opening a new
+    /// channel per request. It currently tops up one request at a time.
     pub(crate) batch_channels: pay_core::client::batch::BatchChannelCache,
 }
 
