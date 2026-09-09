@@ -3428,22 +3428,26 @@ mod tests {
             .unwrap()
             .close_after;
 
-        tokio::time::sleep(Duration::from_millis(35)).await;
-
-        let heartbeat_deadline = session
-            .operator_runtime
-            .channel_store
-            .get_channel(&channel)
-            .await
-            .unwrap()
-            .unwrap()
-            .lifecycle
-            .unwrap()
-            .close_after;
-        assert!(
-            heartbeat_deadline > initial_deadline,
-            "an in-flight request must renew the external worker's idle deadline"
-        );
+        let heartbeat_deadline = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let deadline = session
+                    .operator_runtime
+                    .channel_store
+                    .get_channel(&channel)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .lifecycle
+                    .unwrap()
+                    .close_after;
+                if deadline > initial_deadline {
+                    break deadline;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("an in-flight request must renew the external worker's idle deadline");
 
         drop(lease);
         tokio::time::sleep(Duration::from_millis(25)).await;
