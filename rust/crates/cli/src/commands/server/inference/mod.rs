@@ -1304,6 +1304,7 @@ models:
                 tokens_completion: Some(214),
                 tokens_per_sec: Some(41.2),
             }),
+            charge: None,
         });
 
         let flows = state.pdb.correlation.lock().unwrap().snapshot();

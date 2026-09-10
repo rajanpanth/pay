@@ -141,6 +141,57 @@ pub struct HttpExchange {
     /// Final inference telemetry from the gate's stream observer, when the
     /// host opted in via `record_request_start`.
     pub usage: Option<InferenceUsage>,
+    /// Pricing/settlement outcome for this exchange, when the endpoint is
+    /// metered. `None` for endpoints the gate never prices at all (control
+    /// plane, unmetered subscription auth) — distinct from
+    /// [`ChargeStatus::NotCharged`], which means a metered endpoint's request
+    /// specifically wasn't charged (free tier, short-circuited before
+    /// payment).
+    pub charge: Option<ChargeOutcome>,
+}
+
+/// Outcome of a proxied request's pricing, independent of on-chain
+/// settlement timing — a request can be reportable (unit, quantity, USD
+/// amount known) before its payment is confirmed on-chain. Covers every
+/// [`pay_types::metering::Scheme`]: charge-style schemes (`mpp/charge`,
+/// `x402/exact`, `x402/batch`) know this synchronously before forwarding;
+/// usage-metered schemes (`x402/upto`, `mpp/session`) only know it once the
+/// response has been served and settlement computed.
+#[derive(Debug, Clone)]
+pub struct ChargeOutcome {
+    pub scheme: pay_types::metering::Scheme,
+    pub status: ChargeStatus,
+    /// `None` iff `status` is [`ChargeStatus::NotCharged`].
+    pub currency: Option<String>,
+    /// `None` iff `status` is [`ChargeStatus::NotCharged`].
+    pub amount_usd: Option<f64>,
+    /// The billing dimension that priced this request (e.g. `"tokens"`,
+    /// `"requests"`, `"bytes"`) — the serialized form of
+    /// [`pay_types::metering::BillingUnit`], mirroring
+    /// [`pay_types::metering::ResolvedDimension::unit`]. `None` when the
+    /// endpoint's `paywall.yml` doesn't resolve one for this request.
+    pub unit: Option<String>,
+    /// Quantity billed in `unit`, when the gate computed an exact count
+    /// (e.g. a usage-metered token/byte count). `None` for flat per-call
+    /// pricing, where quantity is implicitly 1 request.
+    pub quantity: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargeStatus {
+    /// Served and settled for a non-zero amount (on-chain confirmation may
+    /// still be pending for deferred schemes).
+    Charged,
+    /// Served, but settled to zero — a refund (failed delivery, missing-usage
+    /// policy, or a `!served_ok` post-response settlement).
+    Refunded,
+    /// Not charged at all: free tier, or short-circuited before any payment
+    /// was verified.
+    NotCharged,
+    /// The resource was served, but the settlement attempt itself errored
+    /// (e.g. a deferred on-chain settle broadcast failed) — distinct from a
+    /// deliberate `Refunded`. The amount, if any, is unknown.
+    Failed,
 }
 
 /// Request-side facts handed to [`PaymentState::record_request_start`].
