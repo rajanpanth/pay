@@ -1,16 +1,21 @@
 //! `report-billing-events` — drains the `pay:billing:events` Redis Stream
 //! (populated by `pay-proxy`'s hosts via `record_exchange`, one entry per
-//! metered exchange regardless of payment scheme) and reports each batch
-//! onward.
+//! metered exchange regardless of payment scheme) and durably relocates
+//! each one into `pay:billing:events:exported`.
 //!
 //! The final export destination is intentionally not wired up yet: whether a
 //! self-hosted, analytics-only Apigee Adapter feed is acceptable for a
 //! partner's billing meter (vs. requiring traffic through their fully-hosted
-//! proxy) is still an open question with that partner. Until it's answered,
-//! this job proves the pipeline end-to-end — reclaiming and reading real
-//! events, decoding them, and acking them only once `report` (below)
-//! succeeds — with the actual outbound call as the one place that needs to
-//! change once that's resolved.
+//! proxy) is still an open question with that partner. Until that's
+//! answered, `report` doesn't make an outbound call at all — it relocates
+//! the event, byte-for-byte, into the exported archive stream, which is a
+//! real, durable, verifiable delivery: the record survives under a
+//! different key, rather than being deleted from the inbox on nothing more
+//! than a log line. An entry is only acked (and removed from the inbox)
+//! once that relocation actually succeeds. `report` is the one place that
+//! needs to change — to a real outbound call, reading from the inbox or
+//! from the exported archive — once the partner's requirements are
+//! resolved.
 //!
 //! Uses a single, stable consumer identity for the life of the process
 //! (`HOSTNAME`, falling back to the PID) rather than a fresh one per poll —
@@ -51,6 +56,14 @@ use tracing::{error, info, warn};
 /// Redis Stream key `pay-proxy` hosts `XADD` billing events into (mirrors
 /// the producer-side constant in `pay::commands::server::billing_export`).
 const STREAM_KEY: &str = "pay:billing:events";
+/// The durable archive `report` relocates successfully-handled events
+/// into. Deliberately unbounded (no `MAXLEN`) — this stream IS the
+/// delivery guarantee for a billing event; trimming it silently would
+/// recreate the exact "records vanish with nothing to show for it"
+/// problem this design exists to avoid. Retention/cleanup is a separate,
+/// explicit operational decision to make once a real downstream exporter
+/// exists and is actually draining it.
+const EXPORTED_STREAM_KEY: &str = "pay:billing:events:exported";
 const CONSUMER_GROUP: &str = "report-billing-events";
 const DEFAULT_INTERVAL_SECONDS: u64 = 10;
 const DEFAULT_BATCH_SIZE: u64 = 200;
@@ -77,12 +90,13 @@ struct BillingEvent {
     quantity: Option<u64>,
 }
 
-/// `report`'s failure mode. Never constructed today — see `report`'s doc
-/// comment — but real: the ack-only-on-success wiring below depends on this
-/// being an actual `Result`, not a formality.
+/// `report`'s failure mode: relocating the event into the exported archive
+/// failed. Real, not a formality — `report` makes an actual Redis call
+/// that can actually fail, and the ack-only-on-success wiring below
+/// depends on that.
 #[derive(Debug, thiserror::Error)]
-#[error("billing event report failed")]
-struct ReportError;
+#[error("billing event report failed: {0}")]
+struct ReportError(String);
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
@@ -379,14 +393,14 @@ async fn process_entries(
     let mut ids_to_ack = Vec::new();
     for (id, fields) in entries {
         let handled = match decode_entry(fields) {
-            Some(Ok(event)) => match report(&event) {
+            Some((raw, Ok(event))) => match report(conn, id, &raw, &event).await {
                 Ok(()) => true,
                 Err(error) => {
                     warn!(%error, %id, "billing event report failed; leaving pending for retry");
                     false
                 }
             },
-            Some(Err(error)) => {
+            Some((_, Err(error))) => {
                 warn!(%error, %id, "failed to decode billing event; dropping (poison message)");
                 true
             }
@@ -474,22 +488,35 @@ fn parse_claimed_entries(value: &Value) -> Vec<(String, HashMap<String, Value>)>
         .collect()
 }
 
-/// `None` if the entry carries no `event` field at all; `Some(Err(_))` if it
-/// does but isn't valid UTF-8 JSON matching `BillingEvent`.
-fn decode_entry(fields: &HashMap<String, Value>) -> Option<Result<BillingEvent, serde_json::Error>> {
+/// `None` if the entry carries no `event` field at all. Otherwise the
+/// original raw JSON string alongside the decode result — `report` needs
+/// the raw string to relocate the event byte-for-byte into the exported
+/// archive, without a lossy re-encode through `BillingEvent`.
+fn decode_entry(
+    fields: &HashMap<String, Value>,
+) -> Option<(String, Result<BillingEvent, serde_json::Error>)> {
     let raw = value_as_string(fields.get("event")?)?;
-    Some(serde_json::from_str(&raw))
+    let decoded = serde_json::from_str(&raw);
+    Some((raw, decoded))
 }
 
 /// TODO(apigee): this is the one place that needs to change once the
 /// partner confirms whether the self-hosted, analytics-only Adapter feed is
-/// acceptable for their billing meter. For now this proves the pipeline
-/// works end-to-end against real, non-mocked billing events.
+/// acceptable for their billing meter — to a real outbound call, either
+/// instead of or in addition to the relocation below.
 ///
-/// Infallible today — a `tracing::info!` call cannot fail — but returns a
-/// `Result` so `process_entries`' ack-only-on-success logic is already
-/// correctly wired for when this becomes a real outbound call.
-fn report(event: &BillingEvent) -> Result<(), ReportError> {
+/// Until then, the relocation itself is the real delivery guarantee: the
+/// event is `XADD`ed into `EXPORTED_STREAM_KEY` — a durable, verifiable
+/// archive a real exporter can later drain — before the caller acks and
+/// removes it from the inbox. `raw_json` is forwarded byte-for-byte (not a
+/// re-encode of `event`) so the exported record is exactly what the
+/// producer sent.
+async fn report(
+    conn: &mut redis::aio::ConnectionManager,
+    id: &str,
+    raw_json: &str,
+    event: &BillingEvent,
+) -> Result<(), ReportError> {
     info!(
         monotonic_counter.pay_billing_events_reported_total = 1_u64,
         method = %event.method,
@@ -503,7 +530,18 @@ fn report(event: &BillingEvent) -> Result<(), ReportError> {
         quantity = event.quantity,
         "billing event"
     );
-    Ok(())
+    let result: Result<String, redis::RedisError> = redis::cmd("XADD")
+        .arg(EXPORTED_STREAM_KEY)
+        .arg("*")
+        .arg("event")
+        .arg(raw_json)
+        .arg("source_id")
+        .arg(id)
+        .query_async(conn)
+        .await;
+    result
+        .map(|_| ())
+        .map_err(|error| ReportError(error.to_string()))
 }
 
 fn record_startup_failure(error: JobError) -> std::process::ExitCode {

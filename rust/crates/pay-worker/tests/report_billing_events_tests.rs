@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 const STREAM_KEY: &str = "pay:billing:events";
+const EXPORTED_STREAM_KEY: &str = "pay:billing:events:exported";
 const CONSUMER_GROUP: &str = "report-billing-events";
 
 struct RedisServer {
@@ -146,6 +147,32 @@ fn report_billing_events_drains_and_acks_a_real_event() {
         len, 0,
         "expected the acknowledged entry to also be removed from the stream, stream still has {len} entries"
     );
+
+    // Regression: deleting the inbox entry is only safe because it was
+    // durably relocated first — not just logged. The exported archive must
+    // actually contain the event, byte-for-byte.
+    let exported: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+        .arg(EXPORTED_STREAM_KEY)
+        .arg("-")
+        .arg("+")
+        .query(&mut conn)
+        .expect("XRANGE exported archive");
+    assert_eq!(
+        exported.ids.len(),
+        1,
+        "expected the handled event to be durably relocated into {EXPORTED_STREAM_KEY}"
+    );
+    let redis::Value::BulkString(exported_payload) =
+        exported.ids[0].map.get("event").expect("exported entry carries an 'event' field")
+    else {
+        panic!("expected the exported 'event' field to be a bulk string");
+    };
+    let exported_json: serde_json::Value =
+        serde_json::from_slice(exported_payload).expect("exported payload is valid JSON");
+    assert_eq!(
+        exported_json["path"], "v1/simple/echo",
+        "expected the exported record to be the original event, byte-for-byte"
+    );
 }
 
 /// Regression test for "pending events never recovered": simulates a
@@ -255,6 +282,15 @@ fn report_billing_events_reclaims_a_stranded_pending_entry() {
         .query(&mut conn)
         .expect("XLEN");
     assert_eq!(len, 0, "expected the reclaimed entry to also be XDELed, got {len} remaining");
+
+    let exported_len: u64 = redis::cmd("XLEN")
+        .arg(EXPORTED_STREAM_KEY)
+        .query(&mut conn)
+        .expect("XLEN exported archive");
+    assert_eq!(
+        exported_len, 1,
+        "expected the reclaimed entry to be durably relocated into {EXPORTED_STREAM_KEY}"
+    );
 }
 
 /// Regression test for "run once leaves backlogs": seeds more entries than
@@ -363,6 +399,107 @@ fn report_billing_events_reuses_one_consumer_identity_across_invocations() {
         1,
         "expected two invocations under the same HOSTNAME to register as one stable consumer, got {}: {consumers:?}",
         consumers.len()
+    );
+}
+
+/// Regression test for "events acknowledged before export": makes the
+/// relocation into the exported archive actually fail (an ACL-restricted
+/// user with `XADD` denied — `report`'s only Redis write) and asserts the
+/// source entry is neither acked nor deleted, and nothing lands in the
+/// exported archive. Proves the ack/delete is conditioned on relocation
+/// really succeeding, not just on having logged the event.
+#[test]
+fn report_billing_events_leaves_entry_pending_when_relocation_fails() {
+    let Some(redis_server) = RedisServer::start() else {
+        eprintln!(
+            "skipping report_billing_events_leaves_entry_pending_when_relocation_fails: redis-server not found on PATH"
+        );
+        return;
+    };
+
+    let client = redis::Client::open(redis_server.url()).expect("valid redis url");
+    let mut conn = client.get_connection().expect("connect to ephemeral redis");
+
+    let payload = serde_json::json!({
+        "method": "POST",
+        "path": "v1/simple/echo",
+        "status": 200,
+        "ms": 3,
+        "scheme": "x402-upto",
+        "charge_status": "charged",
+        "currency": "USDC",
+        "amount_usd": 0.03,
+        "unit": "tokens",
+        "quantity": 128,
+    })
+    .to_string();
+    let _: String = redis::cmd("XADD")
+        .arg(STREAM_KEY)
+        .arg("*")
+        .arg("event")
+        .arg(&payload)
+        .query(&mut conn)
+        .expect("seed the stream");
+
+    // A user with every command allowed except XADD — `report`'s only
+    // Redis write is the XADD into the exported archive, so this fails
+    // exactly that call while leaving XGROUP/XREADGROUP/XACK/XDEL/
+    // XAUTOCLAIM (everything else the worker needs) unaffected.
+    let _: String = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg("limited")
+        .arg("on")
+        .arg(">testpass")
+        .arg("~*")
+        .arg("+@all")
+        .arg("-xadd")
+        .query(&mut conn)
+        .expect("ACL SETUSER");
+    let restricted_url = format!("redis://limited:testpass@127.0.0.1:{}", redis_server.port);
+
+    let bin = env!("CARGO_BIN_EXE_report-billing-events");
+    let status = Command::new(bin)
+        .env("PAY_BILLING_REDIS_URL", restricted_url)
+        .env("RUN_ONCE", "true")
+        .status()
+        .expect("run report-billing-events");
+    // A per-entry report failure is logged and left pending — not a fatal
+    // drain error — so the process itself still exits successfully.
+    assert!(
+        status.success(),
+        "report-billing-events exited with {status}"
+    );
+
+    let pending: redis::Value = redis::cmd("XPENDING")
+        .arg(STREAM_KEY)
+        .arg(CONSUMER_GROUP)
+        .query(&mut conn)
+        .expect("XPENDING summary");
+    let redis::Value::Array(fields) = &pending else {
+        panic!("unexpected XPENDING reply shape: {pending:?}");
+    };
+    assert_eq!(
+        fields[0],
+        redis::Value::Int(1),
+        "expected the entry to remain pending after a failed relocation, got {pending:?}"
+    );
+
+    let len: u64 = redis::cmd("XLEN")
+        .arg(STREAM_KEY)
+        .query(&mut conn)
+        .expect("XLEN");
+    assert_eq!(
+        len, 1,
+        "expected the entry to remain in the source stream after a failed relocation, got {len}"
+    );
+
+    let exported_len: u64 = redis::cmd("XLEN")
+        .arg(EXPORTED_STREAM_KEY)
+        .query(&mut conn)
+        .expect("XLEN exported archive");
+    assert_eq!(
+        exported_len, 0,
+        "expected nothing to land in the exported archive when relocation fails"
     );
 }
 
