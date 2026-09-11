@@ -213,6 +213,8 @@ mod tests {
         BillingEvent {
             method: "POST".to_string(),
             path: "v1/simple/echo".to_string(),
+            host: Some("vision.google.example.com".to_string()),
+            subdomain: "vision".to_string(),
             status: 200,
             ms: 1,
             scheme: pay_types::metering::Scheme::MppCharge,

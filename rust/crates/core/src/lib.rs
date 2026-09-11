@@ -159,6 +159,10 @@ pub struct HttpExchange {
 /// response has been served and settlement computed.
 #[derive(Debug, Clone)]
 pub struct ChargeOutcome {
+    /// The endpoint's declared subdomain (e.g. `"vision"`, `"bigquery"`) —
+    /// how a deployment maps this request to a specific proxied API. Always
+    /// present whenever a `ChargeOutcome` exists at all.
+    pub subdomain: String,
     pub scheme: pay_types::metering::Scheme,
     pub status: ChargeStatus,
     /// `None` iff `status` is [`ChargeStatus::NotCharged`].
@@ -209,6 +213,15 @@ pub enum ChargeStatus {
 pub struct BillingEvent {
     pub method: String,
     pub path: String,
+    /// `Host` header from the original request, when present — the
+    /// strongest per-deployment signal of which proxied fleet/domain
+    /// served this request (e.g. `vision.google-sandbox.example.com`
+    /// distinguishes provider and environment, not just API name).
+    pub host: Option<String>,
+    /// The endpoint's declared subdomain (e.g. `"vision"`, `"bigquery"`) —
+    /// identifies which proxied API served this request, independent of
+    /// deployment domain naming.
+    pub subdomain: String,
     pub status: u16,
     pub ms: u64,
     pub scheme: pay_types::metering::Scheme,
@@ -226,9 +239,16 @@ impl BillingEvent {
     /// `charge_status: NotCharged`, still reported).
     pub fn from_exchange(exchange: &HttpExchange) -> Option<Self> {
         let charge = exchange.charge.as_ref()?;
+        let host = exchange
+            .req_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.clone());
         Some(Self {
             method: exchange.method.clone(),
             path: exchange.path.clone(),
+            host,
+            subdomain: charge.subdomain.clone(),
             status: exchange.status,
             ms: exchange.ms,
             scheme: charge.scheme,
@@ -297,8 +317,52 @@ mod billing_event_tests {
     }
 
     #[test]
+    fn host_header_is_extracted_case_insensitively() {
+        let charge = ChargeOutcome {
+            subdomain: "vision".to_string(),
+            scheme: pay_types::metering::Scheme::MppCharge,
+            status: ChargeStatus::Charged,
+            currency: Some("SOL".to_string()),
+            amount_usd: Some(0.01),
+            unit: None,
+            quantity: None,
+        };
+        let mut exchange = exchange(Some(charge));
+        // Real proxied requests carry a title-case `Host` header, but
+        // nothing in the HTTP spec requires that exact casing — the lookup
+        // must not depend on it.
+        exchange.req_headers = vec![(
+            "HOST".to_string(),
+            "vision.google-sandbox.example.com".to_string(),
+        )];
+
+        let event = BillingEvent::from_exchange(&exchange).unwrap();
+        assert_eq!(
+            event.host.as_deref(),
+            Some("vision.google-sandbox.example.com")
+        );
+        assert_eq!(event.subdomain, "vision");
+    }
+
+    #[test]
+    fn missing_host_header_reports_none_not_an_error() {
+        let charge = ChargeOutcome {
+            subdomain: "vision".to_string(),
+            scheme: pay_types::metering::Scheme::MppCharge,
+            status: ChargeStatus::Charged,
+            currency: Some("SOL".to_string()),
+            amount_usd: Some(0.01),
+            unit: None,
+            quantity: None,
+        };
+        let event = BillingEvent::from_exchange(&exchange(Some(charge))).unwrap();
+        assert_eq!(event.host, None);
+    }
+
+    #[test]
     fn a_charged_exchange_maps_every_field() {
         let charge = ChargeOutcome {
+            subdomain: "vision".to_string(),
             scheme: pay_types::metering::Scheme::MppCharge,
             status: ChargeStatus::Charged,
             currency: Some("SOL".to_string()),
@@ -311,6 +375,7 @@ mod billing_event_tests {
 
         assert_eq!(event.method, "POST");
         assert_eq!(event.path, "v1/simple/echo");
+        assert_eq!(event.subdomain, "vision");
         assert_eq!(event.status, 200);
         assert_eq!(event.ms, 42);
         assert_eq!(event.scheme, pay_types::metering::Scheme::MppCharge);
@@ -327,6 +392,7 @@ mod billing_event_tests {
     #[test]
     fn a_not_charged_exchange_serializes_to_the_consumer_expected_wire_shape() {
         let charge = ChargeOutcome {
+            subdomain: "vision".to_string(),
             scheme: pay_types::metering::Scheme::MppSession,
             status: ChargeStatus::NotCharged,
             currency: None,

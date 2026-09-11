@@ -197,6 +197,7 @@ impl PaidRequestTelemetry {
     pub fn into_charge_outcome(self) -> Option<crate::ChargeOutcome> {
         let scheme = self.scheme?;
         Some(crate::ChargeOutcome {
+            subdomain: self.subdomain,
             scheme,
             status: self.status,
             currency: self.payment.as_ref().map(|p| p.currency.clone()),

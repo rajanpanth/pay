@@ -92,6 +92,13 @@ const DEFAULT_PORT: u64 = 8080;
 struct BillingEvent {
     method: String,
     path: String,
+    // `#[serde(default)]` on the two fields below: entries already queued
+    // from before this field existed on the producer side must still
+    // decode, not be treated as poison messages and dropped.
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    subdomain: Option<String>,
     status: u16,
     #[allow(dead_code)] // carried through for a future export payload
     ms: u64,
@@ -536,6 +543,8 @@ async fn report(
         monotonic_counter.pay_billing_events_reported_total = 1_u64,
         method = %event.method,
         path = %event.path,
+        host = event.host.as_deref(),
+        subdomain = event.subdomain.as_deref(),
         status = event.status,
         scheme = %event.scheme,
         charge_status = %event.charge_status,
