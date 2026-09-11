@@ -10,7 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 const STREAM_KEY: &str = "pay:billing:events";
-const EXPORTED_STREAM_KEY: &str = "pay:billing:events:exported";
+const EXPORTED_KEY_PREFIX: &str = "pay:billing:events:exported:";
 const CONSUMER_GROUP: &str = "report-billing-events";
 
 struct RedisServer {
@@ -102,7 +102,7 @@ fn report_billing_events_drains_and_acks_a_real_event() {
         "quantity": null,
     })
     .to_string();
-    let _: String = redis::cmd("XADD")
+    let seeded_id: String = redis::cmd("XADD")
         .arg(STREAM_KEY)
         .arg("*")
         .arg("event")
@@ -149,26 +149,16 @@ fn report_billing_events_drains_and_acks_a_real_event() {
     );
 
     // Regression: deleting the inbox entry is only safe because it was
-    // durably relocated first — not just logged. The exported archive must
+    // durably relocated first — not just logged. The exported key must
     // actually contain the event, byte-for-byte.
-    let exported: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
-        .arg(EXPORTED_STREAM_KEY)
-        .arg("-")
-        .arg("+")
+    let exported_raw: Option<String> = redis::cmd("GET")
+        .arg(format!("{EXPORTED_KEY_PREFIX}{seeded_id}"))
         .query(&mut conn)
-        .expect("XRANGE exported archive");
-    assert_eq!(
-        exported.ids.len(),
-        1,
-        "expected the handled event to be durably relocated into {EXPORTED_STREAM_KEY}"
-    );
-    let redis::Value::BulkString(exported_payload) =
-        exported.ids[0].map.get("event").expect("exported entry carries an 'event' field")
-    else {
-        panic!("expected the exported 'event' field to be a bulk string");
-    };
-    let exported_json: serde_json::Value =
-        serde_json::from_slice(exported_payload).expect("exported payload is valid JSON");
+        .expect("GET exported key");
+    let exported_json: serde_json::Value = serde_json::from_str(
+        &exported_raw.expect("expected the handled event to be durably relocated"),
+    )
+    .expect("exported payload is valid JSON");
     assert_eq!(
         exported_json["path"], "v1/simple/echo",
         "expected the exported record to be the original event, byte-for-byte"
@@ -207,7 +197,7 @@ fn report_billing_events_reclaims_a_stranded_pending_entry() {
         "quantity": null,
     })
     .to_string();
-    let _: String = redis::cmd("XADD")
+    let seeded_id: String = redis::cmd("XADD")
         .arg(STREAM_KEY)
         .arg("*")
         .arg("event")
@@ -283,13 +273,13 @@ fn report_billing_events_reclaims_a_stranded_pending_entry() {
         .expect("XLEN");
     assert_eq!(len, 0, "expected the reclaimed entry to also be XDELed, got {len} remaining");
 
-    let exported_len: u64 = redis::cmd("XLEN")
-        .arg(EXPORTED_STREAM_KEY)
+    let exported: Option<String> = redis::cmd("GET")
+        .arg(format!("{EXPORTED_KEY_PREFIX}{seeded_id}"))
         .query(&mut conn)
-        .expect("XLEN exported archive");
-    assert_eq!(
-        exported_len, 1,
-        "expected the reclaimed entry to be durably relocated into {EXPORTED_STREAM_KEY}"
+        .expect("GET exported key");
+    assert!(
+        exported.is_some(),
+        "expected the reclaimed entry to be durably relocated to {EXPORTED_KEY_PREFIX}{seeded_id}"
     );
 }
 
@@ -402,12 +392,127 @@ fn report_billing_events_reuses_one_consumer_identity_across_invocations() {
     );
 }
 
+/// Regression test for "archive retries duplicate records": simulates an
+/// entry that was already successfully relocated (its exported key
+/// written) before the process crashed — the exact window between
+/// `report` succeeding and the source ack that a real crash could land
+/// in — then retries via reclaim. A stream-based archive with a
+/// freshly-generated id per write would create a second, duplicate
+/// record here; a per-event key written with a plain `SET` instead
+/// overwrites the exact same key with the exact same value, so asserts
+/// there is still exactly one value for this event, and that the retry
+/// still completes the ack/delete on the source side.
+#[test]
+fn report_billing_events_retry_after_a_successful_relocation_does_not_duplicate() {
+    let Some(redis_server) = RedisServer::start() else {
+        eprintln!(
+            "skipping report_billing_events_retry_after_a_successful_relocation_does_not_duplicate: redis-server not found on PATH"
+        );
+        return;
+    };
+
+    let client = redis::Client::open(redis_server.url()).expect("valid redis url");
+    let mut conn = client.get_connection().expect("connect to ephemeral redis");
+
+    let payload = serde_json::json!({
+        "method": "POST",
+        "path": "v1/simple/echo",
+        "status": 200,
+        "ms": 5,
+        "scheme": "x402-batch",
+        "charge_status": "charged",
+        "currency": "USDC",
+        "amount_usd": 0.04,
+        "unit": "requests",
+        "quantity": null,
+    })
+    .to_string();
+    let seeded_id: String = redis::cmd("XADD")
+        .arg(STREAM_KEY)
+        .arg("*")
+        .arg("event")
+        .arg(&payload)
+        .query(&mut conn)
+        .expect("seed the stream");
+
+    // Simulate: a prior attempt already relocated this event successfully
+    // (the exported key exists, with the real payload)...
+    let _: () = redis::cmd("SET")
+        .arg(format!("{EXPORTED_KEY_PREFIX}{seeded_id}"))
+        .arg(&payload)
+        .query(&mut conn)
+        .expect("simulate a prior successful relocation");
+    // ...then crashed before acking the source, exactly like the
+    // stranded-pending test.
+    let _: Result<String, redis::RedisError> = redis::cmd("XGROUP")
+        .arg("CREATE")
+        .arg(STREAM_KEY)
+        .arg(CONSUMER_GROUP)
+        .arg("0")
+        .query(&mut conn);
+    let _: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg(CONSUMER_GROUP)
+        .arg("crashed-consumer")
+        .arg("COUNT")
+        .arg(10)
+        .arg("STREAMS")
+        .arg(STREAM_KEY)
+        .arg(">")
+        .query(&mut conn)
+        .expect("simulate delivery to a since-crashed consumer");
+
+    let bin = env!("CARGO_BIN_EXE_report-billing-events");
+    let status = Command::new(bin)
+        .env("PAY_BILLING_REDIS_URL", redis_server.url())
+        .env("RUN_ONCE", "true")
+        .env("BILLING_EXPORT_MIN_IDLE_MS", "0")
+        .status()
+        .expect("run report-billing-events");
+    assert!(
+        status.success(),
+        "report-billing-events exited with {status}"
+    );
+
+    let pending: redis::Value = redis::cmd("XPENDING")
+        .arg(STREAM_KEY)
+        .arg(CONSUMER_GROUP)
+        .query(&mut conn)
+        .expect("XPENDING summary");
+    let redis::Value::Array(fields) = &pending else {
+        panic!("unexpected XPENDING reply shape: {pending:?}");
+    };
+    assert_eq!(
+        fields[0],
+        redis::Value::Int(0),
+        "expected the retry to still complete the ack even though relocation was already done, got {pending:?}"
+    );
+
+    let len: u64 = redis::cmd("XLEN")
+        .arg(STREAM_KEY)
+        .query(&mut conn)
+        .expect("XLEN");
+    assert_eq!(len, 0, "expected the source entry to be removed once the retry completes, got {len}");
+
+    // Exactly one value for this event's key — retrying never produces a
+    // second, distinct record the way appending to a stream would.
+    let exported: Option<String> = redis::cmd("GET")
+        .arg(format!("{EXPORTED_KEY_PREFIX}{seeded_id}"))
+        .query(&mut conn)
+        .expect("GET exported key");
+    assert_eq!(
+        exported.as_deref(),
+        Some(payload.as_str()),
+        "expected the retry to leave exactly the original relocated value in place, not duplicate or alter it"
+    );
+}
+
 /// Regression test for "events acknowledged before export": makes the
 /// relocation into the exported archive actually fail (an ACL-restricted
-/// user with `XADD` denied — `report`'s only Redis write) and asserts the
-/// source entry is neither acked nor deleted, and nothing lands in the
-/// exported archive. Proves the ack/delete is conditioned on relocation
-/// really succeeding, not just on having logged the event.
+/// user with `SET` denied — `report`'s only Redis write) and asserts the
+/// source entry is neither acked nor deleted, and nothing is relocated.
+/// Proves the ack/delete is conditioned on relocation really succeeding,
+/// not just on having logged the event.
 #[test]
 fn report_billing_events_leaves_entry_pending_when_relocation_fails() {
     let Some(redis_server) = RedisServer::start() else {
@@ -433,7 +538,7 @@ fn report_billing_events_leaves_entry_pending_when_relocation_fails() {
         "quantity": 128,
     })
     .to_string();
-    let _: String = redis::cmd("XADD")
+    let seeded_id: String = redis::cmd("XADD")
         .arg(STREAM_KEY)
         .arg("*")
         .arg("event")
@@ -441,10 +546,11 @@ fn report_billing_events_leaves_entry_pending_when_relocation_fails() {
         .query(&mut conn)
         .expect("seed the stream");
 
-    // A user with every command allowed except XADD — `report`'s only
-    // Redis write is the XADD into the exported archive, so this fails
-    // exactly that call while leaving XGROUP/XREADGROUP/XACK/XDEL/
-    // XAUTOCLAIM (everything else the worker needs) unaffected.
+    // A user with every command allowed except SET — `report`'s only
+    // Redis write is the SET that relocates the event into its exported
+    // key, so this fails exactly that call while leaving XGROUP/
+    // XREADGROUP/XACK/XDEL/XAUTOCLAIM (everything else the worker needs)
+    // unaffected.
     let _: String = redis::cmd("ACL")
         .arg("SETUSER")
         .arg("limited")
@@ -452,7 +558,7 @@ fn report_billing_events_leaves_entry_pending_when_relocation_fails() {
         .arg(">testpass")
         .arg("~*")
         .arg("+@all")
-        .arg("-xadd")
+        .arg("-set")
         .query(&mut conn)
         .expect("ACL SETUSER");
     let restricted_url = format!("redis://limited:testpass@127.0.0.1:{}", redis_server.port);
@@ -493,13 +599,13 @@ fn report_billing_events_leaves_entry_pending_when_relocation_fails() {
         "expected the entry to remain in the source stream after a failed relocation, got {len}"
     );
 
-    let exported_len: u64 = redis::cmd("XLEN")
-        .arg(EXPORTED_STREAM_KEY)
+    let exported: Option<String> = redis::cmd("GET")
+        .arg(format!("{EXPORTED_KEY_PREFIX}{seeded_id}"))
         .query(&mut conn)
-        .expect("XLEN exported archive");
-    assert_eq!(
-        exported_len, 0,
-        "expected nothing to land in the exported archive when relocation fails"
+        .expect("GET exported key");
+    assert!(
+        exported.is_none(),
+        "expected nothing to be relocated when the relocation write itself fails"
     );
 }
 

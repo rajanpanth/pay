@@ -1,21 +1,33 @@
 //! `report-billing-events` — drains the `pay:billing:events` Redis Stream
 //! (populated by `pay-proxy`'s hosts via `record_exchange`, one entry per
 //! metered exchange regardless of payment scheme) and durably relocates
-//! each one into `pay:billing:events:exported`.
+//! each one into its own `pay:billing:events:exported:<id>` key.
 //!
 //! The final export destination is intentionally not wired up yet: whether a
 //! self-hosted, analytics-only Apigee Adapter feed is acceptable for a
 //! partner's billing meter (vs. requiring traffic through their fully-hosted
 //! proxy) is still an open question with that partner. Until that's
 //! answered, `report` doesn't make an outbound call at all — it relocates
-//! the event, byte-for-byte, into the exported archive stream, which is a
-//! real, durable, verifiable delivery: the record survives under a
-//! different key, rather than being deleted from the inbox on nothing more
-//! than a log line. An entry is only acked (and removed from the inbox)
-//! once that relocation actually succeeds. `report` is the one place that
-//! needs to change — to a real outbound call, reading from the inbox or
-//! from the exported archive — once the partner's requirements are
-//! resolved.
+//! the event, byte-for-byte, into a durable, verifiable per-event key: the
+//! record survives under a different key, rather than being deleted from
+//! the inbox on nothing more than a log line. An entry is only acked (and
+//! removed from the inbox) once that relocation actually succeeds.
+//!
+//! Deliberately one `SET` per event, keyed by the source stream id, rather
+//! than a second stream: a retry after a crash between the relocation
+//! write and the source ack/delete (or after a `report` failure that
+//! itself needs retrying) writes the exact same key with the exact same
+//! value again, which is a safe no-op. Appending to a stream instead — even
+//! reusing the source id as the new entry's id — cannot give that guarantee
+//! *in general*, because Redis Streams enforce one global, monotonically
+//! increasing id per stream: by the time a stuck entry is retried, other
+//! (newer) events may already have advanced the archive stream's id past
+//! the stuck entry's own id, so a same-id retry would fail for a reason
+//! indistinguishable from "already delivered" — and treating that as
+//! success would silently drop a record that was never actually
+//! relocated. `report` is the one function that needs to change — to a
+//! real outbound call, reading from the inbox or from these keys — once
+//! the partner's requirements are resolved.
 //!
 //! Uses a single, stable consumer identity for the life of the process
 //! (`HOSTNAME`, falling back to the PID) rather than a fresh one per poll —
@@ -56,14 +68,15 @@ use tracing::{error, info, warn};
 /// Redis Stream key `pay-proxy` hosts `XADD` billing events into (mirrors
 /// the producer-side constant in `pay::commands::server::billing_export`).
 const STREAM_KEY: &str = "pay:billing:events";
-/// The durable archive `report` relocates successfully-handled events
-/// into. Deliberately unbounded (no `MAXLEN`) — this stream IS the
-/// delivery guarantee for a billing event; trimming it silently would
-/// recreate the exact "records vanish with nothing to show for it"
-/// problem this design exists to avoid. Retention/cleanup is a separate,
-/// explicit operational decision to make once a real downstream exporter
-/// exists and is actually draining it.
-const EXPORTED_STREAM_KEY: &str = "pay:billing:events:exported";
+/// Prefix for the durable per-event keys `report` relocates
+/// successfully-handled events into (`{PREFIX}{source stream id}`).
+/// Deliberately given no TTL/expiry — each key IS the delivery guarantee
+/// for one billing event; expiring them silently would recreate the exact
+/// "records vanish with nothing to show for it" problem this design
+/// exists to avoid. Retention/cleanup is a separate, explicit operational
+/// decision to make once a real downstream exporter exists and is
+/// actually consuming them.
+const EXPORTED_KEY_PREFIX: &str = "pay:billing:events:exported:";
 const CONSUMER_GROUP: &str = "report-billing-events";
 const DEFAULT_INTERVAL_SECONDS: u64 = 10;
 const DEFAULT_BATCH_SIZE: u64 = 200;
@@ -490,8 +503,8 @@ fn parse_claimed_entries(value: &Value) -> Vec<(String, HashMap<String, Value>)>
 
 /// `None` if the entry carries no `event` field at all. Otherwise the
 /// original raw JSON string alongside the decode result — `report` needs
-/// the raw string to relocate the event byte-for-byte into the exported
-/// archive, without a lossy re-encode through `BillingEvent`.
+/// the raw string to relocate the event byte-for-byte into its exported
+/// key, without a lossy re-encode through `BillingEvent`.
 fn decode_entry(
     fields: &HashMap<String, Value>,
 ) -> Option<(String, Result<BillingEvent, serde_json::Error>)> {
@@ -506,11 +519,15 @@ fn decode_entry(
 /// instead of or in addition to the relocation below.
 ///
 /// Until then, the relocation itself is the real delivery guarantee: the
-/// event is `XADD`ed into `EXPORTED_STREAM_KEY` — a durable, verifiable
-/// archive a real exporter can later drain — before the caller acks and
-/// removes it from the inbox. `raw_json` is forwarded byte-for-byte (not a
-/// re-encode of `event`) so the exported record is exactly what the
-/// producer sent.
+/// event is `SET` into `{EXPORTED_KEY_PREFIX}{id}` — a durable, verifiable
+/// key a real exporter can later read — before the caller acks and removes
+/// it from the inbox. Keying by the source entry's own id (rather than
+/// appending to a second stream) is what makes this idempotent: a retry
+/// after a crash between this write and the source ack/delete (or after an
+/// earlier failed attempt) writes the exact same key with the exact same
+/// value again — a safe no-op, never a duplicate. `raw_json` is forwarded
+/// byte-for-byte (not a re-encode of `event`) so the exported record is
+/// exactly what the producer sent.
 async fn report(
     conn: &mut redis::aio::ConnectionManager,
     id: &str,
@@ -530,18 +547,12 @@ async fn report(
         quantity = event.quantity,
         "billing event"
     );
-    let result: Result<String, redis::RedisError> = redis::cmd("XADD")
-        .arg(EXPORTED_STREAM_KEY)
-        .arg("*")
-        .arg("event")
+    let result: Result<(), redis::RedisError> = redis::cmd("SET")
+        .arg(format!("{EXPORTED_KEY_PREFIX}{id}"))
         .arg(raw_json)
-        .arg("source_id")
-        .arg(id)
         .query_async(conn)
         .await;
-    result
-        .map(|_| ())
-        .map_err(|error| ReportError(error.to_string()))
+    result.map_err(|error| ReportError(error.to_string()))
 }
 
 fn record_startup_failure(error: JobError) -> std::process::ExitCode {
