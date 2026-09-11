@@ -74,7 +74,9 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     /// middleware needs it at verify time to co-sign the activation
     /// transaction; charge / session paths construct their own MPP
     /// instances at startup and don't ask for it through this trait.
-    fn fee_payer_signer(&self) -> Option<Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>> {
+    fn fee_payer_signer(
+        &self,
+    ) -> Option<Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>> {
         None
     }
 

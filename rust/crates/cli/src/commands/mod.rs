@@ -552,7 +552,7 @@ fn handle_outcome(
                         "amount_base_units": decoded.amount_base_units,
                         "currency": decoded.currency_label,
                         "mint": decoded.method_details.mint,
-                        "plan": decoded.method_details.plan_id,
+                        "plan": decoded.method_details.plan_address,
                         "puller": decoded.method_details.puller,
                         "recipient": decoded.request.recipient,
                         "period_unit": match decoded.period_unit {
@@ -2123,6 +2123,7 @@ mod tests {
                 network: "localnet".to_string(),
                 channel_program: solana_pubkey::Pubkey::new_unique().to_string(),
                 channel_id: None,
+                transaction_versions: None,
                 recent_blockhash: Some("11111111111111111111111111111111".to_string()),
                 recent_slot: Some(1),
                 decimals: Some(6),

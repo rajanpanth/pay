@@ -3,7 +3,7 @@
 //! Thin wrapper around `pay_kit::x402::client::exact` for challenge detection
 //! and payment building.
 
-use pay_kit::x402::solana_keychain::SolanaSigner;
+use pay_kit::x402::solana_keychain::{SolanaSigner, TransactionSigner};
 use pay_kit::x402::solana_rpc_client::rpc_client::RpcClient;
 use pay_kit::x402::{
     PAYMENT_REQUIRED_HEADER, X402_V1_PAYMENT_REQUIRED_HEADER, X402_VERSION_FIELD, X402_VERSION_V1,
@@ -726,7 +726,7 @@ pub fn build_siwx_auth_header_with_override(
 
 fn build_siwx_header(
     challenge: &Challenge,
-    signer: &dyn SolanaSigner,
+    signer: &dyn TransactionSigner,
     network: &str,
     rt: &tokio::runtime::Runtime,
 ) -> Result<Option<(&'static str, String)>> {
@@ -943,6 +943,7 @@ mod tests {
             extra: None,
             accepted: None,
             resource_info: None,
+            transaction_versions: None,
         }
     }
 
@@ -1057,7 +1058,7 @@ mod tests {
                 "maxAmountRequired": "5000",
                 "payTo": "abc123",
                 "asset": "SOL",
-                "resource": "/test"
+                "resource": "/test",
             }]
         })
         .to_string();

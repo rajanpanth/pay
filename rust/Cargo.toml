@@ -116,7 +116,7 @@ http-body = "1"
 # deps. The `axum` feature (kit's own gate) is intentionally OFF — pay has its
 # own gate (pay-core + pay-proxy).
 #
-pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundation/pay-kit.git", rev = "c143bfab", default-features = false, features = [
+pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundation/pay-kit.git", rev = "1cfc850b", default-features = false, features = [
     "mpp",
     "x402",
     "client",
@@ -129,12 +129,19 @@ pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundat
 # Solana primitives (pinned to versions used by solana-mpp)
 bincode = "1"
 solana-commitment-config = "3.1"
-solana-hash = "3.1"
+solana-hash = "4.4"
 solana-instruction = "3.2"
-solana-message = "3.1"
+solana-message = "~4.4"
 solana-pubkey = "3.0"
 solana-keypair = "3.1"
 solana-sanitize = "3.0"
 solana-signature = "3.2"
 solana-system-interface = "2.0"
-solana-transaction = "3.1"
+solana-transaction = "~4.1"
+
+# solana-keychain 2.0.0-beta.1 on crates.io compiles its `sdk-v4` feature against
+# wincode 0.4; pay-kit is on the SDK 4.1+ line (wincode 0.5). Keychain main has
+# the bump but no release yet. Mirrors pay-kit's workspace patch; drop both once
+# solana-keychain 2.0.0-beta.2 ships.
+[patch.crates-io]
+solana-keychain = { git = "https://github.com/solana-foundation/solana-keychain", rev = "6461a18cc39d4700d589b1eb981f8ddd71c09e8d" }

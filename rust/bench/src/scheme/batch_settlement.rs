@@ -1190,6 +1190,7 @@ mod tests {
             pay_to: Pubkey::from([5_u8; 32]).to_string(),
             max_timeout_seconds: 60,
             extra: BatchExtra {
+                transaction_versions: None,
                 payment_flow: None,
                 fee_payer: fee_payer.to_string(),
                 receiver_authorizer: None,
@@ -1299,6 +1300,7 @@ mod tests {
             pay_to: pc::pubkey_string(&Pubkey::from([5u8; 32])),
             max_timeout_seconds: 60,
             extra: BatchExtra {
+                transaction_versions: None,
                 payment_flow: None,
                 fee_payer: pc::pubkey_string(&fee_payer),
                 receiver_authorizer: None,

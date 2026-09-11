@@ -78,7 +78,7 @@ fn server_built_challenge_round_trips_through_client_classify_and_decode() {
     //    server's `methodDetails` shape matches what the client expects —
     //    they were authored independently and could drift.
     let decoded = sub_client::decode(&challenge).expect("decode");
-    assert_eq!(decoded.method_details.plan_id, PLAN);
+    assert_eq!(decoded.method_details.plan_address, PLAN);
     assert_eq!(decoded.method_details.puller, OPERATOR);
     assert_eq!(decoded.amount_base_units, "9990000");
     assert_eq!(decoded.period_count, 30);
@@ -107,8 +107,7 @@ fn receipt_parser_extracts_subscription_extensions() {
         parsed.extensions.subscription_id,
         "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE"
     );
-    assert_eq!(parsed.extensions.plan_id, PLAN);
-    assert_eq!(parsed.extensions.period_index, "0");
+    assert_eq!(parsed.extensions.period_index, 0);
 }
 
 #[test]

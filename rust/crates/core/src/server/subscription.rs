@@ -57,7 +57,8 @@ pub struct OperatorDefaults<'a> {
     /// — the SDK's verify path co-signs the activation transaction
     /// with it before broadcasting. The middleware threads it through
     /// from `PaymentState::fee_payer_signer`.
-    pub fee_payer_signer: Option<std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>>,
+    pub fee_payer_signer:
+        Option<std::sync::Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>>,
 }
 
 /// Resolve `(amount_base_units, decimals, mint_b58)` from the endpoint
@@ -205,6 +206,7 @@ pub fn build_handler(
     };
 
     SubscriptionServer::new(config)
+        .map(|server| server.with_tx_v1(pay_kit::core::tx::TxV1Mode::Auto))
         .map_err(|e| Error::Mpp(format!("Failed to initialise SubscriptionServer: {e}")))
 }
 
@@ -332,7 +334,7 @@ pub async fn check_plan_exists(
 pub async fn publish_plan(
     spec: &SubscriptionEndpoint,
     operator: &solana_pubkey::Pubkey,
-    operator_signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>,
+    operator_signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>,
     rpc_url: &str,
     plan_id_numeric: u64,
 ) -> Result<PublishedPlan> {
@@ -451,14 +453,11 @@ async fn fetch_plan_created_at(rpc_url: &str, plan_pda: &solana_pubkey::Pubkey) 
 /// and broadcast through `send_and_confirm_transaction`. Returns the
 /// settlement signature as base58.
 async fn sign_and_broadcast(
-    signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::SolanaSigner>,
+    signer: std::sync::Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>,
     instructions: Vec<solana_instruction::Instruction>,
     rpc_url: &str,
 ) -> Result<String> {
     use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
-    use solana_message::Message;
-    use solana_signature::Signature;
-    use solana_transaction::Transaction;
 
     let url = rpc_url.to_string();
     let signer_pubkey = signer.pubkey();
@@ -475,36 +474,21 @@ async fn sign_and_broadcast(
     .await
     .map_err(|e| Error::Mpp(format!("RPC task join: {e}")))??;
 
-    let message = Message::new_with_blockhash(&instructions, Some(&signer_pubkey), &blockhash);
-    let mut tx = Transaction::new_unsigned(message);
-
-    let msg_bytes = tx.message_data();
-    let sig_bytes = signer
-        .sign_message(&msg_bytes)
+    let mut tx = pay_kit::core::tx::build_unsigned(
+        pay_kit::core::tx::TxVersion::V0,
+        &signer_pubkey,
+        &instructions,
+        blockhash,
+        None,
+    )
+    .map_err(|e| Error::Mpp(format!("Failed to build tx: {e}")))?;
+    pay_kit::core::signing::sign_versioned_transaction_slot(signer.as_ref(), &mut tx)
         .await
         .map_err(|e| Error::Mpp(format!("Operator signing failed: {e}")))?;
-    let signature = Signature::from(<[u8; 64]>::from(sig_bytes));
 
-    let signer_index = tx
-        .message
-        .account_keys
-        .iter()
-        .position(|k| *k == signer_pubkey)
-        .ok_or_else(|| Error::Mpp("Operator pubkey absent from account_keys".into()))?;
-    if tx.signatures.len() <= signer_index {
-        return Err(Error::Mpp(
-            "Transaction signatures vec is shorter than account_keys".into(),
-        ));
-    }
-    tx.signatures[signer_index] = signature;
-
-    let serialised =
-        bincode::serialize(&tx).map_err(|e| Error::Mpp(format!("Failed to serialise tx: {e}")))?;
     let confirmed_sig = tokio::task::spawn_blocking(move || {
         let rpc = RpcClient::new(url);
-        let tx: Transaction = bincode::deserialize(&serialised)
-            .map_err(|e| Error::Mpp(format!("tx round-trip: {e}")))?;
-        rpc.send_and_confirm_transaction(&tx)
+        pay_kit::core::rpc::send_and_confirm_transaction(&rpc, &tx)
             .map_err(|e| Error::Mpp(format!("Broadcast failed: {e}")))
     })
     .await

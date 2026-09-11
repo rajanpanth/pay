@@ -14,7 +14,7 @@ use pay_core::PaymentState;
 use pay_core::server::session::SessionMpp;
 use pay_kit::mpp::server::Mpp;
 use pay_kit::mpp::server::session::{SessionConfig, VoucherSigner};
-use pay_kit::mpp::solana_keychain::SolanaSigner;
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use pay_kit::mpp::solana_keychain::memory::MemorySigner;
 use pay_types::metering::ApiSpec;
 use surfpool_sdk::{Keypair, Signer, Surfnet};
@@ -152,7 +152,7 @@ fn build_state(
     rpc_url: &str,
     recipient: &str,
     operator: &str,
-    operator_signer: Option<Arc<dyn SolanaSigner>>,
+    operator_signer: Option<Arc<dyn TransactionSigner>>,
 ) -> Result<AppState> {
     match scheme {
         Scheme::MppSession => {
@@ -252,7 +252,7 @@ async fn setup_fork_proxy(cfg: &RunConfig) -> Result<(Surfnet, String, String)> 
         .as_ref()
         .map(|s| s.settle_onchain)
         .unwrap_or(false);
-    let operator_signer: Option<Arc<dyn SolanaSigner>> = if settle_onchain {
+    let operator_signer: Option<Arc<dyn TransactionSigner>> = if settle_onchain {
         Some(Arc::new(
             MemorySigner::from_bytes(&operator.to_bytes())
                 .map_err(|e| anyhow::anyhow!("operator signer: {e}"))?,
