@@ -135,6 +135,235 @@ fn report_billing_events_drains_and_acks_a_real_event() {
         redis::Value::Int(0),
         "expected every delivered entry to be acknowledged, got {pending:?}"
     );
+
+    // Regression: XACK alone does not shrink the stream. A handled entry
+    // must also be XDELed, or the stream grows without bound forever.
+    let len: u64 = redis::cmd("XLEN")
+        .arg(STREAM_KEY)
+        .query(&mut conn)
+        .expect("XLEN");
+    assert_eq!(
+        len, 0,
+        "expected the acknowledged entry to also be removed from the stream, stream still has {len} entries"
+    );
+}
+
+/// Regression test for "pending events never recovered": simulates a
+/// consumer that read an entry via `XREADGROUP` and then crashed before
+/// acking it, then runs the real binary as a fresh process (a distinct PID,
+/// so under the old per-call consumer-naming scheme it would also be a
+/// distinct, unrelated consumer identity) and asserts it reclaims, reports,
+/// and fully removes the stranded entry rather than leaving it pending
+/// forever.
+#[test]
+fn report_billing_events_reclaims_a_stranded_pending_entry() {
+    let Some(redis_server) = RedisServer::start() else {
+        eprintln!(
+            "skipping report_billing_events_reclaims_a_stranded_pending_entry: redis-server not found on PATH"
+        );
+        return;
+    };
+
+    let client = redis::Client::open(redis_server.url()).expect("valid redis url");
+    let mut conn = client.get_connection().expect("connect to ephemeral redis");
+
+    let payload = serde_json::json!({
+        "method": "POST",
+        "path": "v1/simple/echo",
+        "status": 200,
+        "ms": 7,
+        "scheme": "x402-exact",
+        "charge_status": "charged",
+        "currency": "USDC",
+        "amount_usd": 0.02,
+        "unit": "requests",
+        "quantity": null,
+    })
+    .to_string();
+    let _: String = redis::cmd("XADD")
+        .arg(STREAM_KEY)
+        .arg("*")
+        .arg("event")
+        .arg(&payload)
+        .query(&mut conn)
+        .expect("seed the stream");
+
+    // Simulate a consumer that read the entry and then crashed: create the
+    // group, deliver the entry to a consumer that will never ack it.
+    let _: Result<String, redis::RedisError> = redis::cmd("XGROUP")
+        .arg("CREATE")
+        .arg(STREAM_KEY)
+        .arg(CONSUMER_GROUP)
+        .arg("0")
+        .query(&mut conn);
+    let _: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
+        .arg("GROUP")
+        .arg(CONSUMER_GROUP)
+        .arg("crashed-consumer")
+        .arg("COUNT")
+        .arg(10)
+        .arg("STREAMS")
+        .arg(STREAM_KEY)
+        .arg(">")
+        .query(&mut conn)
+        .expect("simulate delivery to a since-crashed consumer");
+
+    let pending_before: redis::Value = redis::cmd("XPENDING")
+        .arg(STREAM_KEY)
+        .arg(CONSUMER_GROUP)
+        .query(&mut conn)
+        .expect("XPENDING summary");
+    let redis::Value::Array(fields_before) = &pending_before else {
+        panic!("unexpected XPENDING reply shape: {pending_before:?}");
+    };
+    assert_eq!(
+        fields_before[0],
+        redis::Value::Int(1),
+        "expected the simulated crash to leave exactly one entry pending, got {pending_before:?}"
+    );
+
+    let bin = env!("CARGO_BIN_EXE_report-billing-events");
+    let status = Command::new(bin)
+        .env("PAY_BILLING_REDIS_URL", redis_server.url())
+        .env("RUN_ONCE", "true")
+        // Reclaim immediately rather than waiting the default 60s — the
+        // entry above is already "stranded", regardless of its exact age.
+        .env("BILLING_EXPORT_MIN_IDLE_MS", "0")
+        .status()
+        .expect("run report-billing-events");
+    assert!(
+        status.success(),
+        "report-billing-events exited with {status}"
+    );
+
+    let pending_after: redis::Value = redis::cmd("XPENDING")
+        .arg(STREAM_KEY)
+        .arg(CONSUMER_GROUP)
+        .query(&mut conn)
+        .expect("XPENDING summary");
+    let redis::Value::Array(fields_after) = &pending_after else {
+        panic!("unexpected XPENDING reply shape: {pending_after:?}");
+    };
+    assert_eq!(
+        fields_after[0],
+        redis::Value::Int(0),
+        "expected the stranded entry to be reclaimed and acked, got {pending_after:?}"
+    );
+
+    let len: u64 = redis::cmd("XLEN")
+        .arg(STREAM_KEY)
+        .query(&mut conn)
+        .expect("XLEN");
+    assert_eq!(len, 0, "expected the reclaimed entry to also be XDELed, got {len} remaining");
+}
+
+/// Regression test for "run once leaves backlogs": seeds more entries than
+/// a single batch, and asserts one `RUN_ONCE` invocation still drains the
+/// entire backlog rather than stopping after the first `XREADGROUP` call.
+#[test]
+fn report_billing_events_run_once_drains_a_backlog_larger_than_one_batch() {
+    let Some(redis_server) = RedisServer::start() else {
+        eprintln!(
+            "skipping report_billing_events_run_once_drains_a_backlog_larger_than_one_batch: redis-server not found on PATH"
+        );
+        return;
+    };
+
+    let client = redis::Client::open(redis_server.url()).expect("valid redis url");
+    let mut conn = client.get_connection().expect("connect to ephemeral redis");
+
+    const BATCH_SIZE: usize = 3;
+    const TOTAL: usize = 10; // more than 3x the batch size
+    let payload = serde_json::json!({
+        "method": "POST",
+        "path": "v1/simple/echo",
+        "status": 200,
+        "ms": 1,
+        "scheme": "mpp-charge",
+        "charge_status": "charged",
+        "currency": "SOL",
+        "amount_usd": 0.001,
+        "unit": "requests",
+        "quantity": null,
+    })
+    .to_string();
+    for _ in 0..TOTAL {
+        let _: String = redis::cmd("XADD")
+            .arg(STREAM_KEY)
+            .arg("*")
+            .arg("event")
+            .arg(&payload)
+            .query(&mut conn)
+            .expect("seed the stream");
+    }
+
+    let bin = env!("CARGO_BIN_EXE_report-billing-events");
+    let status = Command::new(bin)
+        .env("PAY_BILLING_REDIS_URL", redis_server.url())
+        .env("RUN_ONCE", "true")
+        .env("BILLING_EXPORT_BATCH_SIZE", BATCH_SIZE.to_string())
+        .status()
+        .expect("run report-billing-events");
+    assert!(
+        status.success(),
+        "report-billing-events exited with {status}"
+    );
+
+    let len: u64 = redis::cmd("XLEN")
+        .arg(STREAM_KEY)
+        .query(&mut conn)
+        .expect("XLEN");
+    assert_eq!(
+        len, 0,
+        "expected a single RUN_ONCE invocation to drain the full {TOTAL}-entry backlog \
+         (batch size {BATCH_SIZE}) rather than stop after one batch, {len} entries remain"
+    );
+}
+
+/// Regression test for "consumer metadata grows forever": two separate
+/// process invocations (distinct PIDs — under the old per-call
+/// `pid-timestamp` naming scheme these would already be two distinct
+/// consumers even before considering repeated polls within one process)
+/// with the same `HOSTNAME` must register as exactly one Redis consumer
+/// identity, not two.
+#[test]
+fn report_billing_events_reuses_one_consumer_identity_across_invocations() {
+    let Some(redis_server) = RedisServer::start() else {
+        eprintln!(
+            "skipping report_billing_events_reuses_one_consumer_identity_across_invocations: redis-server not found on PATH"
+        );
+        return;
+    };
+
+    let client = redis::Client::open(redis_server.url()).expect("valid redis url");
+    let mut conn = client.get_connection().expect("connect to ephemeral redis");
+
+    let bin = env!("CARGO_BIN_EXE_report-billing-events");
+    for _ in 0..2 {
+        let status = Command::new(bin)
+            .env("PAY_BILLING_REDIS_URL", redis_server.url())
+            .env("RUN_ONCE", "true")
+            .env("HOSTNAME", "stable-test-instance")
+            .status()
+            .expect("run report-billing-events");
+        assert!(
+            status.success(),
+            "report-billing-events exited with {status}"
+        );
+    }
+
+    let consumers: Vec<redis::Value> = redis::cmd("XINFO")
+        .arg("CONSUMERS")
+        .arg(STREAM_KEY)
+        .arg(CONSUMER_GROUP)
+        .query(&mut conn)
+        .expect("XINFO CONSUMERS");
+    assert_eq!(
+        consumers.len(),
+        1,
+        "expected two invocations under the same HOSTNAME to register as one stable consumer, got {}: {consumers:?}",
+        consumers.len()
+    );
 }
 
 #[test]

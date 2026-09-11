@@ -7,9 +7,20 @@
 //! self-hosted, analytics-only Apigee Adapter feed is acceptable for a
 //! partner's billing meter (vs. requiring traffic through their fully-hosted
 //! proxy) is still an open question with that partner. Until it's answered,
-//! this job proves the pipeline end-to-end — reading real events, decoding
-//! them, and acking them — with the actual outbound call as the one place
-//! (`report`, below) that needs to change once that's resolved.
+//! this job proves the pipeline end-to-end — reclaiming and reading real
+//! events, decoding them, and acking them only once `report` (below)
+//! succeeds — with the actual outbound call as the one place that needs to
+//! change once that's resolved.
+//!
+//! Uses a single, stable consumer identity for the life of the process
+//! (`HOSTNAME`, falling back to the PID) rather than a fresh one per poll —
+//! Redis never forgets a consumer group's member list on its own, so a
+//! per-call identity leaks unbounded `XINFO CONSUMERS` metadata. Every
+//! drain reclaims stale-pending entries (delivered to a since-crashed
+//! consumer, never acked) via `XAUTOCLAIM` before reading new ones, and a
+//! single "drain" (one `RUN_ONCE` invocation, or one continuous-mode tick)
+//! loops until the stream is fully caught up rather than stopping after one
+//! batch.
 //!
 //! Env:
 //!   PAY_BILLING_REDIS_URL             Redis connection URL (required)
@@ -17,11 +28,16 @@
 //!                                     continuous Cloud Run service form
 //!   BILLING_EXPORT_INTERVAL_SECONDS   poll interval in continuous mode
 //!                                     (default 10)
-//!   BILLING_EXPORT_BATCH_SIZE         max entries per XREADGROUP call
-//!                                     (default 200)
+//!   BILLING_EXPORT_BATCH_SIZE         max entries per XREADGROUP/XAUTOCLAIM
+//!                                     call (default 200)
+//!   BILLING_EXPORT_MIN_IDLE_MS        how long an entry must sit
+//!                                     unacknowledged under another
+//!                                     consumer before this one reclaims it
+//!                                     (default 60000)
 //!   PORT                              health-check port in continuous mode
 //!                                     (default 8080)
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::Router;
@@ -38,6 +54,7 @@ const STREAM_KEY: &str = "pay:billing:events";
 const CONSUMER_GROUP: &str = "report-billing-events";
 const DEFAULT_INTERVAL_SECONDS: u64 = 10;
 const DEFAULT_BATCH_SIZE: u64 = 200;
+const DEFAULT_MIN_IDLE_MS: u64 = 60_000;
 const DEFAULT_PORT: u64 = 8080;
 
 /// Mirrors `pay_core::BillingEvent`'s JSON shape. Deliberately not a shared
@@ -60,6 +77,13 @@ struct BillingEvent {
     quantity: Option<u64>,
 }
 
+/// `report`'s failure mode. Never constructed today — see `report`'s doc
+/// comment — but real: the ack-only-on-success wiring below depends on this
+/// being an actual `Result`, not a formality.
+#[derive(Debug, thiserror::Error)]
+#[error("billing event report failed")]
+struct ReportError;
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     let _telemetry = telemetry::init("pay-jobs-report-billing-events");
@@ -80,6 +104,11 @@ async fn main() -> std::process::ExitCode {
         Ok(value) => value,
         Err(error) => return record_startup_failure(error),
     };
+    let min_idle_ms = match parse_u64_env("BILLING_EXPORT_MIN_IDLE_MS", DEFAULT_MIN_IDLE_MS) {
+        Ok(value) => value,
+        Err(error) => return record_startup_failure(error),
+    };
+    let consumer = consumer_identity();
 
     let mut conn = match connect(&redis_url).await {
         Ok(conn) => conn,
@@ -90,7 +119,7 @@ async fn main() -> std::process::ExitCode {
     }
 
     if run_once {
-        return match drain_once(&mut conn, batch_size).await {
+        return match drain_all(&mut conn, &consumer, batch_size, min_idle_ms).await {
             Ok(count) => {
                 info!(
                     count,
@@ -139,6 +168,7 @@ async fn main() -> std::process::ExitCode {
     info!(
         %address,
         interval_seconds,
+        consumer = %consumer,
         "continuous report-billing-events worker starting"
     );
 
@@ -166,7 +196,7 @@ async fn main() -> std::process::ExitCode {
             () = cancel.cancelled() => break,
             _ = ticker.tick() => {}
         }
-        match drain_once(&mut conn, batch_size).await {
+        match drain_all(&mut conn, &consumer, batch_size, min_idle_ms).await {
             Ok(count) if count > 0 => info!(count, "reported billing events"),
             Ok(_) => {}
             Err(error) => warn!(%error, "billing-event drain failed; will retry next tick"),
@@ -196,6 +226,18 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+/// A single, stable identity reused for the life of the process. Cloud
+/// Run sets `HOSTNAME` to a value stable for the life of one instance —
+/// exactly the granularity a Redis consumer group member should have.
+/// Falls back to the PID (also process-lifetime-stable) when unset, e.g.
+/// running locally.
+fn consumer_identity() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| std::process::id().to_string())
+}
+
 async fn connect(redis_url: &str) -> Result<redis::aio::ConnectionManager, JobError> {
     let client =
         redis::Client::open(redis_url).map_err(|error| JobError::Config(format!("Redis client: {error}")))?;
@@ -223,19 +265,86 @@ async fn ensure_group(conn: &mut redis::aio::ConnectionManager) -> Result<(), Jo
     }
 }
 
-/// Read one batch via the consumer group, report and `XACK` whatever decoded
-/// cleanly. A malformed entry is acked anyway (logged, not retried) rather
-/// than left to block the group forever on a poison message. Returns the
-/// number of entries acknowledged.
+/// Drains repeatedly until a pass reclaims and reads nothing at all. One
+/// `RUN_ONCE` invocation, or one continuous-mode tick, must not report
+/// success while entries beyond a single batch remain available — each
+/// underlying `drain_once` call is bounded by `batch_size`, so catching up
+/// after any real backlog takes more than one call.
+async fn drain_all(
+    conn: &mut redis::aio::ConnectionManager,
+    consumer: &str,
+    batch_size: u64,
+    min_idle_ms: u64,
+) -> Result<usize, JobError> {
+    let mut total = 0usize;
+    loop {
+        let count = drain_once(conn, consumer, batch_size, min_idle_ms).await?;
+        if count == 0 {
+            return Ok(total);
+        }
+        total += count;
+    }
+}
+
+/// Reclaims stale-pending entries (delivered to a consumer that crashed or
+/// was replaced before acking) before reading newly-arrived ones. Returns
+/// the total number of entries acknowledged across both.
 async fn drain_once(
     conn: &mut redis::aio::ConnectionManager,
+    consumer: &str,
+    batch_size: u64,
+    min_idle_ms: u64,
+) -> Result<usize, JobError> {
+    let reclaimed = reclaim_pending(conn, consumer, batch_size, min_idle_ms).await?;
+    let read = read_new(conn, consumer, batch_size).await?;
+    Ok(reclaimed + read)
+}
+
+/// `XAUTOCLAIM`s up to `batch_size` entries that have been pending (
+/// delivered, never acked) for at least `min_idle_ms` under any consumer,
+/// reassigns them to `consumer`, and processes them exactly like freshly
+/// read ones. Always scans from the start of the pending list (`0-0`): a
+/// reclaimed-and-then-acked entry leaves the pending list entirely, so
+/// repeated calls converge without needing to track `XAUTOCLAIM`'s cursor.
+async fn reclaim_pending(
+    conn: &mut redis::aio::ConnectionManager,
+    consumer: &str,
+    batch_size: u64,
+    min_idle_ms: u64,
+) -> Result<usize, JobError> {
+    let reply: Value = redis::cmd("XAUTOCLAIM")
+        .arg(STREAM_KEY)
+        .arg(CONSUMER_GROUP)
+        .arg(consumer)
+        .arg(min_idle_ms)
+        .arg("0-0")
+        .arg("COUNT")
+        .arg(batch_size)
+        .query_async(conn)
+        .await
+        .map_err(|error| JobError::Config(format!("Redis XAUTOCLAIM: {error}")))?;
+    // Reply shape: [next-cursor, [[id, [field, value, ...]], ...], deleted-ids?].
+    let Value::Array(parts) = reply else {
+        return Ok(0);
+    };
+    let entries = match parts.get(1) {
+        Some(entries_value) => parse_claimed_entries(entries_value),
+        None => Vec::new(),
+    };
+    process_entries(conn, &entries).await
+}
+
+/// Reads newly-arrived entries (`>`) via the consumer group and processes
+/// them.
+async fn read_new(
+    conn: &mut redis::aio::ConnectionManager,
+    consumer: &str,
     batch_size: u64,
 ) -> Result<usize, JobError> {
-    let consumer = format!("{}-{}", std::process::id(), unix_nanos());
     let reply: redis::streams::StreamReadReply = redis::cmd("XREADGROUP")
         .arg("GROUP")
         .arg(CONSUMER_GROUP)
-        .arg(&consumer)
+        .arg(consumer)
         .arg("COUNT")
         .arg(batch_size)
         .arg("STREAMS")
@@ -245,19 +354,49 @@ async fn drain_once(
         .await
         .map_err(|error| JobError::Config(format!("Redis XREADGROUP: {error}")))?;
 
-    let mut ids_to_ack = Vec::new();
+    let mut entries = Vec::new();
     for stream_key in &reply.keys {
         for entry in &stream_key.ids {
-            match decode_entry(entry) {
-                Some(Ok(event)) => report(&event),
-                Some(Err(error)) => {
-                    warn!(%error, id = %entry.id, "failed to decode billing event");
+            entries.push((entry.id.clone(), entry.map.clone()));
+        }
+    }
+    process_entries(conn, &entries).await
+}
+
+/// Reports each entry and only then `XACK`s + `XDEL`s it. A malformed
+/// entry (undecodable, or missing its `event` field) is acked and deleted
+/// anyway — logged, not retried — since no amount of retrying will make a
+/// permanently poison message decodable; a `report` failure, in contrast,
+/// leaves the entry pending so the next drain retries it (or, eventually,
+/// `reclaim_pending` does, once it has aged past `min_idle_ms`).
+async fn process_entries(
+    conn: &mut redis::aio::ConnectionManager,
+    entries: &[(String, HashMap<String, Value>)],
+) -> Result<usize, JobError> {
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let mut ids_to_ack = Vec::new();
+    for (id, fields) in entries {
+        let handled = match decode_entry(fields) {
+            Some(Ok(event)) => match report(&event) {
+                Ok(()) => true,
+                Err(error) => {
+                    warn!(%error, %id, "billing event report failed; leaving pending for retry");
+                    false
                 }
-                None => {
-                    warn!(id = %entry.id, "billing-event entry missing its 'event' field");
-                }
+            },
+            Some(Err(error)) => {
+                warn!(%error, %id, "failed to decode billing event; dropping (poison message)");
+                true
             }
-            ids_to_ack.push(entry.id.clone());
+            None => {
+                warn!(%id, "billing-event entry missing its 'event' field; dropping");
+                true
+            }
+        };
+        if handled {
+            ids_to_ack.push(id.clone());
         }
     }
     if ids_to_ack.is_empty() {
@@ -273,17 +412,72 @@ async fn drain_once(
         .query_async(conn)
         .await
         .map_err(|error| JobError::Config(format!("Redis XACK: {error}")))?;
+
+    // XACK only clears the consumer group's pending list — it does not
+    // shrink the stream itself. Without this, every successfully handled
+    // entry (on top of whatever the producer's XADD ... MAXLEN trims)
+    // stays in Redis forever.
+    let mut del = redis::cmd("XDEL");
+    del.arg(STREAM_KEY);
+    for id in &ids_to_ack {
+        del.arg(id);
+    }
+    let _: i64 = del
+        .query_async(conn)
+        .await
+        .map_err(|error| JobError::Config(format!("Redis XDEL: {error}")))?;
+
     Ok(ids_to_ack.len())
+}
+
+fn value_as_string(value: &Value) -> Option<String> {
+    match value {
+        Value::BulkString(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        Value::SimpleString(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Parses a raw `[field, value, field, value, ...]` reply array (the shape
+/// `XAUTOCLAIM`/`XRANGE`/`XCLAIM` return per entry) into a field map — the
+/// same shape `redis::streams::StreamId::map` already gives `XREADGROUP`
+/// callers, so `decode_entry` can treat both sources identically.
+fn parse_fields_array(value: &Value) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+    if let Value::Array(items) = value {
+        let mut iter = items.iter();
+        while let (Some(key_value), Some(value)) = (iter.next(), iter.next()) {
+            if let Some(key) = value_as_string(key_value) {
+                map.insert(key, value.clone());
+            }
+        }
+    }
+    map
+}
+
+/// Parses `XAUTOCLAIM`'s entries array (`reply[1]`) into `(id, fields)`
+/// pairs.
+fn parse_claimed_entries(value: &Value) -> Vec<(String, HashMap<String, Value>)> {
+    let Value::Array(entries) = value else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let Value::Array(parts) = entry else {
+                return None;
+            };
+            let id = value_as_string(parts.first()?)?;
+            let fields = parts.get(1).map(parse_fields_array).unwrap_or_default();
+            Some((id, fields))
+        })
+        .collect()
 }
 
 /// `None` if the entry carries no `event` field at all; `Some(Err(_))` if it
 /// does but isn't valid UTF-8 JSON matching `BillingEvent`.
-fn decode_entry(entry: &redis::streams::StreamId) -> Option<Result<BillingEvent, serde_json::Error>> {
-    let raw = match entry.map.get("event")? {
-        Value::BulkString(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-        Value::SimpleString(s) => s.clone(),
-        _ => return None,
-    };
+fn decode_entry(fields: &HashMap<String, Value>) -> Option<Result<BillingEvent, serde_json::Error>> {
+    let raw = value_as_string(fields.get("event")?)?;
     Some(serde_json::from_str(&raw))
 }
 
@@ -291,7 +485,11 @@ fn decode_entry(entry: &redis::streams::StreamId) -> Option<Result<BillingEvent,
 /// partner confirms whether the self-hosted, analytics-only Adapter feed is
 /// acceptable for their billing meter. For now this proves the pipeline
 /// works end-to-end against real, non-mocked billing events.
-fn report(event: &BillingEvent) {
+///
+/// Infallible today — a `tracing::info!` call cannot fail — but returns a
+/// `Result` so `process_entries`' ack-only-on-success logic is already
+/// correctly wired for when this becomes a real outbound call.
+fn report(event: &BillingEvent) -> Result<(), ReportError> {
     info!(
         monotonic_counter.pay_billing_events_reported_total = 1_u64,
         method = %event.method,
@@ -305,13 +503,7 @@ fn report(event: &BillingEvent) {
         quantity = event.quantity,
         "billing event"
     );
-}
-
-fn unix_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default()
+    Ok(())
 }
 
 fn record_startup_failure(error: JobError) -> std::process::ExitCode {
