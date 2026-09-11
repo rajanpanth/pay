@@ -1834,16 +1834,6 @@ impl StartCommand {
                     } else {
                         (recipient.clone(), session_splits)
                     };
-                let settlement_signer = fee_payer_signer
-                    .as_ref()
-                    .expect("live MPP session signer validated above");
-                if settlement_signer.pubkey().to_string() != session_recipient {
-                    return Err(pay_core::Error::Config(
-                        "session settlement signer must match the configured payment recipient"
-                            .to_string(),
-                    ));
-                }
-
                 let (session_channel_store, durable_session_store) =
                     session_channel_store().await?;
                 let mut session_mpps = Vec::with_capacity(currency_configs.len());
