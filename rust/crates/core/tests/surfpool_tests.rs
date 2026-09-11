@@ -366,11 +366,141 @@ async fn mpp_charge_reports_a_charged_outcome_for_a_real_settled_payment() {
 
     assert_eq!(outcome.scheme, Scheme::MppCharge);
     assert_eq!(outcome.status, pay_core::ChargeStatus::Charged);
+    assert_eq!(outcome.subdomain, "testapi");
     assert_eq!(outcome.currency.as_deref(), Some("SOL"));
     assert!(
         outcome.amount_usd.is_some_and(|amount| amount > 0.0),
         "a real settled payment must report a positive amount, got {:?}",
         outcome.amount_usd
+    );
+}
+
+// =============================================================================
+// Billing event: single-API mode must attribute to the configured API's own
+// declared subdomain, never to whatever Host label the caller happened to
+// send — in single-API mode any Host is accepted (there's nothing else to
+// route to), so a caller-controlled label reaching billing attribution
+// would let consumption be misattributed under an arbitrary, self-chosen
+// name.
+// =============================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn mpp_charge_attributes_to_the_configured_subdomain_not_a_spoofed_host() {
+    use http::Method;
+    use pay_core::PaymentState;
+    use pay_core::server::gate::{GateDecision, GateRequest, PaymentGate};
+    use pay_kit::mpp::server::Mpp;
+    use pay_kit::mpp::solana_keychain::memory::MemorySigner;
+    use pay_types::metering::{ApiSpec, Scheme};
+    use std::sync::Arc;
+
+    #[derive(Clone)]
+    struct S {
+        apis: Arc<Vec<ApiSpec>>,
+        mpp: Option<Mpp>,
+    }
+    impl PaymentState for S {
+        fn apis(&self) -> &[ApiSpec] {
+            &self.apis
+        }
+        fn mpp(&self) -> Option<&Mpp> {
+            self.mpp.as_ref()
+        }
+    }
+
+    let surfnet = start_surfnet().await;
+    let recipient = Keypair::new();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&recipient.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let api: ApiSpec =
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
+            .unwrap();
+    assert_eq!(
+        api.subdomain, "testapi",
+        "this test's premise is that the fixture's real subdomain differs \
+         from the spoofed Host label used below"
+    );
+
+    let mpp = Mpp::new(pay_kit::mpp::server::Config {
+        recipient: recipient.pubkey().to_string(),
+        currency: "SOL".to_string(),
+        decimals: 9,
+        network: "localnet".to_string(),
+        rpc_url: Some(surfnet.rpc_url().to_string()),
+        challenge_binding_secret: Some("test-secret-key-do-not-use-32b-pad".to_string()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    // Single-API mode: exactly one configured API, so it serves any Host.
+    let state = S {
+        apis: Arc::new(vec![api]),
+        mpp: Some(mpp.clone()),
+    };
+    let gate = PaymentGate::new(state);
+
+    // A Host that does NOT match the fixture's declared "testapi" subdomain
+    // — single-API mode accepts it anyway and forwards to the one
+    // configured API.
+    let spoofed_host = "attacker-chosen-label.localhost";
+    let method = Method::POST;
+    let challenge_req = GateRequest {
+        method: &method,
+        path: "v1/simple/echo",
+        host: Some(spoofed_host),
+        accept: None,
+        authorization: None,
+        content_length: Some(2),
+        query: None,
+        x402_payment: None,
+    };
+    let GateDecision::Respond(challenge_resp) = gate.evaluate(&challenge_req).await else {
+        panic!("expected a 402 challenge without a credential");
+    };
+    let www_auth = challenge_resp
+        .headers
+        .iter()
+        .find(|(name, _)| name.as_str().eq_ignore_ascii_case("www-authenticate"))
+        .and_then(|(_, value)| value.to_str().ok())
+        .expect("402 response carries a WWW-Authenticate challenge")
+        .to_string();
+    let challenge = pay_kit::mpp::parse_www_authenticate(&www_auth).unwrap();
+
+    let payer = Keypair::new();
+    surfnet
+        .cheatcodes()
+        .fund_sol(&payer.pubkey(), 2_000_000_000)
+        .unwrap();
+    let signer = MemorySigner::from_bytes(&payer.to_bytes()).unwrap();
+    let rpc =
+        pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient::new(surfnet.rpc_url().to_string());
+    let auth = pay_kit::mpp::client::build_credential_header(&signer, &rpc, &challenge)
+        .await
+        .unwrap();
+
+    let paid_req = GateRequest {
+        authorization: Some(&auth),
+        ..challenge_req
+    };
+    let GateDecision::Forward { paid_request, .. } = gate.evaluate(&paid_req).await else {
+        panic!("expected the settled credential to forward");
+    };
+    let outcome = paid_request
+        .expect("mpp/charge always produces telemetry")
+        .into_charge_outcome()
+        .expect("mpp/charge is inside the metering model");
+
+    assert_eq!(outcome.scheme, Scheme::MppCharge);
+    assert_eq!(outcome.status, pay_core::ChargeStatus::Charged);
+    assert_eq!(
+        outcome.subdomain, "testapi",
+        "billing attribution must use the configured API's own subdomain, \
+         never the caller-supplied Host label ({spoofed_host:?}), got {:?}",
+        outcome.subdomain
     );
 }
 

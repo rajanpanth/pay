@@ -515,16 +515,23 @@ impl<S: PaymentState> PaymentGate<S> {
             return GateDecision::Passthrough;
         }
 
-        let subdomain = req.host.unwrap_or("").split('.').next().unwrap_or("");
+        let requested_subdomain = req.host.unwrap_or("").split('.').next().unwrap_or("");
         let accepts_html = req.accept.is_some_and(mpp_html::accepts_html);
 
         let apis = self.state.apis();
-        let api = match apis.iter().find(|a| a.subdomain == subdomain) {
+        let api = match apis.iter().find(|a| a.subdomain == requested_subdomain) {
             Some(api) => api,
             // Single-API mode: one configured API serves any subdomain.
             None if apis.len() == 1 => &apis[0],
             None => return GateDecision::Passthrough,
         };
+        // Always attribute telemetry/billing to the resolved API's own
+        // declared identity, not the caller-supplied Host header verbatim:
+        // in single-API mode any Host is accepted (`api` can legitimately
+        // differ from `requested_subdomain`), so recording the unverified
+        // header here would let a caller misattribute consumption under an
+        // arbitrary, self-chosen label.
+        let subdomain = api.subdomain.as_str();
 
         // Service worker for the HTML payment-link UI — before metering lookup
         // so it works for any path/method.
