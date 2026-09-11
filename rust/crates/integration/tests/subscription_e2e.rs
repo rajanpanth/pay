@@ -94,10 +94,11 @@ fn receipt_parser_extracts_subscription_extensions() {
         "timestamp": "2026-05-29T12:03:10Z",
         "reference": "5J8signature",
         "subscriptionId": "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE",
+        "subscriptionDelegation": "7Zt3z8YpQ7bF1o5Rk3yq2XnjwG9dKmbB4XyTzq1aP9Wc",
         "planId": PLAN,
-        "periodIndex": "0",
-        "periodStartTs": "2026-05-29T12:03:10Z",
-        "periodEndTs": "2026-06-28T12:03:10Z",
+        "periodIndex": 0,
+        "periodStart": "2026-05-29T12:03:10Z",
+        "periodEnd": "2026-06-28T12:03:10Z",
     });
     let header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
     let parsed = sub_client::parse_subscription_receipt(&header).expect("receipt");

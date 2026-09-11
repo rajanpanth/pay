@@ -22,7 +22,6 @@ use axum::http::Request;
 use axum::middleware;
 use axum::response::IntoResponse;
 use axum::routing::any;
-use base64::Engine;
 use ed25519_dalek::{Signer as _, SigningKey};
 use pay_core::PaymentState;
 use pay_kit::mpp::server::Mpp;
