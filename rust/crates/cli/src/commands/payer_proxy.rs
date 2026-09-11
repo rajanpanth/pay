@@ -2,7 +2,7 @@
 //!
 //! Some agent CLIs cannot handle HTTP 402 payment challenges, so they cannot
 //! talk to a priced inference gateway directly. This proxy sits between the
-//! agent process and the upstream (`pay serve inference`, a hosted paid
+//! agent process and the upstream (`pay gate inference`, a hosted paid
 //! provider, or a bare local provider in direct mode):
 //!
 //! 1. Every request is forwarded upstream, preserving method, path+query,
@@ -27,7 +27,7 @@
 //! Anthropic-shaped `POST /v1/messages` requests. When its upstream speaks
 //! OpenAI chat completions ([`Dialect::OpenAiCompat`] — vLLM, LM Studio,
 //! llama.cpp, Alibaba Model Studio's compatible mode), those requests are
-//! translated to OpenAI shape (see [`crate::commands::claude::translate`]),
+//! translated to OpenAI shape (see [`crate::commands::agent::translate`]),
 //! sent to the upstream's chat-completions path, and translated back to an
 //! Anthropic envelope. The payment retry composes with translation: the
 //! challenge fires on the translated request, so the retry replays the
@@ -51,7 +51,7 @@ use pay_core::accounts::{
 #[cfg(test)]
 use pay_kit::x402::PAYMENT_RESPONSE_HEADER;
 
-use super::claude::translate;
+use super::agent::translate;
 use crate::commands::server::inference::providers::Dialect;
 
 /// Request bodies are buffered so the paid retry can replay them; cap the
@@ -75,7 +75,8 @@ pub struct PayerProxy {
 /// Payment contract the local payer must enforce for its upstream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaymentProtocol {
-    /// Preserve the generic payer behavior: MPP charge first, then x402 upto.
+    /// Preserve the generic payer behavior: MPP charge first, then x402
+    /// `upto`, then x402 `exact`.
     Auto,
     /// Require a delegated MPP session and never fall back to x402.
     MppSession,
@@ -113,6 +114,8 @@ pub struct PayerUpstream {
 struct PayerState {
     /// Upstream base URL without a trailing slash.
     upstream: String,
+    /// Logical provider URL shown in session spending authorization.
+    authorization_url: String,
     host_header: Option<HeaderValue>,
     dialect: Dialect,
     /// Chat-completions path without a leading slash (translation target).
@@ -152,6 +155,12 @@ impl PayerState {
             .map(HeaderValue::from_str)
             .transpose()
             .map_err(|e| pay_core::Error::Config(format!("payer proxy Host header: {e}")))?;
+        let parsed_upstream = reqwest::Url::parse(&upstream.base_url)
+            .map_err(|e| pay_core::Error::Config(format!("payer proxy upstream URL: {e}")))?;
+        let authorization_url = match upstream.host_header.as_deref() {
+            Some(host) => format!("{}://{host}", parsed_upstream.scheme()),
+            None => upstream.base_url.clone(),
+        };
         // Do not impose a total request timeout: streamed completions may stay
         // open for minutes. Bound connection setup and silent read stalls so a
         // hung provider cannot retain the session mutex forever.
@@ -164,6 +173,7 @@ impl PayerState {
             .map_err(|e| pay_core::Error::Config(format!("payer proxy HTTP client: {e}")))?;
         Ok(Self {
             upstream: upstream.base_url.trim_end_matches('/').to_string(),
+            authorization_url,
             host_header,
             dialect: upstream.dialect,
             chat_path: upstream.chat_path.trim_start_matches('/').to_string(),
@@ -321,9 +331,14 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         }
     };
 
+    // Normalize OpenAI Chat Completions before the send/402 loop so paid
+    // retries replay the exact same compatible body. Goose uses the newer
+    // `developer` role for GPT-5, while some compatible providers only
+    // accept the older `system` role.
+    let body = normalize_openai_chat_request(&state, &method, &path, &body);
+
     // Anthropic → OpenAI request translation for OpenAI-compatible
-    // upstreams. Happens BEFORE the send/402 loop so the pay-retry
-    // replays the translated body. Everything else passes through.
+    // upstreams. This also happens before the send/402 loop.
     let (url, body, translated) = match translate_request(&state, &method, &path, &body) {
         Some(openai_body) => (
             format!("{}/{}", state.upstream, state.chat_path),
@@ -374,7 +389,10 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
     };
 
     if first.status() != StatusCode::PAYMENT_REQUIRED {
-        if state.require_payment && first.status().is_success() && !used_cached_session {
+        if requires_payment_challenge(&state, &method, &path)
+            && first.status().is_success()
+            && !used_cached_session
+        {
             tracing::error!(%url, status = %first.status(), "payer proxy: hosted provider bypassed its payment gate");
             let message = if path.trim_matches('/') == "v1/responses" {
                 "payer proxy: the hosted Responses endpoint is not payment-enabled; deploy its Agent Gateway provider spec before using Codex"
@@ -384,12 +402,6 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             return (StatusCode::BAD_GATEWAY, message).into_response();
         }
         return deliver(first, translated, session_authorization.take()).await;
-    }
-
-    // The cached channel may have expired, closed, or exhausted its cap. Drop
-    // it before consuming the fresh challenge and opening a replacement.
-    if let Some(cached) = session_authorization.as_mut() {
-        **cached = None;
     }
 
     // Buffer the 402 so it can be passed through untouched when payment
@@ -415,17 +427,80 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             .filter_map(|value| value.to_str().ok()),
     );
 
-    // A cached delegated session is represented by its idempotent `open`
-    // credential. Once the server seals that channel, the resulting 402 is a
-    // terminal-session error rather than a fresh challenge. Rediscovery must
-    // therefore happen without the stale credential before we can open a
-    // replacement channel.
+    let mut has_session_challenge = mpp_challenges.iter().any(|challenge| {
+        challenge.method.as_str() == "solana" && challenge.intent.as_str() == "session"
+    });
+
     if state.payment_protocol == PaymentProtocol::MppSession
         && used_cached_session
-        && !mpp_challenges.iter().any(|challenge| {
-            challenge.method.as_str() == "solana" && challenge.intent.as_str() == "session"
-        })
+        && !has_session_challenge
+        && retryable_cached_session_error(&resp_body)
     {
+        tracing::info!(%url, "payer proxy: retrying transient cached MPP session rejection");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let retried = match send_upstream(
+            &state,
+            &method,
+            &url,
+            &headers,
+            body.clone(),
+            cached_payment.as_ref(),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(%url, %error, "payer proxy: cached MPP session retry failed");
+                return buffered_response(status, &resp_headers, resp_body);
+            }
+        };
+        if retried.status() != StatusCode::PAYMENT_REQUIRED {
+            return deliver(retried, translated, session_authorization.take()).await;
+        }
+        status = retried.status();
+        resp_headers = retried.headers().clone();
+        resp_body = match retried.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%url, %error, "payer proxy: failed to read cached MPP session retry");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("payer proxy: upstream error: {error}"),
+                )
+                    .into_response();
+            }
+        };
+        mpp_challenges = pay_core::mpp::parse_all(
+            resp_headers
+                .get_all(header::WWW_AUTHENTICATE)
+                .iter()
+                .filter_map(|value| value.to_str().ok()),
+        );
+        has_session_challenge = mpp_challenges.iter().any(|challenge| {
+            challenge.method.as_str() == "solana" && challenge.intent.as_str() == "session"
+        });
+    }
+
+    // A cached operator-signed session is represented by its reusable `use`
+    // credential. Only a definitive terminal error or a fresh session
+    // challenge proves that the cached channel should be replaced. Transient
+    // store contention must preserve it for the next request.
+    if state.payment_protocol == PaymentProtocol::MppSession
+        && used_cached_session
+        && !has_session_challenge
+        && !terminal_cached_session_error(&resp_body)
+    {
+        tracing::warn!(%url, "payer proxy: preserving cached MPP session after non-terminal 402");
+        return buffered_response(status, &resp_headers, resp_body);
+    }
+
+    if state.payment_protocol == PaymentProtocol::MppSession
+        && used_cached_session
+        && !has_session_challenge
+    {
+        if let Some(cached) = session_authorization.as_mut() {
+            **cached = None;
+        }
         tracing::info!(%url, "payer proxy: cached MPP session ended; requesting a fresh challenge");
         let refreshed = match send_upstream(&state, &method, &url, &headers, body.clone(), None)
             .await
@@ -437,7 +512,8 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             }
         };
         if refreshed.status() != StatusCode::PAYMENT_REQUIRED {
-            if state.require_payment && refreshed.status().is_success() {
+            if requires_payment_challenge(&state, &method, &path) && refreshed.status().is_success()
+            {
                 tracing::error!(%url, status = %refreshed.status(), "payer proxy: hosted provider bypassed its payment gate while refreshing a session");
                 return (
                     StatusCode::BAD_GATEWAY,
@@ -467,6 +543,11 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
                 .iter()
                 .filter_map(|value| value.to_str().ok()),
         );
+    } else if state.payment_protocol == PaymentProtocol::MppSession
+        && used_cached_session
+        && let Some(cached) = session_authorization.as_mut()
+    {
+        **cached = None;
     }
 
     let charge_challenges: Vec<_> = mpp_challenges
@@ -493,7 +574,8 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
         })
         .await
     } else if !charge_challenges.is_empty() {
-        // Scheme precedence in auto mode: MPP charge first, then x402 upto.
+        // Scheme precedence in auto mode: MPP charge first, then x402 upto,
+        // then x402 exact.
         // `select_challenge_by_balance` / `build_credential` spin their own
         // runtimes and may block on RPC + signing — keep them off the async
         // workers.
@@ -513,8 +595,18 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             build_upto_authorization(&state, &upto, &resource_url).map(|payment| (payment, None))
         })
         .await
+    } else if let Some(exact) = parse_exact_challenge(&resp_headers, &resp_body) {
+        // x402 `exact`: sign this one request. Session and usage-metered
+        // channels remain preferred, but an exact-only provider must still
+        // work in auto mode.
+        let state = state.clone();
+        let resource_url = url.clone();
+        tokio::task::spawn_blocking(move || {
+            build_exact_authorization(&state, &exact, &resource_url).map(|payment| (payment, None))
+        })
+        .await
     } else {
-        tracing::warn!(%url, "payer proxy: 402 without an MPP or x402-upto challenge — passing through");
+        tracing::warn!(%url, "payer proxy: 402 without a supported MPP or x402 challenge — passing through");
         return buffered_response(status, &resp_headers, resp_body);
     };
 
@@ -529,32 +621,86 @@ async fn proxy(State(state): State<Arc<PayerState>>, req: Request) -> Response {
             return buffered_response(status, &resp_headers, resp_body);
         }
     };
-    if let (Some(cache), Some(authorization)) = (
-        session_authorization.as_mut(),
-        new_session_authorization.as_ref(),
-    ) {
-        **cache = Some(authorization.clone());
-    }
-
     tracing::info!(%url, "payer proxy: 402 paid — retrying once with payment credential");
     match send_upstream(&state, &method, &url, &headers, body, Some(&payment)).await {
         Ok(retry) => {
-            if retry.status() == StatusCode::PAYMENT_REQUIRED
-                && let Some(cache) = session_authorization.as_mut()
-            {
-                **cache = None;
+            // Only adopt the new credential once a request has actually gone
+            // through on it. Caching it before this point risks stranding a
+            // credential for a channel whose open transaction never landed
+            // (or whose response was lost) — a use of that credential then
+            // fails with a terminal-looking rejection (e.g. "unknown session
+            // channel") that never clears without a manual restart.
+            if retry.status() == StatusCode::PAYMENT_REQUIRED {
+                if let Some(cache) = session_authorization.as_mut() {
+                    **cache = None;
+                }
+            } else if let (Some(cache), Some(authorization)) = (
+                session_authorization.as_mut(),
+                new_session_authorization.as_ref(),
+            ) {
+                **cache = Some(authorization.clone());
             }
             deliver(retry, translated, session_authorization.take()).await
         }
         Err(e) => {
-            // The open credential is idempotent and the channel may already
-            // have been funded even though the response was lost. Preserve it
-            // across transport failures; only a definitive 402 rejection
-            // above proves that the cached session cannot be reused.
-            tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — preserving the session and returning the original 402");
+            // A transport failure here means we don't know whether the paid
+            // request (and, for a first use, the channel open it carried)
+            // landed upstream. Leave the cache exactly as it was before this
+            // attempt — do not adopt the unconfirmed new credential — so the
+            // next request renegotiates instead of reusing a channel that
+            // may never have opened.
+            tracing::warn!(%url, error = %e, "payer proxy: paid retry failed — preserving the prior session and returning the original 402");
             buffered_response(status, &resp_headers, resp_body)
         }
     }
+}
+
+fn cached_session_error_text(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            let error = value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let message = value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            (!error.is_empty() || !message.is_empty()).then(|| format!("{error} {message}"))
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
+        .to_ascii_lowercase()
+}
+
+fn retryable_cached_session_error(body: &[u8]) -> bool {
+    let text = cached_session_error_text(body);
+    text.contains("concurrent channel update")
+        || text.contains("retry the request")
+        || text.contains("session_capacity_reserved")
+}
+
+fn terminal_cached_session_error(body: &[u8]) -> bool {
+    use pay_core::server::session::terminal_errors;
+    let text = cached_session_error_text(body);
+    text.contains("session_cap_exhausted")
+        || text.contains("session_close_pending")
+        || text.contains("already sealed")
+        || text.contains("close is pending")
+        || text.contains("cap has been exhausted")
+        || text.contains("exceeds available deposit")
+        || text.contains(terminal_errors::UNKNOWN_CHANNEL)
+        || text.contains(terminal_errors::CHALLENGE_ECHO_MISMATCH)
+        || text.contains(terminal_errors::OPERATOR_ONLY)
+        || text.contains(terminal_errors::PREDATES_PROOF_BINDING)
+        || text.contains(terminal_errors::PROOF_MISMATCH)
+}
+
+/// Hosted providers must challenge successful inference requests, but model
+/// discovery is intentionally public so harnesses can initialize before the
+/// first paid completion.
+fn requires_payment_challenge(state: &PayerState, method: &Method, path: &str) -> bool {
+    state.require_payment && !(*method == Method::GET && path.trim_end_matches('/') == "/v1/models")
 }
 
 /// Map standard agent API paths to the selected provider's declared paths.
@@ -600,6 +746,68 @@ fn parse_upto_challenge(
         .collect();
     let body = std::str::from_utf8(resp_body).ok();
     pay_core::client::x402::parse_upto(&headers, body)
+}
+
+/// Parse an x402 `exact` challenge after the preferred `upto` parser has had
+/// first refusal. Some upto envelopes are intentionally accepted by the
+/// lenient exact parser, so call order is significant.
+fn parse_exact_challenge(
+    resp_headers: &HeaderMap,
+    resp_body: &Bytes,
+) -> Option<pay_core::client::x402::Challenge> {
+    let headers: Vec<(String, String)> = resp_headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let body = std::str::from_utf8(resp_body).ok();
+    pay_core::client::x402::parse(&headers, body)
+}
+
+/// Normalize newer OpenAI Chat Completions fields for broadly compatible
+/// providers. Invalid or unrelated bodies pass through untouched so the
+/// upstream remains responsible for reporting request errors.
+fn normalize_openai_chat_request(
+    state: &PayerState,
+    method: &Method,
+    path: &str,
+    body: &Bytes,
+) -> Bytes {
+    if state.dialect != Dialect::OpenAiCompat
+        || method != Method::POST
+        || path != "/v1/chat/completions"
+    {
+        return body.clone();
+    }
+
+    let Ok(mut request) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(messages) = request
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return body.clone();
+    };
+
+    let mut changed = false;
+    for message in messages {
+        if message.get("role").and_then(|role| role.as_str()) == Some("developer") {
+            message["role"] = serde_json::Value::String("system".to_string());
+            changed = true;
+        }
+    }
+    if !changed {
+        return body.clone();
+    }
+
+    serde_json::to_vec(&request)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| body.clone())
 }
 
 /// When the upstream is OpenAI-compatible and the inbound request is
@@ -754,9 +962,9 @@ fn translate_stream_response(
     })
 }
 
-/// The header(s) a paid retry must carry. MPP charge sets a single
-/// `Authorization: Payment <credential>`; x402 `upto` sets `PAYMENT-SIGNATURE`
-/// (and never touches `Authorization`, so the caller's upstream key survives).
+/// The header(s) a paid retry must carry. MPP sets
+/// `Authorization: Payment <credential>`; x402 `upto` and `exact` set their
+/// version-appropriate payment header without clobbering an upstream key.
 struct PaidHeaders {
     headers: Vec<(String, String)>,
 }
@@ -768,72 +976,35 @@ impl PaidHeaders {
             headers: vec![(header::AUTHORIZATION.as_str().to_string(), credential)],
         }
     }
+
+    fn x402(headers: Vec<(&'static str, String)>) -> Self {
+        Self {
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
+        }
+    }
 }
 
-/// Open a delegated push session and return the authorization reused for all
-/// subsequent requests handled by this payer proxy.
+/// Open an operator-signed session and return the initial `open`
+/// authorization plus the reusable `use` credential cached for all subsequent
+/// requests handled by this payer proxy.
 fn build_session_authorization(
     state: &PayerState,
     challenge: &pay_core::mpp::Challenge,
 ) -> pay_core::Result<(PaidHeaders, String)> {
-    use pay_kit::mpp::{SessionMode, SessionRequest, SessionSettlementAuthority};
+    let (open_authorization, use_authorization) =
+        pay_core::session::open_operator_signed_session_authorizations(
+            challenge,
+            state.store.as_ref(),
+            state.network_override.as_deref(),
+            state.account_override.as_deref(),
+            &state.authorization_url,
+            None,
+        )?;
 
-    let request: SessionRequest = challenge
-        .request
-        .decode()
-        .map_err(|error| pay_core::Error::Mpp(format!("invalid MPP session challenge: {error}")))?;
-    if request.settlement_authority != SessionSettlementAuthority::Delegated {
-        return Err(pay_core::Error::Mpp(
-            "agent payer requires a delegated MPP session".to_string(),
-        ));
-    }
-    if !request.modes.is_empty() && !request.modes.contains(&SessionMode::Push) {
-        return Err(pay_core::Error::Mpp(
-            "agent payer requires MPP session push mode".to_string(),
-        ));
-    }
-    if let (Some(forced), Some(offered)) = (
-        state.network_override.as_deref(),
-        request.network.as_deref(),
-    ) && forced != offered
-    {
-        return Err(pay_core::Error::Mpp(format!(
-            "MPP session network mismatch: payer requires `{forced}`, gateway offered `{offered}`"
-        )));
-    }
-
-    let cap = request.cap.parse::<u64>().map_err(|_| {
-        pay_core::Error::Mpp(format!(
-            "MPP session challenge advertised a non-numeric cap: {}",
-            request.cap
-        ))
-    })?;
-    if cap == 0 {
-        return Err(pay_core::Error::Mpp(
-            "MPP session challenge advertised a zero cap".to_string(),
-        ));
-    }
-    let min_delta = request
-        .min_voucher_delta
-        .as_deref()
-        .unwrap_or("1")
-        .parse::<u64>()
-        .map_err(|_| {
-            pay_core::Error::Mpp("MPP session challenge has invalid minVoucherDelta".to_string())
-        })?;
-    let deposit = min_delta.saturating_mul(1_000).max(1_000_000).min(cap);
-    let sandbox = state.network_override.as_deref() == Some("localnet");
-    let (_handle, authorization) = pay_core::session::open_payment_channel_session_header(
-        challenge,
-        &request,
-        state.store.as_ref(),
-        state.network_override.as_deref(),
-        state.account_override.as_deref(),
-        deposit,
-        sandbox,
-    )?;
-
-    Ok((PaidHeaders::mpp(authorization.clone()), authorization))
+    Ok((PaidHeaders::mpp(open_authorization), use_authorization))
 }
 
 /// Select a payable MPP challenge and build the `Authorization: Payment …`
@@ -930,19 +1101,53 @@ fn build_upto_authorization(
         );
     }
 
-    Ok(PaidHeaders {
-        headers: built
-            .headers
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), value))
-            .collect(),
-    })
+    Ok(PaidHeaders::x402(built.headers))
+}
+
+/// Sign a one-shot x402 `exact` payment and return its retry headers. This is
+/// the final auto-mode fallback after MPP charge and x402 `upto`.
+fn build_exact_authorization(
+    state: &PayerState,
+    challenge: &pay_core::client::x402::Challenge,
+    resource_url: &str,
+) -> pay_core::Result<PaidHeaders> {
+    if let Some(cap) = state.per_request_cap_base_units {
+        let amount: u128 = challenge.requirements.amount.parse().map_err(|_| {
+            pay_core::Error::Mpp(format!(
+                "x402-exact challenge advertised a non-numeric amount: {}",
+                challenge.requirements.amount
+            ))
+        })?;
+        if amount > cap {
+            return Err(pay_core::Error::Mpp(format!(
+                "x402-exact amount {amount} (base units of {}) exceeds the payer's per-request budget {cap}",
+                challenge.requirements.currency
+            )));
+        }
+    }
+
+    let built = pay_core::client::x402::build_payment(
+        challenge,
+        state.store.as_ref(),
+        state.network_override.as_deref(),
+        state.account_override.as_deref(),
+        Some(resource_url),
+    )?;
+
+    if let Some(resolved) = built.ephemeral_notice {
+        tracing::info!(
+            network = %resolved.network,
+            pubkey = resolved.account.pubkey.as_deref().unwrap_or("(unknown)"),
+            "payer proxy: generated ephemeral wallet"
+        );
+    }
+
+    Ok(PaidHeaders::x402(built.headers))
 }
 
 /// Forward a request upstream, replaying `body`. When `payment` is `Some`,
-/// its headers are applied to the paid retry: MPP replaces `Authorization`
-/// with the `Payment` credential; x402-upto adds `PAYMENT-SIGNATURE` (leaving
-/// the caller's own `Authorization` intact).
+/// its headers are applied to the paid retry: MPP replaces `Authorization`;
+/// x402 adds its payment proof without replacing the caller's upstream key.
 async fn send_upstream(
     state: &PayerState,
     method: &Method,
@@ -1102,6 +1307,58 @@ mod tests {
         assert_eq!(PAYER_PROXY_BIND_IP, Ipv4Addr::LOCALHOST);
     }
 
+    /// One case per real `session_failed` rejection the server can produce
+    /// for a stale cached credential (see `pay_core::server::session`'s
+    /// `verify_use_authentication` and `verify_challenge_echo`). Every one
+    /// of these is terminal — the exact same cached credential will fail
+    /// identically forever, so the proxy must discard it and renegotiate
+    /// rather than preserve-and-retry. Pinned against the server's own
+    /// error text so a rewording can't silently reopen the wedge.
+    #[test]
+    fn terminal_cached_session_error_recognizes_every_server_rejection() {
+        use pay_core::server::session::terminal_errors;
+
+        let session_failed_body = |message: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "error": "session_failed",
+                "message": message,
+                "retryable": true,
+            }))
+            .unwrap()
+        };
+
+        for message in [
+            &format!("{}: 6y6WeJ8H4o", terminal_errors::UNKNOWN_CHANNEL),
+            terminal_errors::CHALLENGE_ECHO_MISMATCH,
+            terminal_errors::OPERATOR_ONLY,
+            &format!(
+                "session channel {}; open a new session",
+                terminal_errors::PREDATES_PROOF_BINDING
+            ),
+            &format!("use authentication {}", terminal_errors::PROOF_MISMATCH),
+        ] {
+            let body = session_failed_body(message);
+            assert!(
+                terminal_cached_session_error(&body),
+                "expected terminal classification for: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_cached_session_error_does_not_misclassify_a_transient_store_error() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "error": "session_failed",
+            "message": "failed to read session channel abc123: store timeout",
+            "retryable": true,
+        }))
+        .unwrap();
+        assert!(
+            !terminal_cached_session_error(&body),
+            "a store read hiccup must stay retryable, not be treated as terminal"
+        );
+    }
+
     /// A canned MPP charge challenge that signs fully offline: the
     /// embedded `recentBlockhash` skips the blockhash RPC and the
     /// embedded `tokenProgram` + `decimals` skip the mint-account RPC
@@ -1168,6 +1425,36 @@ mod tests {
                     "recentSlot": "123456789",
                 },
             }],
+        });
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(envelope.to_string().as_bytes())
+    }
+
+    /// A canned x402 `exact` challenge that can be signed offline for the same
+    /// reason as [`upto_challenge_header`]: it carries a devnet network, fee
+    /// payer, and recent blockhash.
+    fn exact_challenge_header(amount: &str) -> String {
+        let payee = "CXhrFZJLKqjzmP3sjYLcF4dTeXWKCy9e2SXXZ2Yo6MPY";
+        let envelope = serde_json::json!({
+            "x402Version": 2,
+            "resource": {
+                "url": "http://127.0.0.1/v1/messages",
+                "description": "test exact payment",
+                "mimeType": "application/json"
+            },
+            "accepts": [{
+                "scheme": "exact",
+                "network": pay_kit::x402::exact::SOLANA_DEVNET,
+                "amount": amount,
+                "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+                "payTo": payee,
+                "maxTimeoutSeconds": 300,
+                "extra": {
+                    "feePayer": payee,
+                    "recentBlockhash": "9zrUHnA1nCByPksy3aL8tQ47vqdaG2vnFs4HrxgcZj4F",
+                    "decimals": 6
+                }
+            }]
         });
         use base64::Engine;
         base64::engine::general_purpose::STANDARD.encode(envelope.to_string().as_bytes())
@@ -1250,6 +1537,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blockrun_chat_uses_api_v1_provider_path() {
+        let seen = Arc::new(Mutex::new(None::<serde_json::Value>));
+        let record = seen.clone();
+        let upstream = spawn_server(Router::new().route(
+            "/api/v1/chat/completions",
+            axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+                let record = record.clone();
+                async move {
+                    *record.lock().unwrap() = Some(body.0);
+                    (StatusCode::OK, "blockrun path reached")
+                }
+            }),
+        ))
+        .await;
+        let payer = spawn_payer_with(
+            PayerUpstream {
+                base_url: upstream,
+                host_header: None,
+                dialect: Dialect::OpenAiCompat,
+                chat_path: "api/v1/chat/completions".to_string(),
+                responses_path: "v1/responses".to_string(),
+                require_payment: false,
+                payment_protocol: PaymentProtocol::Auto,
+            },
+            None,
+        )
+        .await;
+
+        let response = reqwest::Client::new()
+            .post(format!("{payer}/v1/chat/completions"))
+            .json(&serde_json::json!({
+                "model": "openai/gpt-5.6-sol",
+                "messages": [
+                    { "role": "developer", "content": "You are Goose." },
+                    { "role": "user", "content": "test" }
+                ]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "blockrun path reached");
+        let body = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[tokio::test]
     async fn direct_openai_responses_uses_declared_provider_path() {
         let upstream = spawn_server(Router::new().route(
             "/v1/responses",
@@ -1270,6 +1606,24 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "responses path reached");
+    }
+
+    #[test]
+    fn parses_x402_exact_challenge_from_payment_required_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "payment-required",
+            HeaderValue::from_str(&exact_challenge_header("28130")).unwrap(),
+        );
+
+        let challenge = parse_exact_challenge(&headers, &Bytes::new()).unwrap();
+
+        assert_eq!(challenge.x402_version, 2);
+        assert_eq!(challenge.requirements.amount, "28130");
+        assert_eq!(
+            challenge.requirements.resource,
+            "http://127.0.0.1/v1/messages"
+        );
     }
 
     #[tokio::test]
@@ -1307,6 +1661,37 @@ mod tests {
                 .unwrap()
                 .contains("refusing an ungated response")
         );
+    }
+
+    #[tokio::test]
+    async fn hosted_provider_allows_public_model_discovery() {
+        let upstream = spawn_server(Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async { (StatusCode::OK, r#"{"data":[]}"#) }),
+        ))
+        .await;
+        let payer = spawn_payer_with(
+            PayerUpstream {
+                base_url: upstream,
+                host_header: None,
+                dialect: Dialect::OpenAiCompat,
+                chat_path: "v1/chat/completions".to_string(),
+                responses_path: "v1/responses".to_string(),
+                require_payment: true,
+                payment_protocol: PaymentProtocol::Auto,
+            },
+            None,
+        )
+        .await;
+
+        let response = reqwest::Client::new()
+            .get(format!("{payer}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), r#"{"data":[]}"#);
     }
 
     const OPENAI_COMPLETION_JSON: &str = r#"{
@@ -1500,6 +1885,77 @@ mod tests {
         );
     }
 
+    /// Stub that offers only x402 `exact`, matching BlockRun's payment
+    /// protocol, then accepts the signed retry.
+    fn exact_stub(seen: Arc<Mutex<StubSeen>>, amount: &'static str) -> Router {
+        Router::new().fallback(any(move |req: Request| {
+            let seen = seen.clone();
+            async move {
+                let uri = req.uri().to_string();
+                let sig = req
+                    .headers()
+                    .get("payment-signature")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let body = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+                    .await
+                    .unwrap();
+                let mut seen = seen.lock().unwrap();
+                seen.calls += 1;
+                if seen.calls == 1 {
+                    seen.first_uri = Some(uri);
+                    seen.retry_body = Some(body.to_vec());
+                    return Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header("payment-required", exact_challenge_header(amount))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(r#"{"error":"payment required"}"#))
+                        .unwrap();
+                }
+                assert_eq!(
+                    seen.retry_body.as_deref(),
+                    Some(&body[..]),
+                    "exact retry must replay the identical body"
+                );
+                seen.retry_auth = sig;
+                (StatusCode::OK, "exact paid ok").into_response()
+            }
+        }))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pays_x402_exact_402_and_retries_with_payment_header() {
+        let seen = Arc::new(Mutex::new(StubSeen::default()));
+        let upstream = spawn_server(exact_stub(seen.clone(), "28130")).await;
+        let payer = spawn_payer(upstream, None).await;
+
+        let body = r#"{"model":"openai/gpt-5.6-sol","messages":[{"role":"user","content":"hi"}]}"#;
+        let resp = reqwest::Client::new()
+            .post(format!("{payer}/v1/messages"))
+            .header("authorization", "Bearer upstream-key")
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "exact paid ok");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.calls, 2, "exactly one retry after the exact 402");
+        let sig = seen
+            .retry_auth
+            .as_deref()
+            .expect("exact retry must carry a PAYMENT-SIGNATURE header");
+        assert!(!sig.is_empty(), "PAYMENT-SIGNATURE must be non-empty");
+        assert_eq!(
+            seen.retry_body.as_deref(),
+            Some(body.as_bytes()),
+            "exact retry must replay the identical request body"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn session_challenge_does_not_mask_coexisting_x402_upto() {
         let seen = Arc::new(Mutex::new(StubSeen::default()));
@@ -1639,7 +2095,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn session_open_credential_survives_a_paid_retry_transport_error() {
+    async fn session_open_credential_does_not_survive_a_paid_retry_transport_error() {
         fn open_test_session(
             _state: &PayerState,
             _challenge: &pay_core::mpp::Challenge,
@@ -1649,8 +2105,9 @@ mod tests {
         }
 
         // Serve exactly the challenge response, then stop listening before the
-        // paid retry. This models a connection failure after the open may
-        // already have funded its channel.
+        // paid retry. This models a connection failure after the open may or
+        // may not have landed upstream — genuinely ambiguous, since nothing
+        // confirms whether the retry was even received.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let challenge = session_challenge_header();
@@ -1699,8 +2156,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
         assert_eq!(
             state.session_authorization.lock().await.as_deref(),
-            Some("Payment durable-open"),
-            "an ambiguous transport failure must retain the idempotent open credential"
+            None,
+            "an unconfirmed open credential must not be cached — adopting it before \
+             a paid retry proves it landed risks stranding a credential for a \
+             channel that never opened; the next request must renegotiate instead \
+             of trusting a credential no response ever confirmed"
         );
     }
 
@@ -1898,6 +2358,97 @@ mod tests {
                 Some("Payment test-session".to_string()),
             ],
             "a terminal cached session must be followed by unauthenticated challenge discovery",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retryable_cached_session_error_reuses_channel() {
+        fn open_test_session(
+            _state: &PayerState,
+            _challenge: &pay_core::mpp::Challenge,
+        ) -> pay_core::Result<(PaidHeaders, String)> {
+            let authorization = "Payment retryable-session".to_string();
+            Ok((PaidHeaders::mpp(authorization.clone()), authorization))
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let record = seen.clone();
+        let app = Router::new().fallback(any(move |req: Request| {
+            let record = record.clone();
+            async move {
+                let authorization = req
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let _ = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await;
+                let mut seen = record.lock().unwrap();
+                seen.push(authorization.clone());
+                match seen.len() {
+                    1 => Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header(header::WWW_AUTHENTICATE, session_challenge_header())
+                        .body(Body::from(r#"{"error":"payment required"}"#))
+                        .unwrap(),
+                    2 | 4 => (StatusCode::OK, "session paid").into_response(),
+                    3 => Response::builder()
+                        .status(StatusCode::PAYMENT_REQUIRED)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"error":"session_failed","message":"Store error: Concurrent channel update; retry the request"}"#,
+                        ))
+                        .unwrap(),
+                    call => panic!("unexpected upstream call {call}"),
+                }
+            }
+        }));
+        let upstream = spawn_server(app).await;
+        let store: Arc<dyn AccountsStore> = Arc::new(MemoryAccountsStore::new());
+        let state = Arc::new(
+            PayerState::new(
+                PayerUpstream {
+                    base_url: upstream,
+                    host_header: None,
+                    dialect: Dialect::Anthropic,
+                    chat_path: "v1/chat/completions".to_string(),
+                    responses_path: "v1/responses".to_string(),
+                    require_payment: true,
+                    payment_protocol: PaymentProtocol::MppSession,
+                },
+                store,
+                None,
+                None,
+            )
+            .unwrap()
+            .with_session_opener(open_test_session),
+        );
+        let payer = spawn_server(router(state.clone())).await;
+
+        let client = reqwest::Client::new();
+        for prompt in ["one", "two"] {
+            let response = client
+                .post(format!("{payer}/v1/messages"))
+                .body(prompt)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                None,
+                Some("Payment retryable-session".to_string()),
+                Some("Payment retryable-session".to_string()),
+                Some("Payment retryable-session".to_string()),
+            ],
+            "a retryable store conflict must retry the same channel without rediscovery",
+        );
+        assert_eq!(
+            state.session_authorization.lock().await.as_deref(),
+            Some("Payment retryable-session"),
+            "a transient 402 must preserve the cached session"
         );
     }
 

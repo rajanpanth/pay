@@ -1,6 +1,7 @@
 .idea
 .vscode
 .DS_Store
+.worktrees/
 
 # TypeScript
 node_modules
@@ -31,3 +32,6 @@ rust/example/node_modules
 rust/example/pnpm-lock.yaml
 *.log
 coverage*.json
+
+# Local benchmark profiler captures (large, machine-specific artifacts)
+docs/benchmarks/profiles/2026-09-05-base58/

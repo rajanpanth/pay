@@ -31,41 +31,6 @@ async fn start_surfnet() -> &'static Surfnet {
         .await
 }
 
-async fn submit_sol_transfer(
-    rpc_url: &str,
-    payer: &Keypair,
-    recipient: &str,
-    lamports: u64,
-) -> String {
-    use pay_kit::mpp::solana_keychain::SolanaSigner;
-    use pay_kit::mpp::solana_keychain::memory::MemorySigner;
-    use pay_kit::mpp::solana_rpc_client::rpc_client::RpcClient;
-    use solana_message::Message;
-    use solana_pubkey::Pubkey;
-    use solana_signature::Signature;
-    use solana_system_interface::instruction as system_instruction;
-    use solana_transaction::Transaction;
-
-    let signer = MemorySigner::from_bytes(&payer.to_bytes()).unwrap();
-    let sender = signer.pubkey();
-    let recipient = recipient.parse::<Pubkey>().unwrap();
-    let rpc = RpcClient::new(rpc_url.to_string());
-    let blockhash = rpc.get_latest_blockhash().unwrap();
-    let ix = system_instruction::transfer(&sender, &recipient, lamports);
-    let message = Message::new_with_blockhash(&[ix], Some(&sender), &blockhash);
-    let mut tx = Transaction::new_unsigned(message);
-    let sig_bytes = signer.sign_message(&tx.message_data()).await.unwrap();
-    let sig = Signature::from(<[u8; 64]>::from(sig_bytes));
-    let signer_index = tx
-        .message
-        .account_keys
-        .iter()
-        .position(|key| key == &sender)
-        .unwrap();
-    tx.signatures[signer_index] = sig;
-    rpc.send_and_confirm_transaction(&tx).unwrap().to_string()
-}
-
 // =============================================================================
 // balance
 // =============================================================================
@@ -205,7 +170,7 @@ async fn full_payment_flow_with_surfnet() {
         .unwrap();
 
     let api: ApiSpec =
-        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
             .unwrap();
 
     let mpp = Mpp::new(pay_kit::mpp::server::Config {
@@ -335,7 +300,7 @@ async fn replayed_authorization_is_rejected() {
         .unwrap();
 
     let api: ApiSpec =
-        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
             .unwrap();
 
     let mpp = Mpp::new(pay_kit::mpp::server::Config {
@@ -469,13 +434,14 @@ async fn push_session_full_flow() {
     use axum::routing::any;
     use pay_core::PaymentState;
     use pay_core::server::session::SessionMpp;
-    use pay_kit::mpp::client::session::ActiveSession;
+    use pay_kit::mpp::program::payment_channels::generated::generated::{
+        accounts::Channel, types::SettlementWatermarks,
+    };
     use pay_kit::mpp::server::session::SessionConfig;
     use pay_kit::mpp::solana_keychain::memory::MemorySigner;
-    use pay_kit::mpp::{
-        PaymentCredential, SessionMode, format_authorization, parse_www_authenticate,
-    };
+    use pay_kit::mpp::{PaymentCredential, format_authorization, parse_www_authenticate};
     use pay_types::metering::ApiSpec;
+    use std::str::FromStr;
     use std::sync::Arc;
 
     // ── App state ──────────────────────────────────────────────────────────
@@ -497,38 +463,166 @@ async fn push_session_full_flow() {
     }
 
     // ── Infrastructure ─────────────────────────────────────────────────────
-    let surfnet = start_surfnet().await;
-    let rpc_url = surfnet.rpc_url().to_string();
-
+    // The final session wire makes the server the broadcaster of the client's
+    // open transaction: `process_open` re-broadcasts the payload transaction
+    // and verifies the resulting on-chain channel account. Surfpool cannot run
+    // the payment-channels program, so this test fronts the session server
+    // with a canned JSON-RPC endpoint (the same pattern as pay-kit's own
+    // full-path open tests) while everything above it — pay's payment
+    // middleware, the challenge binding, the real client-side opener,
+    // vouchers, and close — runs for real.
     let operator = Keypair::new();
     let recipient = Keypair::new();
-
-    // Fund the client that will "deposit" into the session channel.
     let client_kp = Keypair::new();
-    surfnet
-        .cheatcodes()
-        .fund_sol(&client_kp.pubkey(), 2_000_000_000)
-        .unwrap();
+    let session_kp = Keypair::new();
 
     let api: ApiSpec =
-        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
             .unwrap();
 
-    // 1 USDC cap (6 decimals). rpc_url enables on-chain signature verification.
+    // Deterministic open parameters so the canned channel account below
+    // matches what the real client-side opener derives from the challenge.
+    let deposit = 1_000_000u64; // 1 USDC
+    let salt = 42u64;
+    let grace_period = 900u32;
+    let challenged_slot = 33u64;
+    let challenged_blockhash = solana_hash::Hash::new_from_array([7; 32]);
+    let mint = solana_pubkey::Pubkey::from_str(pay_kit::mpp::mints::USDC_MAINNET).unwrap();
+    let token_program =
+        solana_pubkey::Pubkey::from_str(pay_kit::mpp::programs::TOKEN_PROGRAM).unwrap();
+    let program_id = pay_kit::mpp::program::payment_channels::default_program_id();
+    let open_params = pay_kit::mpp::program::payment_channels::OpenChannelParams {
+        payer: client_kp.pubkey(),
+        // The client-side opener pins rentPayer == fee payer == payer.
+        rent_payer: client_kp.pubkey(),
+        payee: recipient.pubkey(),
+        mint,
+        authorized_signer: session_kp.pubkey(),
+        salt,
+        open_slot: challenged_slot,
+        deposit,
+        grace_period,
+        recipients: vec![],
+        token_program,
+        program_id,
+    };
+    let channel_id =
+        pay_kit::mpp::program::payment_channels::derive_channel_addresses(&open_params).channel;
+    let (_, bump) = pay_kit::mpp::program::payment_channels::find_channel_pda(
+        &open_params.payer,
+        &open_params.payee,
+        &open_params.mint,
+        &open_params.authorized_signer,
+        open_params.salt,
+        open_params.open_slot,
+        &open_params.program_id,
+    );
+    let channel = Channel {
+        discriminator: 1,
+        version: 1,
+        bump,
+        status: 0,
+        salt,
+        deposit,
+        settlement: SettlementWatermarks {
+            settled: 0,
+            payout_watermark: 0,
+        },
+        closure_started_at: 0,
+        payer_withdrawn_at: 0,
+        grace_period,
+        distribution_hash: pay_kit::mpp::program::payment_channels::distribution_hash(&[]),
+        payer: client_kp.pubkey(),
+        payee: recipient.pubkey(),
+        authorized_signer: session_kp.pubkey(),
+        mint,
+        rent_payer: client_kp.pubkey(),
+        open_slot: challenged_slot,
+    };
+    let channel_data = borsh::to_vec(&channel).unwrap();
+
+    // Canned Solana JSON-RPC: acknowledge the broadcast, report it finalized,
+    // and serve the channel account the verified open would have created.
+    let rpc_owner = program_id.to_string();
+    let rpc_channel_data = channel_data.clone();
+    let rpc_app = Router::new().route(
+        "/",
+        axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+            let channel_data = rpc_channel_data.clone();
+            let owner = rpc_owner.clone();
+            async move {
+                use base64::Engine as _;
+                let result = match body["method"].as_str().unwrap_or_default() {
+                    "getSlot" => serde_json::json!(challenged_slot + 1),
+                    "sendTransaction" => serde_json::json!(
+                        pay_kit::mpp::program::payment_channels::decode_transaction(
+                            body["params"][0].as_str().unwrap()
+                        )
+                        .unwrap()
+                        .signatures[0]
+                            .to_string()
+                    ),
+                    "getSignatureStatuses" => serde_json::json!({
+                        "context": { "slot": 34 },
+                        "value": [{
+                            "slot": 34,
+                            "confirmations": null,
+                            "err": null,
+                            "confirmationStatus": "finalized",
+                            "status": { "Ok": null }
+                        }]
+                    }),
+                    "getMultipleAccounts" => {
+                        assert_eq!(body["params"][0].as_array().map(Vec::len), Some(1));
+                        assert_eq!(body["params"][1]["minContextSlot"], 34);
+                        serde_json::json!({
+                            "context": { "slot": 34 },
+                            "value": [{
+                                "data": [
+                                    base64::engine::general_purpose::STANDARD.encode(&channel_data),
+                                    "base64"
+                                ],
+                                "executable": false,
+                                "lamports": 1_000_000u64,
+                                "owner": owner,
+                                "rentEpoch": 0,
+                                "space": channel_data.len()
+                            }]
+                        })
+                    }
+                    other => panic!("unexpected RPC method {other}"),
+                };
+                axum::Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": body["id"].clone(),
+                    "result": result
+                }))
+            }
+        }),
+    );
+    let rpc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc_url = format!("http://{}", rpc_listener.local_addr().unwrap());
+    tokio::spawn(async { axum::serve(rpc_listener, rpc_app).await.unwrap() });
+
+    // The challenge advertises the open-transaction context from this cache;
+    // the client binds its open transaction to the same values.
+    let blockhash_cache = pay_kit::mpp::blockhash::BlockhashCache::new();
+    blockhash_cache.set(challenged_blockhash.to_string(), 100, challenged_slot);
+
     let session_mpp = SessionMpp::new(
         SessionConfig {
             operator: operator.pubkey().to_string(),
             recipient: recipient.pubkey().to_string(),
-            max_cap: 1_000_000,
             currency: "USDC".to_string(),
             decimals: 6,
             network: "localnet".to_string(),
-            modes: vec![SessionMode::Push],
+            grace_period_seconds: grace_period,
             rpc_url: Some(rpc_url.clone()),
             ..Default::default()
         },
         "test-session-secret",
-    );
+    )
+    .with_blockhash_cache(blockhash_cache);
 
     let state = S {
         apis: Arc::new(vec![api]),
@@ -580,30 +674,38 @@ async fn push_session_full_flow() {
 
     // ── Step 2: Open session ───────────────────────────────────────────────
     // Session key: any Ed25519 keypair — signs vouchers, never touches chain.
-    let session_kp = Keypair::new();
     let session_signer: Box<dyn pay_kit::mpp::solana_keychain::SolanaSigner> =
         Box::new(MemorySigner::from_bytes(&session_kp.to_bytes()).unwrap());
+    let payer_signer = MemorySigner::from_bytes(&client_kp.to_bytes()).unwrap();
 
-    // Submit a real SOL transfer to surfpool as a stand-in for the Fiber
-    // channel open. The server verifies this tx is confirmed on-chain before
-    // accepting the open.
-    let open_tx_sig = submit_sol_transfer(
-        &rpc_url,
-        &client_kp,
-        &operator.pubkey().to_string(),
-        10_000_000,
+    // The real client-side opener: derives the channel from the challenge,
+    // builds the open transaction against the challenged `recentBlockhash`
+    // and `recentSlot`, and signs it with the payer key.
+    let challenged_request: pay_kit::mpp::SessionRequest = challenge.request.decode().unwrap();
+    let opened = pay_kit::mpp::client::create_payment_channel_session_opener(
+        &challenged_request,
+        &payer_signer,
+        session_signer,
+        None, // bind to the challenged recentBlockhash
+        pay_kit::mpp::client::PaymentChannelSessionOpenOptions {
+            open: pay_kit::mpp::client::PaymentChannelOpenOptions {
+                deposit: Some(deposit),
+                grace_period: Some(grace_period),
+                salt: Some(salt),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
-    .await;
-
-    // Channel ID is any valid Solana pubkey (would be the real Fiber channel
-    // in production; here it's just a key for the in-memory store).
-    let channel_id = Keypair::new().pubkey();
-    let mut active = ActiveSession::new(channel_id, session_signer);
-
-    let deposit = 1_000_000u64; // 1 USDC
-    let open_action = active.open_action(deposit, &open_tx_sig);
+    .await
+    .unwrap();
+    assert_eq!(
+        opened.open.channel_id, channel_id,
+        "client-derived channel must match the canned RPC account"
+    );
+    let mut active = opened.session;
     let auth =
-        format_authorization(&PaymentCredential::new(challenge.to_echo(), open_action)).unwrap();
+        format_authorization(&PaymentCredential::new(challenge.to_echo(), opened.action)).unwrap();
 
     let resp = http
         .post(format!("{url}/v1/simple/echo"))
@@ -613,12 +715,16 @@ async fn push_session_full_flow() {
         .send()
         .await
         .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
     assert_eq!(
-        resp.status(),
-        402,
+        status, 402,
         "open should acknowledge with 402, got {}: {}",
-        resp.status(),
-        resp.text().await.unwrap()
+        status, body
+    );
+    assert!(
+        body.contains("session_voucher_required"),
+        "open should request the first voucher, got: {body}"
     );
 
     // ── Step 3: Voucher (subsequent API call) ──────────────────────────────
@@ -657,7 +763,9 @@ async fn push_session_full_flow() {
     assert_eq!(resp.status(), 200, "second voucher should return 200");
 
     // ── Step 4: Close session ──────────────────────────────────────────────
-    let close_action = active.close_action(None).await.unwrap();
+    // A client-voucher close must carry the final voucher; sign one last
+    // increment covering the closing request.
+    let close_action = active.close_action(Some(1_000)).await.unwrap();
     let auth =
         format_authorization(&PaymentCredential::new(challenge.to_echo(), close_action)).unwrap();
 
@@ -720,7 +828,7 @@ async fn mpp_build_credential_with_surfnet() {
         .unwrap();
 
     let api: ApiSpec =
-        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-provider.yml").unwrap())
+        serde_yml::from_str(&std::fs::read_to_string("tests/fixtures/test-paywall.yml").unwrap())
             .unwrap();
 
     let mpp = Mpp::new(pay_kit::mpp::server::Config {

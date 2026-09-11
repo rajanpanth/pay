@@ -1,6 +1,6 @@
 //! Shared payment-stack machinery for the gateway commands.
 //!
-//! `pay server start` and `pay serve inference --price`/`--pricing` build the
+//! `pay gate api` and `pay gate inference [RATES]`/`--price` build the
 //! same sandbox charge stack: an auto/ephemeral fee-payer signer, localnet RPC
 //! resolution, Surfpool wallet funding + payout-recipient ATA preparation,
 //! the shared recent-blockhash cache, the charge HMAC secret (mirrored into
@@ -24,8 +24,9 @@ pub(crate) fn should_use_auto_fee_payer_signer(
     sandbox: bool,
     network: &SolanaNetwork,
     signer_cfg: Option<&SignerConfig>,
+    fee_payer: bool,
 ) -> bool {
-    sandbox || (signer_cfg.is_none() && network.is_throwaway())
+    sandbox || (fee_payer && signer_cfg.is_none() && network.is_throwaway())
 }
 
 /// `(account_name, pubkey)` of a freshly generated gateway ephemeral.
@@ -85,6 +86,20 @@ pub(crate) fn resolve_currency(currency: &str, network: &str) -> (String, u8) {
         return (stablecoin.mint(Some(network)).to_string(), 6);
     }
     (currency.to_string(), 6)
+}
+
+pub(crate) fn resolve_currency_checked(
+    currency: &str,
+    network: &str,
+) -> pay_core::Result<(String, u8)> {
+    let currency = currency.trim();
+    if currency.eq_ignore_ascii_case("SOL") {
+        return Ok(("sol".to_string(), 9));
+    }
+    let mint = pay_kit::mpp::protocol::solana::try_resolve_stablecoin_mint(currency, Some(network))
+        .map_err(|error| pay_core::Error::Config(error.to_string()))?
+        .unwrap_or(currency);
+    Ok((mint.to_string(), 6))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -186,7 +201,7 @@ pub(crate) struct FundingTargetBalance {
 ///     `network: localnet` path lands here).
 ///
 /// `fund_via_surfpool` deposits a fixed amount (100 SOL + 1000 USDC) so
-/// calling it on every server start is idempotent and survives Surfpool
+/// calling it on every `pay gate api` start is idempotent and survives Surfpool
 /// restarts (which would otherwise wipe the cheatcode-set balances).
 ///
 /// When the RPC is a real cluster (mainnet/devnet/local validator), funding
@@ -346,7 +361,9 @@ pub(crate) fn stable_token_account_requirements(
 ) -> pay_core::Result<Vec<StableTokenAccountRequirement>> {
     let mut requirements = Vec::new();
     for (label, mint, _decimals) in currency_configs {
-        if Stablecoin::parse_symbol(label).is_none() && Stablecoin::from_mint(mint).is_none() {
+        if Stablecoin::parse_symbol(label).is_none()
+            && !pay_kit::mpp::protocol::solana::is_known_stablecoin_mint(mint)
+        {
             continue;
         }
 
@@ -624,12 +641,12 @@ pub(crate) fn build_charge_mpps(
 
 /// Build the x402 `upto` backend for the sandbox charge stack.
 ///
-/// Mirrors `server start`'s upto wiring: an [`X402Upto`] built from the
+/// Mirrors `gate api`'s upto wiring: an [`X402Upto`] built from the
 /// operator (fee-payer) signer, the sandbox RPC, and the configured
 /// currencies, sharing the same blockhash cache as the charge MPPs. In
 /// sandbox inference the payout recipient IS the operator's own gateway
 /// wallet, so the operator keeps the whole channel payout. Used by
-/// `pay serve inference` per-token charging, where the settlement voucher is
+/// `pay gate inference` per-token charging, where the settlement voucher is
 /// signed post-response from the observed token usage.
 pub(crate) fn build_sandbox_upto_backend(
     currency_configs: &[(String, String, u8)],

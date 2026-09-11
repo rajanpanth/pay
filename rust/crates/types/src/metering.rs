@@ -9,6 +9,9 @@ pub use profiles::{ApiProfile, OpenAiSurface, XtreamSurface};
 /// block.
 pub const X_PAY_METERING_EXTENSION: &str = "x-pay-metering";
 
+/// Default idle delay before an x402 batch-settlement residual is reconciled.
+pub const DEFAULT_BATCH_IDLE_SETTLEMENT_DELAY_MS: u64 = 300_000;
+
 // =============================================================================
 // Provider & API
 // =============================================================================
@@ -59,24 +62,28 @@ pub struct ApiSpec {
     /// per-request charges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionSpec>,
+    /// x402 batch-settlement lifecycle parameters. Unlike a per-cycle sample,
+    /// each settlement tick snapshots and reconciles the complete channel
+    /// fleet; pay-kit packs up to four claims into each Solana transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_settlement: Option<BatchSettlementSpec>,
 }
 
 impl ApiSpec {
     /// Fill in per-endpoint scheme defaults for endpoints that omit `schemes`.
     ///
     /// The base default is `[MppCharge]`. A spec that declares a top-level
-    /// `session:` block additionally gets `MppSession`, so existing session
-    /// deployments keep accepting `intent=session` credentials without having
-    /// to enumerate `schemes` on every endpoint — otherwise the charge-only
-    /// fallback in [`Metering::accepted_schemes`] would silently re-challenge
-    /// session clients with charge-only options. Endpoints that set `schemes`
-    /// explicitly are left untouched (explicit config is a restriction).
+    /// `session:` block additionally gets `MppSession`; a top-level
+    /// `batch_settlement:` block additionally gets `X402BatchSettlement`.
+    /// Endpoints that set `schemes` explicitly are left untouched (explicit
+    /// config is a restriction).
     ///
     /// Resolving here (once, at load) keeps every consumer — the payment gate,
-    /// the OpenAPI offer builder, and the x402-backend probe in `server start` —
+    /// the OpenAPI offer builder, and the x402-backend probe in `gate api` —
     /// reading the same scheme set.
     pub fn apply_scheme_defaults(&mut self) {
         let has_session = self.session.is_some();
+        let has_batch_settlement = self.batch_settlement.is_some();
         for endpoint in &mut self.endpoints {
             if let Some(metering) = endpoint.metering.as_mut()
                 && metering.schemes.is_none()
@@ -84,6 +91,9 @@ impl ApiSpec {
                 let mut schemes = vec![Scheme::MppCharge];
                 if has_session {
                     schemes.push(Scheme::MppSession);
+                }
+                if has_batch_settlement {
+                    schemes.push(Scheme::X402BatchSettlement);
                 }
                 metering.schemes = Some(schemes);
             }
@@ -383,11 +393,20 @@ pub enum AuthConfig {
     /// OAuth2 — fetch access token and inject as `Authorization: Bearer`.
     Oauth2 {
         /// Token endpoint URL (e.g. `https://oauth2.googleapis.com/token`).
-        /// Special value `"gcp_metadata"` uses the GCP metadata server.
+        /// Special value `"gcp_metadata"` uses the GCP metadata server to
+        /// mint an OAuth2 access token; `"gcp_metadata_identity"` mints an
+        /// audience-bound OIDC identity token instead (for invoking
+        /// IAM-protected services such as private Cloud Run) and requires
+        /// `audience`.
         token_url: String,
         /// OAuth2 scopes to request.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         scopes: Vec<String>,
+        /// OIDC audience for `token_url: gcp_metadata_identity` — the URL of
+        /// the IAM-protected service being invoked (e.g. the Cloud Run
+        /// service URL). Required in identity mode, rejected otherwise.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<String>,
         /// Env var for client_id (for client_credentials grant).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id_from_env: Option<String>,
@@ -681,6 +700,13 @@ pub struct OperatorConfig {
     /// When present, charge endpoints advertise one challenge per listed currency.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub currencies: std::collections::BTreeMap<String, Vec<String>>,
+    /// Explicit non-production mints permitted for MPP session benchmarks.
+    ///
+    /// These mints are never treated as canonical stablecoins. The gateway
+    /// additionally requires `PAY_ALLOW_BENCHMARK_TEST_MINTS=1` before it
+    /// will advertise one as a USD-priced session currency.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_benchmark_test_mints: Vec<SessionBenchmarkTestMint>,
     /// Solana RPC URL. Overrides --rpc-url CLI flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_url: Option<String>,
@@ -709,6 +735,23 @@ pub struct OperatorConfig {
     pub realm: Option<String>,
 }
 
+/// A locally administered mint allowed only for an explicitly opted-in MPP
+/// session benchmark. The mint owner is checked on-chain at gateway startup.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SessionBenchmarkTestMint {
+    /// Token mint address (base58).
+    pub mint: String,
+    /// Token decimal count. Session USD pricing currently supports six-decimal
+    /// test mints, matching the stablecoin path.
+    #[serde(default = "default_session_benchmark_test_mint_decimals")]
+    pub decimals: u8,
+}
+
+fn default_session_benchmark_test_mint_decimals() -> u8 {
+    6
+}
+
 impl OperatorConfig {
     /// Resolve `${VAR}` placeholders in operator fields.
     pub fn resolve_env_templates(&mut self, context: &str) -> Result<(), String> {
@@ -733,6 +776,12 @@ impl OperatorConfig {
         }
         if let Some(realm) = self.realm.as_mut() {
             *realm = resolve_env_templates_in_string(realm, &format!("{context}.realm"))?;
+        }
+        for (index, mint) in self.session_benchmark_test_mints.iter_mut().enumerate() {
+            mint.mint = resolve_env_templates_in_string(
+                &mint.mint,
+                &format!("{context}.session_benchmark_test_mints[{index}].mint"),
+            )?;
         }
         Ok(())
     }
@@ -810,16 +859,18 @@ impl SignerConfig {
 /// is configured for MPP session payments (off-chain vouchers).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionSettlementAuthority {
+pub enum SessionVoucherSigner {
     /// The client owns the channel voucher key and signs each cumulative debit.
     #[default]
-    ClientVoucher,
-    /// The client delegates voucher authority to the gateway operator, which
-    /// meters successful responses and signs their cumulative settlement.
-    Delegated,
+    Client,
+    /// The client binds the gateway operator as the channel's voucher signer;
+    /// the operator meters successful responses and signs their cumulative
+    /// settlement while the client authenticates with a reusable payer proof.
+    Operator,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSpec {
     /// Default channel cap offered to clients (USDC, human-readable).
     /// Clients may request a lower cap; the server will not exceed this.
@@ -828,44 +879,29 @@ pub struct SessionSpec {
     /// Prevents spam vouchers smaller than one API call's cost.
     #[serde(default)]
     pub min_voucher_delta: u64,
-    /// Who signs cumulative settlement vouchers. Independent from `modes`,
-    /// which controls how channel transactions are submitted.
+    /// Who signs cumulative settlement vouchers (`client` or `operator`).
     #[serde(default)]
-    pub settlement_authority: SessionSettlementAuthority,
-    /// Session modes this server accepts.
+    pub voucher_signer: SessionVoucherSigner,
+    /// Inactivity thresholds (seconds) offered to clients for negotiation.
     ///
-    /// Allowed values: `"push"` (payment channel, client-funded) and/or
-    /// `"pull"` (SPL token delegation, operator fee-pays the approve tx).
-    ///
-    /// Defaults to `["push"]` when omitted.
-    ///
-    /// Example YAML:
-    /// ```yaml
-    /// session:
-    ///   cap_usdc: 10.0
-    ///   modes: [push, pull]
-    /// ```
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub modes: Vec<String>,
-    /// Pull voucher strategy.
-    ///
-    /// This disambiguates pull-mode sessions:
-    /// - `disabled`: do not advertise or accept pull sessions.
-    /// - `client_voucher`: client signs vouchers; no multi-delegate setup.
-    /// - `operated_voucher`: operator signs vouchers after metering and uses
-    ///   multi-delegate setup for delegated token movement.
-    #[serde(default)]
-    pub pull_voucher_strategy: SessionPullVoucherStrategy,
-    /// Legacy pull-mode channel-open batch flush interval in milliseconds.
-    ///
-    /// Defaults to `400` when omitted.
-    #[serde(default = "default_session_batch_open_interval_ms")]
-    pub batch_open_interval_ms: u64,
+    /// When set, this must be a non-empty, strictly increasing list of
+    /// integers between 1 and 2592000 (30 days). The client may select one
+    /// value in its `open` credential; when omitted the server picks the
+    /// effective timeout from `close_delay_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_options_seconds: Option<Vec<u32>>,
     /// Idle delay before the operator closes and settles the payment channel.
     ///
-    /// Defaults to `15000` when omitted. Set to `0` to disable automatic close.
+    /// Defaults to `600000` (ten minutes) when omitted. Set to `0` to disable
+    /// automatic close.
     #[serde(default = "default_session_close_delay_ms")]
     pub close_delay_ms: u64,
+    /// Boundary used to group idle channel closes into settlement batches.
+    ///
+    /// The close deadline is rounded up to the next boundary. Defaults to
+    /// `60000` (one minute). Must be non-zero when automatic close is enabled.
+    #[serde(default = "default_session_close_batch_interval_ms")]
+    pub close_batch_interval_ms: u64,
     /// Interval between operator pushes of the latest accepted cumulative
     /// watermark to the payment-channel program.
     ///
@@ -879,25 +915,66 @@ pub struct SessionSpec {
     /// converted to basis points for the payment channel distribution.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub splits: Vec<SplitRule>,
+    /// Reuse channels opened by a prior run. When true, a client voucher for a
+    /// channel not in this process's in-memory store is honored by loading the
+    /// channel from chain (resuming from its on-chain settled watermark) instead
+    /// of rejecting it as unknown. Lets a restarted gateway drive channels a
+    /// previous run opened, avoiding re-opening (and re-paying rent for) them.
+    #[serde(default)]
+    pub reuse_from_chain: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionPullVoucherStrategy {
-    #[default]
-    Disabled,
-    ClientVoucher,
-    OperatedVoucher,
+/// Server-side lifecycle policy for x402 batch-settlement channels.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BatchSettlementSpec {
+    /// Interval between complete active-channel settlement sweeps.
+    ///
+    /// Defaults to `0`, leaving active channels untouched. Set this to a
+    /// nonzero cadence (for example `240000` in the 100k benchmark) to bound
+    /// the amount held only in off-chain vouchers.
+    #[serde(default)]
+    pub settlement_interval_ms: u64,
+    /// How long a channel must remain untouched before its positive residual
+    /// is eligible for the normal production settlement loop.
+    #[serde(default = "default_batch_idle_settlement_delay_ms")]
+    pub idle_settlement_delay_ms: u64,
+    /// Minimum per-channel claimed-but-undistributed balance that triggers an
+    /// open-channel distribution, expressed in the configured token's base
+    /// units. Unset by default, so intermediate claims remain in escrow until
+    /// the channel closes. Must be greater than zero when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distribution_threshold_base_units: Option<u64>,
 }
 
-fn default_session_batch_open_interval_ms() -> u64 {
-    400
+impl Default for BatchSettlementSpec {
+    fn default() -> Self {
+        Self {
+            settlement_interval_ms: 0,
+            idle_settlement_delay_ms: default_batch_idle_settlement_delay_ms(),
+            distribution_threshold_base_units: None,
+        }
+    }
 }
 
+fn default_batch_idle_settlement_delay_ms() -> u64 {
+    DEFAULT_BATCH_IDLE_SETTLEMENT_DELAY_MS
+}
+
+/// Idle grace period restarted by each channel touch. The resulting deadline
+/// is rounded separately by `close_batch_interval_ms`.
 fn default_session_close_delay_ms() -> u64 {
-    15_000
+    600_000
 }
 
+/// Deadline bucket width for grouping idle closes. This is neither the idle
+/// grace period nor the reconciliation worker's polling interval.
+fn default_session_close_batch_interval_ms() -> u64 {
+    60_000
+}
+
+/// Cadence for pushing active-channel watermarks in embedded reconciliation
+/// mode. External reconciliation workers use their own configured cadence.
 fn default_session_settlement_interval_ms() -> u64 {
     5_000
 }
@@ -1110,7 +1187,7 @@ pub struct SubscriptionEndpoint {
     pub recipient: Option<String>,
 
     /// Free-trial length in days. Reserved for a future iteration —
-    /// `pay server` ignores this in v0 and surfaces a warning.
+    /// `pay gate api` ignores this in v0 and surfaces a warning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_trial_days: Option<u32>,
 }
@@ -1642,6 +1719,27 @@ pub fn validate_api_spec(spec: &ApiSpec) -> Vec<String> {
     // Channel distribution splits from a top-level `session:` block.
     if let Some(session) = &spec.session {
         validate_session_splits(session, &spec.recipients, &mut errs);
+        if session.close_delay_ms > 0
+            && (session.close_batch_interval_ms < 60_000
+                || session.close_batch_interval_ms % 60_000 != 0)
+        {
+            errs.push(
+                "session.close_batch_interval_ms must be a whole number of minutes when automatic close is enabled"
+                    .to_string(),
+            );
+        }
+    }
+
+    if spec
+        .batch_settlement
+        .as_ref()
+        .and_then(|policy| policy.distribution_threshold_base_units)
+        == Some(0)
+    {
+        errs.push(
+            "batch_settlement.distribution_threshold_base_units must be greater than zero when set"
+                .to_string(),
+        );
     }
 
     errs
@@ -1699,6 +1797,30 @@ fn validate_auth_config(auth: &AuthConfig, context: &str, errs: &mut Vec<String>
             fetch,
             inject,
         } => validate_access_token_auth(prepare, fetch, inject, context, errs),
+        AuthConfig::Oauth2 {
+            token_url,
+            scopes,
+            audience,
+            ..
+        } => {
+            let identity = token_url == "gcp_metadata_identity";
+            let has_audience = audience.as_deref().is_some_and(|a| !a.trim().is_empty());
+            if identity && !has_audience {
+                errs.push(format!(
+                    "{context}: oauth2.token_url `gcp_metadata_identity` requires oauth2.audience — set it to the URL of the IAM-protected service being invoked (e.g. the Cloud Run service URL)"
+                ));
+            }
+            if !identity && audience.is_some() {
+                errs.push(format!(
+                    "{context}: oauth2.audience is only valid with token_url `gcp_metadata_identity` (got token_url `{token_url}`)"
+                ));
+            }
+            if identity && !scopes.is_empty() {
+                errs.push(format!(
+                    "{context}: oauth2.scopes are not supported with token_url `gcp_metadata_identity` — identity tokens are bound to an audience, not scopes"
+                ));
+            }
+        }
         _ => {}
     }
 }
@@ -2508,6 +2630,38 @@ mod tests {
     }
 
     #[test]
+    fn batch_settlement_policy_defaults_to_idle_only() {
+        let policy: BatchSettlementSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(policy.settlement_interval_ms, 0);
+        assert_eq!(
+            policy.idle_settlement_delay_ms,
+            DEFAULT_BATCH_IDLE_SETTLEMENT_DELAY_MS
+        );
+        assert_eq!(policy.distribution_threshold_base_units, None);
+
+        let benchmark: BatchSettlementSpec = serde_json::from_str(
+            r#"{"settlement_interval_ms":240000,"idle_settlement_delay_ms":300000}"#,
+        )
+        .unwrap();
+        assert_eq!(benchmark.settlement_interval_ms, 240_000);
+    }
+
+    #[test]
+    fn batch_distribution_threshold_must_be_positive() {
+        let mut api = test_spec(vec![]);
+        api.batch_settlement = Some(BatchSettlementSpec {
+            distribution_threshold_base_units: Some(0),
+            ..BatchSettlementSpec::default()
+        });
+
+        assert!(
+            validate_api_spec(&api).iter().any(|error| {
+                error.contains("batch_settlement.distribution_threshold_base_units")
+            })
+        );
+    }
+
+    #[test]
     fn compare_op_serde() {
         let json = serde_json::to_string(&CompareOp::Lte).unwrap();
         assert_eq!(json, r#""<=""#);
@@ -2533,24 +2687,48 @@ mod tests {
     fn session_spec_defaults_lifecycle_intervals() {
         let session: SessionSpec = serde_json::from_str(r#"{"cap_usdc":10.0}"#).unwrap();
 
-        assert_eq!(session.batch_open_interval_ms, 400);
-        assert_eq!(session.close_delay_ms, 15_000);
+        assert_eq!(session.close_delay_ms, 600_000);
+        assert_eq!(session.close_batch_interval_ms, 60_000);
         assert_eq!(session.settlement_interval_ms, 5_000);
-        assert_eq!(
-            session.settlement_authority,
-            SessionSettlementAuthority::ClientVoucher
-        );
+        assert_eq!(session.voucher_signer, SessionVoucherSigner::Client);
     }
 
     #[test]
-    fn session_spec_parses_delegated_settlement_authority() {
-        let session: SessionSpec =
-            serde_json::from_str(r#"{"cap_usdc":10.0,"settlement_authority":"delegated"}"#)
-                .unwrap();
+    fn validate_session_close_batch_interval_uses_whole_minutes() {
+        let mut spec = test_spec(vec![]);
+        let mut session: SessionSpec = serde_json::from_str(r#"{"cap_usdc":10.0}"#).unwrap();
+        session.close_batch_interval_ms = 15_000;
+        spec.session = Some(session);
 
-        assert_eq!(
-            session.settlement_authority,
-            SessionSettlementAuthority::Delegated
+        let errors = validate_api_spec(&spec);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("whole number of minutes")),
+            "got: {errors:?}"
+        );
+
+        spec.session.as_mut().unwrap().close_batch_interval_ms = 120_000;
+        assert!(validate_api_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn session_spec_parses_operator_voucher_signer() {
+        let session: SessionSpec =
+            serde_json::from_str(r#"{"cap_usdc":10.0,"voucher_signer":"operator"}"#).unwrap();
+        assert_eq!(session.voucher_signer, SessionVoucherSigner::Operator);
+    }
+
+    #[test]
+    fn session_spec_rejects_unknown_fields() {
+        // A legacy/renamed key (e.g. a since-removed `settlement_authority`)
+        // must be a hard parse error, not a silent no-op that leaves
+        // `voucher_signer` defaulted to `client`.
+        let result: Result<SessionSpec, _> =
+            serde_json::from_str(r#"{"cap_usdc":10.0,"settlement_authority":"delegated"}"#);
+        assert!(
+            result.is_err(),
+            "unknown field must be rejected, not silently ignored"
         );
     }
 
@@ -2824,6 +3002,7 @@ mod tests {
             operator: None,
             recipients: std::collections::HashMap::new(),
             session: None,
+            batch_settlement: None,
         };
         let json = serde_json::to_string(&spec).unwrap();
         let back: ApiSpec = serde_json::from_str(&json).unwrap();
@@ -3235,6 +3414,7 @@ value_from_env: PAY_SIGNER_KEYPAIR
             operator: None,
             recipients,
             session: None,
+            batch_settlement: None,
         }
     }
 
@@ -3286,6 +3466,21 @@ value_from_env: PAY_SIGNER_KEYPAIR
         assert_eq!(
             api.endpoints[1].metering.as_ref().unwrap().schemes,
             Some(vec![Scheme::X402Exact]),
+        );
+    }
+
+    #[test]
+    fn apply_scheme_defaults_adds_batch_when_batch_policy_is_configured() {
+        let mut api = test_spec(vec![metered_endpoint(None)]);
+        api.batch_settlement = Some(BatchSettlementSpec {
+            settlement_interval_ms: 240_000,
+            ..BatchSettlementSpec::default()
+        });
+        api.apply_scheme_defaults();
+
+        assert_eq!(
+            api.endpoints[0].metering.as_ref().unwrap().schemes,
+            Some(vec![Scheme::MppCharge, Scheme::X402BatchSettlement]),
         );
     }
 
@@ -3734,13 +3929,13 @@ value_from_env: PAY_SIGNER_KEYPAIR
         spec.session = Some(SessionSpec {
             cap_usdc: 10.0,
             min_voucher_delta: 0,
-            settlement_authority: SessionSettlementAuthority::ClientVoucher,
-            modes: vec![],
-            pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
-            batch_open_interval_ms: 400,
+            voucher_signer: SessionVoucherSigner::Client,
+            idle_timeout_options_seconds: None,
             close_delay_ms: 15_000,
+            close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
             splits: vec![],
+            reuse_from_chain: false,
         });
 
         let errs = validate_api_spec(&spec);
@@ -3900,13 +4095,13 @@ value_from_env: PAY_SIGNER_KEYPAIR
         spec.session = Some(SessionSpec {
             cap_usdc: 10.0,
             min_voucher_delta: 0,
-            settlement_authority: SessionSettlementAuthority::ClientVoucher,
-            modes: vec![],
-            pull_voucher_strategy: SessionPullVoucherStrategy::Disabled,
-            batch_open_interval_ms: 400,
+            voucher_signer: SessionVoucherSigner::Client,
+            idle_timeout_options_seconds: None,
             close_delay_ms: 15_000,
+            close_batch_interval_ms: 60_000,
             settlement_interval_ms: 5_000,
             splits,
+            reuse_from_chain: false,
         });
         spec
     }
@@ -4671,6 +4866,85 @@ endpoints:
             errs.iter()
                 .any(|e| e.contains("does not support nested oauth2 auth")),
             "expected nested oauth2 validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_identity_requires_audience() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity"#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter().any(|e| e.contains("requires oauth2.audience")),
+            "expected missing-audience validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_audience_requires_identity_token_url() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: https://oauth.example.com/token
+    audience: https://svc-xyz.a.run.app"#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("oauth2.audience is only valid with token_url")),
+            "expected audience-without-identity validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_identity_rejects_scopes() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity
+    audience: https://svc-xyz.a.run.app
+    scopes:
+      - https://www.googleapis.com/auth/cloud-platform"#,
+        ))
+        .unwrap();
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("oauth2.scopes are not supported")),
+            "expected scopes-with-identity validation error, got: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_oauth2_identity_with_audience_is_valid() {
+        let spec: ApiSpec = serde_yml::from_str(&access_token_auth_yaml(
+            r#"    method: oauth2
+    token_url: gcp_metadata_identity
+    audience: https://svc-xyz.a.run.app"#,
+        ))
+        .unwrap();
+
+        match spec.routing.auth() {
+            Some(AuthConfig::Oauth2 {
+                token_url,
+                audience,
+                ..
+            }) => {
+                assert_eq!(token_url, "gcp_metadata_identity");
+                assert_eq!(audience.as_deref(), Some("https://svc-xyz.a.run.app"));
+            }
+            other => panic!("expected oauth2 auth, got: {other:?}"),
+        }
+
+        let errs = validate_api_spec(&spec);
+        assert!(
+            !errs.iter().any(|e| e.contains("oauth2")),
+            "expected no oauth2 validation errors, got: {errs:?}"
         );
     }
 

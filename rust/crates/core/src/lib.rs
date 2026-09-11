@@ -1,5 +1,6 @@
 // Shared modules
 pub mod accounts;
+mod b58;
 pub mod config;
 pub mod error;
 pub mod explorer;
@@ -77,6 +78,13 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
         None
     }
 
+    /// Store used to bind a confirmed subscription activation to its reusable
+    /// bearer proof. Hosts must return the same store across requests; otherwise
+    /// a proof accepted during activation cannot be recognized on later access.
+    fn subscription_store(&self) -> Option<Arc<dyn pay_kit::mpp::store::Store>> {
+        None
+    }
+
     /// x402 `exact` handler, when the server accepts x402 payments.
     fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
         None
@@ -98,8 +106,18 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
     /// bypasses the old axum `logging_middleware`).
     fn record_exchange(&self, _exchange: HttpExchange) {}
 
+    /// Whether the host consumes completed HTTP exchanges.
+    ///
+    /// Defaults to `true` to preserve logging for external implementations
+    /// that override [`Self::record_exchange`]. Hosts that can determine at
+    /// runtime that logging is disabled should return `false`, allowing the
+    /// proxy to skip request/response header materialization entirely.
+    fn records_http_exchanges(&self) -> bool {
+        true
+    }
+
     /// Called at request time, before the upstream responds. A host that
-    /// tracks in-flight requests (`pay serve inference`) returns a log id;
+    /// tracks in-flight requests (`pay gate inference`) returns a log id;
     /// the gate echoes it in [`HttpExchange::log_id`] and in
     /// [`PaymentState::record_exchange_update`] calls. Returning `None`
     /// (the default) also disables the gate's response stream observer for

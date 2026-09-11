@@ -1,12 +1,12 @@
-//! `pay server demo` — start the gateway with a bundled demo spec.
+//! `pay server demo` — start the gateway with a bundled demo paywall.
 //!
-//! Extracts the embedded payment-debugger.yml to `./pay-demo.yaml` in the
-//! current working directory, then invokes `pay server start` with sandbox and
+//! Extracts the embedded playground API spec to `./pay-demo.yaml` in the
+//! current working directory, then invokes `pay gate api` with sandbox and
 //! debugger implied.
 
 use crate::commands::server::start::StartCommand;
 
-const DEMO_SPEC: &str = include_str!("payment-debugger.yml");
+const DEMO_PAYWALL: &str = include_str!("../../../../../playground-api.yaml");
 
 #[derive(clap::Args)]
 pub struct DemoCommand {
@@ -32,11 +32,23 @@ pub struct DemoCommand {
 }
 
 impl DemoCommand {
-    pub fn run(self, active_account_name: Option<&str>, _sandbox: bool) -> pay_core::Result<()> {
-        // Extract embedded spec to ./pay-demo.yaml in the current directory
-        let spec_path = std::path::PathBuf::from("pay-demo.yaml");
-        std::fs::write(&spec_path, DEMO_SPEC)
-            .map_err(|e| pay_core::Error::Config(format!("Failed to write pay-demo.yaml: {e}")))?;
+    pub fn run(
+        self,
+        legacy_signer_source: Option<&str>,
+        account_override: Option<&str>,
+        _sandbox: bool,
+    ) -> pay_core::Result<()> {
+        // Keep the generated file after first launch: subscription Plan
+        // publication writes its PDA and immutable terms back into this YAML,
+        // and the challenge-binding secret must remain stable for bearer reuse.
+        let paywall_path = std::path::PathBuf::from("pay-demo.yaml");
+        if !paywall_path.exists() {
+            let challenge_secret = bs58::encode(rand::random::<[u8; 32]>()).into_string();
+            let rendered = DEMO_PAYWALL.replace("${MPP_SECRET_KEY}", &challenge_secret);
+            std::fs::write(&paywall_path, rendered).map_err(|e| {
+                pay_core::Error::Config(format!("Failed to write pay-demo.yaml: {e}"))
+            })?;
+        }
 
         // Demo mode always runs on sandbox. Default to hosted Surfpool;
         // --local overrides to localhost.
@@ -47,8 +59,10 @@ impl DemoCommand {
         };
 
         let cmd = StartCommand {
-            spec: spec_path.to_string_lossy().into_owned(),
+            paywall: paywall_path.to_string_lossy().into_owned(),
             bind: self.bind,
+            tls_cert: None,
+            tls_key: None,
             recipient: self.recipient,
             currency: self.currency,
             rpc_url,
@@ -57,8 +71,39 @@ impl DemoCommand {
             openapi: None,
             public_url: None,
             no_register: false,
-            scaffolded_spec: Some("./pay-demo.yaml".to_string()),
+            scaffolded_paywall: Some("./pay-demo.yaml".to_string()),
         };
-        cmd.run(active_account_name, true)
+        cmd.run(legacy_signer_source, account_override, true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundled_demo_exposes_all_playground_payment_patterns() {
+        let api: pay_types::metering::ApiSpec = serde_yml::from_str(DEMO_PAYWALL).unwrap();
+        let paths: Vec<&str> = api
+            .endpoints
+            .iter()
+            .map(|endpoint| endpoint.path.as_str())
+            .collect();
+
+        assert_eq!(paths.len(), 6);
+        assert!(paths.contains(&"api/v1/quote/{symbol}"));
+        assert!(paths.contains(&"api/v1/fortune"));
+        assert!(paths.contains(&"api/v1/joke"));
+        assert!(paths.contains(&"api/v1/summarize"));
+        assert!(paths.contains(&"api/v1/feed"));
+        assert!(paths.contains(&"api/v1/stream"));
+        assert!(
+            api.endpoints
+                .iter()
+                .find(|endpoint| endpoint.path == "api/v1/feed")
+                .unwrap()
+                .subscription
+                .is_some()
+        );
     }
 }

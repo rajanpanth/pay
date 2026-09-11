@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 
 use clap::Args;
 
-use super::claude::{AlternateClient, AlternateProvider, prepare_alternate_provider};
+use super::agent::{AlternateClient, AlternateProvider, prepare_alternate_provider};
 
 const ALTERNATE_PROVIDER_ID: &str = "pay_alt";
 const ALTERNATE_BASE_INSTRUCTIONS: &str = "You are Codex, a coding agent working with the user in the current workspace. Follow the developer instructions. Use the provided tools to inspect and modify files when requested, verify your work, and report results concisely. Do not invent tool results.";
@@ -179,7 +179,7 @@ fn build_codex_args(
     args
 }
 
-fn write_model_catalog_file(model: &str) -> pay_core::Result<tempfile::NamedTempFile> {
+pub(crate) fn write_model_catalog_file(model: &str) -> pay_core::Result<tempfile::NamedTempFile> {
     use std::io::Write;
 
     let mut file = tempfile::Builder::new()

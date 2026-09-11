@@ -16,17 +16,29 @@ pub const DEFAULT_CATALOG_FQNS: &[&str] = &[
     "solana-foundation/google/generativelanguage",
 ];
 
+const OPENAI_RESOURCE: &str = "openai";
 const ALIBABA_MODELSTUDIO_FQN: &str = "solana-foundation/alibaba/modelstudio";
 const ALIBABA_MODELSTUDIO_GATEWAY_URL: &str = "https://modelstudio.alibaba.gateway-402.com";
-const ALIBABA_RESPONSES_PATH: &str = "v1/responses";
+const ALIBABA_RESPONSES_PATH: &str = "compatible-mode/v1/responses";
 const GOOGLE_GEMINI_FQN: &str = "solana-foundation/google/generativelanguage";
 const GOOGLE_GEMINI_GATEWAY_URL: &str = "https://generativelanguage.google.gateway-402.com";
 const GOOGLE_OPENAI_CHAT_PATH: &str = "v1beta/openai/chat/completions";
 
+fn is_openai_compatible_endpoint(endpoint: &pay_core::skills::Endpoint) -> bool {
+    endpoint
+        .resource
+        .as_deref()
+        .is_some_and(|resource| resource.eq_ignore_ascii_case(OPENAI_RESOURCE))
+        || {
+            let path = endpoint.path.to_ascii_lowercase();
+            path.contains("chat/completions") || path.trim_matches('/').ends_with("/responses")
+        }
+}
+
 /// A hosted inference provider backed by a resolved catalog entry.
 pub struct CatalogProvider {
     fqn: String,
-    /// Short name derived from the fqn (last segment).
+    /// Stable CLI-facing provider name.
     slug: String,
     title: String,
     service_url: String,
@@ -44,7 +56,7 @@ impl CatalogProvider {
         let title = display_title(&svc.fqn, &svc.meta.title);
         Self {
             fqn: svc.fqn.clone(),
-            slug: svc.name().to_string(),
+            slug: display_slug(&svc.fqn, svc.name()),
             title,
             service_url: svc.meta.service_url.trim_end_matches('/').to_string(),
             endpoints: svc.endpoints.clone(),
@@ -77,6 +89,73 @@ impl CatalogProvider {
             .find(|ep| is_model_list(ep) && ep.pricing.is_none())
             .or_else(|| self.endpoints.iter().find(is_model_list))
     }
+
+    /// Model-list path advertised explicitly or derived from an OpenAI-tagged
+    /// Chat Completions route (`…/chat/completions` → `…/models`).
+    ///
+    /// Some dynamic-price x402 providers omit the unmetered model-list route
+    /// from their payment catalog even though their OpenAI-compatible gateway
+    /// serves it. Derivation keeps discovery generic and preserves any
+    /// provider-specific prefix such as `api/v1`.
+    fn model_list_path(&self) -> Option<String> {
+        self.model_list_endpoint()
+            .map(|endpoint| endpoint.path.clone())
+            .or_else(|| {
+                self.endpoints
+                    .iter()
+                    .find(|endpoint| {
+                        endpoint.method.eq_ignore_ascii_case("POST")
+                            && endpoint.resource.as_deref().is_some_and(|resource| {
+                                resource.eq_ignore_ascii_case(OPENAI_RESOURCE)
+                            })
+                            && endpoint
+                                .path
+                                .to_ascii_lowercase()
+                                .trim_matches('/')
+                                .ends_with("chat/completions")
+                    })
+                    .map(|endpoint| {
+                        let path = endpoint.path.trim_matches('/');
+                        let prefix = &path[..path.len() - "chat/completions".len()];
+                        format!("{prefix}models")
+                    })
+            })
+    }
+
+    /// Fetch the provider's model catalog and any per-model prices exposed by
+    /// an OpenAI-compatible `GET …/models` response.
+    pub async fn list_models_with_pricing(
+        &self,
+        client: &reqwest::Client,
+        base_url: &str,
+    ) -> (Vec<String>, Vec<pay_pdb::types::ModelPricingSummary>) {
+        let fallback = || {
+            let models = models_from_pricing_variants(&self.endpoints);
+            if models.is_empty() {
+                self.fallback_models.clone()
+            } else {
+                models
+            }
+        };
+        let Some(model_list_path) = self.model_list_path() else {
+            return (fallback(), Vec::new());
+        };
+        let path = format!("/{}", model_list_path.trim_start_matches('/'));
+        let Some(json) = get_json(client, base_url.trim_end_matches('/'), &path).await else {
+            return (fallback(), Vec::new());
+        };
+        let advertised_models = parse_model_names(&json);
+        let models = if advertised_models.is_empty() {
+            fallback()
+        } else {
+            models_matching_configured_families(
+                advertised_models,
+                &self.endpoints,
+                &self.fallback_models,
+            )
+        };
+        (models, parse_openai_model_pricing(&json))
+    }
 }
 
 /// Built-in Alibaba provider used until its skills-catalog entry is
@@ -87,7 +166,7 @@ impl CatalogProvider {
 pub fn alibaba_modelstudio_fallback() -> CatalogProvider {
     CatalogProvider {
         fqn: ALIBABA_MODELSTUDIO_FQN.to_string(),
-        slug: "modelstudio".to_string(),
+        slug: "alibaba".to_string(),
         title: "Alibaba Model Studio".to_string(),
         service_url: ALIBABA_MODELSTUDIO_GATEWAY_URL.to_string(),
         endpoints: vec![
@@ -125,7 +204,7 @@ pub fn alibaba_modelstudio_fallback() -> CatalogProvider {
 pub fn google_gemini_fallback() -> CatalogProvider {
     CatalogProvider {
         fqn: GOOGLE_GEMINI_FQN.to_string(),
-        slug: "generativelanguage".to_string(),
+        slug: "google".to_string(),
         title: "Google Gemini".to_string(),
         service_url: GOOGLE_GEMINI_GATEWAY_URL.to_string(),
         endpoints: vec![
@@ -275,9 +354,9 @@ impl InferenceProvider for CatalogProvider {
         &[]
     }
     fn color(&self) -> Option<&str> {
-        if self.fqn.contains("/google/") {
+        if self.fqn == GOOGLE_GEMINI_FQN {
             Some("#4285f4")
-        } else if self.fqn.contains("/alibaba/") {
+        } else if self.fqn == ALIBABA_MODELSTUDIO_FQN {
             Some("#ff6a00")
         } else {
             Some("#94a3b8")
@@ -287,48 +366,46 @@ impl InferenceProvider for CatalogProvider {
     /// catalog, so any HTTP response (even 4xx) from its gateway means up.
     async fn identify(&self, client: &reqwest::Client, base_url: &str) -> Option<Option<String>> {
         let base = base_url.trim_end_matches('/');
-        let url = match self.model_list_endpoint() {
-            Some(ep) => format!("{base}/{}", ep.path.trim_start_matches('/')),
+        let url = match self.model_list_path() {
+            Some(path) => format!("{base}/{}", path.trim_start_matches('/')),
             None => base.to_string(),
         };
-        if client.get(&url).send().await.is_ok() {
-            return Some(None);
+        match client.get(&url).send().await {
+            Ok(_) => return Some(None),
+            Err(error) => {
+                tracing::debug!(%url, %error, "hosted provider probe failed");
+            }
         }
-        if url != base && client.get(base).send().await.is_ok() {
-            return Some(None);
+        if url != base {
+            match client.get(base).send().await {
+                Ok(_) => return Some(None),
+                Err(error) => {
+                    tracing::debug!(url = base, %error, "hosted provider fallback probe failed");
+                }
+            }
         }
         None
     }
     async fn list_models(&self, client: &reqwest::Client, base_url: &str) -> Vec<String> {
-        let fallback = || {
-            let models = models_from_pricing_variants(&self.endpoints);
-            if models.is_empty() {
-                self.fallback_models.clone()
-            } else {
-                models
-            }
-        };
-        let Some(ep) = self.model_list_endpoint() else {
-            return fallback();
-        };
-        let path = format!("/{}", ep.path.trim_start_matches('/'));
-        match get_json(client, base_url.trim_end_matches('/'), &path).await {
-            Some(json) => {
-                let models = parse_model_names(&json);
-                if models.is_empty() {
-                    fallback()
-                } else {
-                    models
-                }
-            }
-            None => fallback(),
-        }
+        self.list_models_with_pricing(client, base_url).await.0
     }
-    /// Metered catalog endpoints, in gate convention (no leading slash).
+    /// Metered catalog endpoints, plus dynamic-price OpenAI chat endpoints,
+    /// in gate convention (no leading slash).
     fn paid_endpoints(&self) -> Vec<PaidEndpoint> {
         self.endpoints
             .iter()
-            .filter(|ep| ep.pricing.is_some())
+            .filter(|endpoint| {
+                endpoint.pricing.is_some()
+                    || (endpoint.method.eq_ignore_ascii_case("POST")
+                        && endpoint
+                            .resource
+                            .as_deref()
+                            .is_some_and(|resource| resource.eq_ignore_ascii_case(OPENAI_RESOURCE))
+                        && endpoint
+                            .path
+                            .to_ascii_lowercase()
+                            .contains("chat/completions"))
+            })
             .filter_map(|ep| {
                 Some(PaidEndpoint {
                     method: parse_method(&ep.method)?,
@@ -338,7 +415,7 @@ impl InferenceProvider for CatalogProvider {
             .collect()
     }
     fn dialect(&self) -> Dialect {
-        if self.fqn.contains("google/generativelanguage") {
+        if self.fqn == GOOGLE_GEMINI_FQN {
             if self
                 .endpoints
                 .iter()
@@ -348,7 +425,9 @@ impl InferenceProvider for CatalogProvider {
             } else {
                 Dialect::GeminiNative
             }
-        } else if self.fqn.contains("alibaba/modelstudio") {
+        } else if self.fqn == ALIBABA_MODELSTUDIO_FQN
+            || self.endpoints.iter().any(is_openai_compatible_endpoint)
+        {
             Dialect::OpenAiCompat
         } else {
             Dialect::Unknown
@@ -406,6 +485,7 @@ impl InferenceProvider for CatalogProvider {
         let mut variant_name: Option<String> = None;
         let mut description: Option<String> = None;
         let mut matched = false;
+        let mut variants_declared = false;
         for ep in self.endpoints.iter().filter(|ep| ep.pricing.is_some()) {
             let Some(variants) = ep
                 .pricing
@@ -415,6 +495,7 @@ impl InferenceProvider for CatalogProvider {
             else {
                 continue;
             };
+            variants_declared = true;
             let Some(variant) = match_variant(variants, model) else {
                 continue;
             };
@@ -428,7 +509,7 @@ impl InferenceProvider for CatalogProvider {
             }
             // Real input/output token rates for this model (the
             // consolidation win): hosted per-model rows now show the same
-            // `in $X · out $Y` chip as local ones.
+            // `input $X · output $Y` chip as local ones.
             if io.is_none() {
                 io = directional_io(variant);
             }
@@ -445,8 +526,15 @@ impl InferenceProvider for CatalogProvider {
                     .map(str::to_string);
             }
         }
-        if !matched || !min.is_finite() {
-            return self.pricing_hint();
+        if !matched {
+            return if variants_declared {
+                None
+            } else {
+                self.pricing_hint()
+            };
+        }
+        if !min.is_finite() {
+            return None;
         }
         Some(PricingHint {
             display: None,
@@ -520,7 +608,7 @@ fn match_variant<'a>(
         let Some(value) = variant.get("value").and_then(|v| v.as_str()) else {
             continue;
         };
-        if value == "default" {
+        if value.eq_ignore_ascii_case("default") {
             default = default.or(Some(variant));
         } else if model.contains(value) {
             return Some(variant);
@@ -556,10 +644,16 @@ fn dimension_prices(variant: &serde_json::Value) -> Vec<(f64, f64)> {
 /// Model names from a model-list response body. Understands Gemini's
 /// `{"models":[{"name":"models/gemini-…"}]}` (the `models/` prefix is
 /// stripped) and the OpenAI-compatible `{"data":[{"id":"…"}]}`.
+///
+/// Gemini entries advertise their capabilities in
+/// `supportedGenerationMethods`; models that cannot serve `generateContent`
+/// (embeddings, imagen, aqa) are dropped so the picker only offers models
+/// the chat route can call. Entries without the field are kept.
 fn parse_model_names(json: &serde_json::Value) -> Vec<String> {
     if let Some(items) = json.get("models").and_then(|v| v.as_array()) {
         return items
             .iter()
+            .filter(|item| supports_generate_content(item))
             .filter_map(|item| item.get("name")?.as_str())
             .map(|name| name.strip_prefix("models/").unwrap_or(name).to_string())
             .collect();
@@ -571,6 +665,62 @@ fn parse_model_names(json: &serde_json::Value) -> Vec<String> {
             .collect();
     }
     Vec::new()
+}
+
+/// Whether a Gemini model-list entry can serve the chat route. Entries
+/// without capability metadata are kept — absence of the field must not
+/// hide a model.
+fn supports_generate_content(item: &serde_json::Value) -> bool {
+    let Some(methods) = item
+        .get("supportedGenerationMethods")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return true;
+    };
+    methods
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .any(|method| method == "generateContent" || method == "streamGenerateContent")
+}
+
+/// Per-million-token rates returned by OpenAI-style model catalogs such as
+/// BlockRun's `{"data":[{"id":"…","pricing":{"input":…,"output":…}}]}`.
+fn parse_openai_model_pricing(
+    json: &serde_json::Value,
+) -> Vec<pay_pdb::types::ModelPricingSummary> {
+    let Some(items) = json.get("data").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let model = item.get("id")?.as_str()?.to_string();
+            let input = item.pointer("/pricing/input")?.as_f64()?;
+            let output = item.pointer("/pricing/output")?.as_f64()?;
+            let description = item
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(str::to_string);
+            let price = PricingHint {
+                display: None,
+                min_usd: input.min(output),
+                max_usd: input.max(output),
+                unit: "tokens".to_string(),
+                variant: Some(model.clone()),
+                description: description.clone(),
+                io: Some((input, output)),
+            }
+            .to_string();
+            Some(pay_pdb::types::ModelPricingSummary {
+                model: model.clone(),
+                variant: Some(model),
+                price: Some(price),
+                description,
+            })
+        })
+        .collect()
 }
 
 /// Model variants are also the catalog for hosted gateways that cannot proxy
@@ -585,7 +735,7 @@ fn models_from_pricing_variants(endpoints: &[pay_core::skills::Endpoint]) -> Vec
         .flatten()
         .filter_map(|variant| variant.get("value"))
         .filter_map(serde_json::Value::as_str)
-        .filter(|value| *value != "default")
+        .filter(|value| !value.eq_ignore_ascii_case("default"))
     {
         if !models.iter().any(|model| model == value) {
             models.push(value.to_string());
@@ -594,15 +744,77 @@ fn models_from_pricing_variants(endpoints: &[pay_core::skills::Endpoint]) -> Vec
     models
 }
 
+/// Whether any priced endpoint declares the `default` pricing sentinel —
+/// the runtime accepts and prices every model for such providers.
+fn has_default_pricing_variant(endpoints: &[pay_core::skills::Endpoint]) -> bool {
+    endpoints
+        .iter()
+        .filter_map(|endpoint| endpoint.pricing.as_ref())
+        .filter_map(|pricing| pricing.get("variants"))
+        .filter_map(serde_json::Value::as_array)
+        .flatten()
+        .filter_map(|variant| variant.get("value"))
+        .filter_map(serde_json::Value::as_str)
+        .any(|value| value.eq_ignore_ascii_case("default"))
+}
+
+/// Restrict a provider's broad model catalog to the model families priced by
+/// its inference endpoints, or its built-in fallback families while a catalog
+/// entry is not yet published. Alibaba's OpenAI-compatible model list includes
+/// audio, image, embedding, and realtime models that chat harnesses cannot
+/// call. These configured families are the agent route's supported allowlist.
+///
+/// Matching intentionally mirrors runtime pricing: a variant value is a
+/// substring of the advertised model id, so dated aliases remain available.
+/// A `default` pricing sentinel is the catalog's explicit promise that
+/// unlisted models are accepted and priced (metering's `resolve_variant`
+/// falls back to it), so providers that declare one keep their full
+/// advertised list — hiding a model here would desynchronize the picker
+/// from the gateway's support policy. Non-chat noise in those lists is
+/// removed by the capability filter in [`parse_model_names`] instead.
+///
+/// Top-level endpoint `dimensions` are also a runtime pricing fallback
+/// (`resolve_price` never leaves a metered endpoint unpriced), but they
+/// deliberately do *not* admit models here: the `default` sentinel is the
+/// catalog author's promise that unlisted models are first-class, while
+/// top-level dimensions are a quote-safety backstop at a conservative
+/// (punitive) rate. Hiding unlisted models from such providers steers
+/// users toward correctly-priced families instead of silently billing
+/// them at the backstop rate.
+fn models_matching_configured_families(
+    advertised_models: Vec<String>,
+    endpoints: &[pay_core::skills::Endpoint],
+    fallback_models: &[String],
+) -> Vec<String> {
+    if has_default_pricing_variant(endpoints) {
+        return advertised_models;
+    }
+    let mut configured_models = models_from_pricing_variants(endpoints);
+    if configured_models.is_empty() {
+        configured_models.extend_from_slice(fallback_models);
+    }
+    if configured_models.is_empty() {
+        return advertised_models;
+    }
+    advertised_models
+        .into_iter()
+        .filter(|model| {
+            configured_models
+                .iter()
+                .any(|configured| model.contains(configured))
+        })
+        .collect()
+}
+
 /// Picker title for a catalog entry. Known default fqns get a short brand
 /// name (catalog titles like "Generative Language API (Gemini)" are too
 /// verbose for a picker row); everything else uses the catalog title,
 /// falling back to the fqn.
 fn display_title(fqn: &str, catalog_title: &str) -> String {
-    if fqn.contains("google/generativelanguage") {
+    if fqn == GOOGLE_GEMINI_FQN {
         return "Google Gemini".to_string();
     }
-    if fqn.contains("alibaba/modelstudio") {
+    if fqn == ALIBABA_MODELSTUDIO_FQN {
         return "Alibaba Model Studio".to_string();
     }
     if catalog_title.trim().is_empty() {
@@ -610,6 +822,21 @@ fn display_title(fqn: &str, catalog_title: &str) -> String {
     } else {
         catalog_title.to_string()
     }
+}
+
+/// Stable brand name shown by agent-provider selection.
+///
+/// Catalog FQNs describe API resources (`generativelanguage`, `openai`,
+/// `modelstudio`), while the CLI presents the provider brands users choose.
+fn display_slug(fqn: &str, catalog_name: &str) -> String {
+    if fqn == GOOGLE_GEMINI_FQN {
+        "google"
+    } else if fqn == ALIBABA_MODELSTUDIO_FQN {
+        "alibaba"
+    } else {
+        catalog_name
+    }
+    .to_string()
 }
 
 fn parse_method(method: &str) -> Option<pay_types::metering::HttpMethod> {
@@ -630,12 +857,13 @@ fn parse_method(method: &str) -> Option<pay_types::metering::HttpMethod> {
 /// path `pay skills show` uses (CDN + `~/.config/pay/skills/detail` cache).
 /// Any fqn that fails to resolve (not yet published, detail fetch failed,
 /// no `service_url`) is skipped with a debug log, never an error.
-pub async fn resolve_catalog_providers(
+pub async fn resolve_catalog_providers<S: AsRef<str>>(
     catalog: &mut pay_core::skills::Catalog,
-    fqns: &[&str],
+    fqns: &[S],
 ) -> Vec<CatalogProvider> {
     let mut providers = Vec::new();
     for fqn in fqns {
+        let fqn = fqn.as_ref();
         if let Err(e) = pay_core::skills::ensure_endpoints(catalog, fqn).await {
             tracing::debug!(fqn, error = %e, "catalog provider unresolved — skipping");
             continue;
@@ -655,6 +883,25 @@ pub async fn resolve_catalog_providers(
         providers.push(CatalogProvider::from_service(svc));
     }
     providers
+}
+
+/// Picker defaults plus locally loaded OpenAI-compatible catalog entries.
+///
+/// PR pins eagerly load their endpoint detail into the catalog overlay, so an
+/// `openai` resource tag makes a provider immediately available for testing
+/// without fetching every canonical provider's detail file.
+pub fn picker_catalog_fqns(catalog: &pay_core::skills::Catalog) -> Vec<String> {
+    let mut fqns: Vec<String> = DEFAULT_CATALOG_FQNS
+        .iter()
+        .map(|fqn| (*fqn).to_string())
+        .collect();
+    for provider in &catalog.providers {
+        let openai_compatible = provider.endpoints.iter().any(is_openai_compatible_endpoint);
+        if openai_compatible && !fqns.iter().any(|fqn| fqn == &provider.fqn) {
+            fqns.push(provider.fqn.clone());
+        }
+    }
+    fqns
 }
 
 #[cfg(test)]
@@ -706,6 +953,22 @@ mod tests {
 
     fn gemini(service_url: &str) -> CatalogProvider {
         CatalogProvider::from_service(&gemini_service(service_url))
+    }
+
+    fn blockrun_service() -> pay_core::skills::Service {
+        serde_json::from_value(serde_json::json!({
+            "fqn": "blockrun/blockrun",
+            "title": "BlockRun - Stablecoin gated LLM inference",
+            "category": "ai_ml",
+            "service_url": "https://sol.blockrun.ai",
+            "endpoints": [{
+                "method": "POST",
+                "path": "api/v1/chat/completions",
+                "resource": "openai",
+                "description": "Generate an AI chat completion with a selected model"
+            }]
+        }))
+        .unwrap()
     }
 
     /// A Gemini entry whose generateContent carries per-model `variants[]`
@@ -765,7 +1028,7 @@ mod tests {
     #[test]
     fn identity_comes_from_the_catalog_entry() {
         let provider = gemini("https://generativelanguage.google.gateway-402.com/");
-        assert_eq!(provider.slug(), "generativelanguage");
+        assert_eq!(provider.slug(), "google");
         // Known default fqns get a short brand title for the picker.
         assert_eq!(provider.title(), "Google Gemini");
         assert_eq!(
@@ -791,6 +1054,57 @@ mod tests {
     }
 
     #[test]
+    fn display_slug_maps_api_resources_to_provider_brands() {
+        assert_eq!(
+            display_slug(
+                "solana-foundation/google/generativelanguage",
+                "generativelanguage"
+            ),
+            "google"
+        );
+        assert_eq!(display_slug("blockrun/blockrun", "blockrun"), "blockrun");
+        assert_eq!(
+            display_slug("solana-foundation/alibaba/modelstudio", "modelstudio"),
+            "alibaba"
+        );
+        assert_eq!(display_slug("op/custom", "custom"), "custom");
+    }
+
+    #[test]
+    fn picker_includes_loaded_openai_compatible_pr_pins() {
+        let catalog: pay_core::skills::Catalog = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "providers": [
+                blockrun_service(),
+                {
+                    "fqn": "op/unrelated",
+                    "service_url": "https://example.com",
+                    "endpoints": [{
+                        "method": "POST",
+                        "path": "v1/messages",
+                        "resource": "anthropic"
+                    }]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let fqns = picker_catalog_fqns(&catalog);
+        assert_eq!(
+            fqns,
+            [
+                "solana-foundation/alibaba/modelstudio",
+                "solana-foundation/google/generativelanguage",
+                "blockrun/blockrun",
+            ]
+        );
+        assert_eq!(
+            CatalogProvider::from_service(&blockrun_service()).dialect(),
+            Dialect::OpenAiCompat
+        );
+    }
+
+    #[test]
     fn paid_endpoints_are_the_metered_catalog_endpoints() {
         let paid = gemini("https://example.com").paid_endpoints();
         let paths: Vec<&str> = paid.iter().map(|e| e.path.as_str()).collect();
@@ -805,6 +1119,23 @@ mod tests {
         assert!(
             paid.iter()
                 .all(|e| matches!(e.method, pay_types::metering::HttpMethod::Post))
+        );
+    }
+
+    #[test]
+    fn dynamic_price_openai_chat_endpoint_remains_routable() {
+        let provider = CatalogProvider::from_service(&blockrun_service());
+        assert!(
+            provider.endpoints[0].pricing.is_none(),
+            "the catalog has no fixed price for this dynamic-price route"
+        );
+        assert_eq!(
+            provider
+                .paid_endpoints()
+                .into_iter()
+                .map(|endpoint| endpoint.path)
+                .collect::<Vec<_>>(),
+            ["api/v1/chat/completions"]
         );
     }
 
@@ -835,7 +1166,7 @@ mod tests {
         );
         // Directional dims populate `io`, so the chip shows real in/out rates.
         assert_eq!(flash.io, Some((0.345, 2.875)));
-        assert_eq!(flash.to_string(), "in $0.34 · out $2.88 /1M tok");
+        assert_eq!(flash.to_string(), "input $0.34 · output $2.88 / 1M tokens");
 
         // First-match-wins: the flash-lite variant precedes the broader
         // flash prefix, so a lite id resolves to lite pricing.
@@ -875,6 +1206,35 @@ mod tests {
             .pricing_hint_for_model(Some("gemini-2.5-flash"))
             .unwrap();
         assert_eq!(hint, provider.pricing_hint().unwrap());
+    }
+
+    /// The Gemini fixture with its `default` sentinel stripped: a provider
+    /// that prices only the named model families.
+    fn variant_priced_without_default() -> CatalogProvider {
+        let mut provider = gemini_variant_priced();
+        for endpoint in &mut provider.endpoints {
+            if let Some(variants) = endpoint
+                .pricing
+                .as_mut()
+                .and_then(|pricing| pricing.get_mut("variants"))
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                variants.retain(|variant| variant["value"] != "default");
+            }
+        }
+        provider
+    }
+
+    #[test]
+    fn unmatched_model_is_unpriced_when_variants_are_model_specific() {
+        let provider = variant_priced_without_default();
+
+        assert!(
+            provider
+                .pricing_hint_for_model(Some("smollm2:135m-instruct-q2_K"))
+                .is_none(),
+            "another model's aggregate range must not price an unmatched model"
+        );
     }
 
     #[test]
@@ -923,6 +1283,22 @@ mod tests {
     }
 
     #[test]
+    fn provider_brand_overrides_require_exact_canonical_fqns() {
+        let service: pay_core::skills::Service = serde_json::from_value(serde_json::json!({
+            "fqn": "third-party/solana-foundation/alibaba/modelstudio",
+            "title": "Unrelated Model Studio",
+            "service_url": "https://example.com"
+        }))
+        .unwrap();
+        let provider = CatalogProvider::from_service(&service);
+
+        assert_eq!(provider.slug(), "modelstudio");
+        assert_eq!(provider.title(), "Unrelated Model Studio");
+        assert_eq!(provider.color(), Some("#94a3b8"));
+        assert_eq!(provider.dialect(), Dialect::Unknown);
+    }
+
+    #[test]
     fn list_models_parses_v1beta_models() {
         rt().block_on(async {
             let port = stub(vec![("/v1beta/models", GEMINI_MODELS_JSON)]).await;
@@ -931,6 +1307,62 @@ mod tests {
                 .await;
             assert_eq!(models, vec!["gemini-2.5-flash", "gemini-2.5-pro"]);
         });
+    }
+
+    #[test]
+    fn openai_chat_route_derives_sibling_model_list_path() {
+        rt().block_on(async {
+            let port = stub(vec![(
+                "/api/v1/models",
+                r#"{"data":[
+                    {
+                        "id":"openai/gpt-5.6-sol",
+                        "description":"Flagship reasoning model.",
+                        "pricing":{"input":5.0,"output":30.0}
+                    },
+                    {
+                        "id":"anthropic/claude-sonnet-5",
+                        "pricing":{"input":3.0,"output":15.0}
+                    }
+                ]}"#,
+            )])
+            .await;
+            let provider = CatalogProvider::from_service(&blockrun_service());
+            assert_eq!(provider.model_list_path().as_deref(), Some("api/v1/models"));
+            let (models, pricing) = provider
+                .list_models_with_pricing(&client(), &base_url(port))
+                .await;
+            assert_eq!(models, ["openai/gpt-5.6-sol", "anthropic/claude-sonnet-5"]);
+            assert_eq!(pricing.len(), 2);
+            assert_eq!(pricing[0].model, "openai/gpt-5.6-sol");
+            assert_eq!(
+                pricing[0].price.as_deref(),
+                Some("input $5.00 · output $30.00 / 1M tokens")
+            );
+            assert_eq!(
+                pricing[0].description.as_deref(),
+                Some("Flagship reasoning model.")
+            );
+        });
+    }
+
+    #[test]
+    fn parse_model_names_drops_models_that_cannot_generate_content() {
+        let json = serde_json::json!({
+            "models": [
+                { "name": "models/gemini-2.5-flash",
+                  "supportedGenerationMethods": ["generateContent", "countTokens"] },
+                { "name": "models/text-embedding-004",
+                  "supportedGenerationMethods": ["embedContent"] },
+                { "name": "models/gemini-mystery" }
+            ]
+        });
+        assert_eq!(
+            parse_model_names(&json),
+            vec!["gemini-2.5-flash", "gemini-mystery"],
+            "non-chat models must not reach the agent picker; entries \
+             without capability metadata stay"
+        );
     }
 
     #[test]
@@ -951,6 +1383,87 @@ mod tests {
     }
 
     #[test]
+    fn live_models_are_intersected_with_priced_model_families() {
+        let provider = variant_priced_without_default();
+        assert_eq!(
+            models_matching_configured_families(
+                vec![
+                    "qwen-audio-3.0-asr-flash".to_string(),
+                    "gemini-2.5-flash".to_string(),
+                    "gemini-2.5-flash-2026-07-15".to_string(),
+                    "gemini-2.5-pro".to_string(),
+                ],
+                &provider.endpoints,
+                &provider.fallback_models,
+            ),
+            ["gemini-2.5-flash", "gemini-2.5-flash-2026-07-15",],
+            "unpriced model families must not leak into an agent picker"
+        );
+    }
+
+    #[test]
+    fn default_priced_catalogs_keep_every_live_model() {
+        // The live Gemini entry describes its `default` variant as the
+        // "Fallback for unlisted Gemini models": the runtime accepts and
+        // prices models beyond the named families, so the picker must not
+        // hide them (pay#416 review). Non-chat models are dropped earlier,
+        // by capability, in `parse_model_names`.
+        let provider = gemini_variant_priced();
+        let advertised = vec![
+            "gemini-2.5-flash".to_string(),
+            "gemini-2.0-flash".to_string(),
+            "gemini-exp-2026".to_string(),
+        ];
+        assert_eq!(
+            models_matching_configured_families(
+                advertised.clone(),
+                &provider.endpoints,
+                &provider.fallback_models,
+            ),
+            advertised,
+            "models priced by the `default` sentinel must stay in the picker"
+        );
+    }
+
+    #[test]
+    fn live_models_remain_authoritative_without_pricing_variants() {
+        let provider = CatalogProvider::from_service(&blockrun_service());
+        let advertised = vec![
+            "openai/gpt-5.6-sol".to_string(),
+            "anthropic/claude-sonnet-5".to_string(),
+        ];
+        assert_eq!(
+            models_matching_configured_families(
+                advertised.clone(),
+                &provider.endpoints,
+                &provider.fallback_models,
+            ),
+            advertised,
+            "providers with live per-model pricing must retain their catalog"
+        );
+    }
+
+    #[test]
+    fn fallback_model_families_filter_broad_live_catalogs() {
+        let provider = alibaba_modelstudio_fallback();
+        assert_eq!(
+            models_matching_configured_families(
+                vec![
+                    "qwen-audio-3.0-asr-flash".to_string(),
+                    "qwen3.7-max".to_string(),
+                    "qwen3.7-max-2026-06-08".to_string(),
+                    "qwen3-coder-next".to_string(),
+                    "qwen-image-2.0".to_string(),
+                ],
+                &provider.endpoints,
+                &provider.fallback_models,
+            ),
+            ["qwen3.7-max", "qwen3.7-max-2026-06-08", "qwen3-coder-next",],
+            "fallback families must exclude non-agent Alibaba models"
+        );
+    }
+
+    #[test]
     fn alibaba_fallback_covers_all_agent_surfaces() {
         let provider = alibaba_modelstudio_fallback();
         assert_eq!(
@@ -961,7 +1474,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "compatible-mode/v1/chat/completions",
-                "v1/responses",
+                "compatible-mode/v1/responses",
                 "v1/messages"
             ]
         );
@@ -1026,7 +1539,7 @@ mod tests {
 
             let providers = resolve_catalog_providers(&mut catalog, DEFAULT_CATALOG_FQNS).await;
             let slugs: Vec<&str> = providers.iter().map(|p| p.slug()).collect();
-            assert_eq!(slugs, vec!["generativelanguage"]);
+            assert_eq!(slugs, vec!["google"]);
         });
     }
 
@@ -1035,7 +1548,7 @@ mod tests {
         let provider = alibaba_modelstudio_fallback();
 
         assert_eq!(provider.title(), "Alibaba Model Studio");
-        assert_eq!(provider.slug(), "modelstudio");
+        assert_eq!(provider.slug(), "alibaba");
         assert_eq!(
             provider.service_url(),
             "https://modelstudio.alibaba.gateway-402.com"
@@ -1077,7 +1590,7 @@ mod tests {
         let provider = google_gemini_fallback();
 
         assert_eq!(provider.title(), "Google Gemini");
-        assert_eq!(provider.slug(), "generativelanguage");
+        assert_eq!(provider.slug(), "google");
         assert_eq!(provider.service_url(), GOOGLE_GEMINI_GATEWAY_URL);
         assert_eq!(provider.dialect(), Dialect::OpenAiCompat);
         assert!(

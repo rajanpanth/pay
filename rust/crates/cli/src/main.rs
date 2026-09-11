@@ -1,3 +1,10 @@
+// Thread-local heaps: the x402 batch-settlement gate clones per-request state
+// (ChannelState with its serde_json map + delivery vecs) under load, and glibc
+// malloc's arena locks turned that churn into ~33% futex contention that capped
+// gateway throughput. mimalloc removes the global allocator lock.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod commands;
 pub mod components;
 pub mod debugger_proxy;
@@ -143,6 +150,33 @@ fn main() {
     let otlp_sidecar = command.otlp_sidecar().map(str::to_owned);
     let _otel_guard = init_logging(config.log_format, opts.verbose, otlp_sidecar.as_deref());
 
+    #[cfg(feature = "profiling")]
+    let profiler = std::env::var("PAY_PYROSCOPE_URL").ok().and_then(|url| {
+        use pyroscope::PyroscopeAgent;
+        use pyroscope_pprofrs::{PprofConfig, pprof_backend};
+
+        let agent = match PyroscopeAgent::builder(url.as_str(), "pay-gateway")
+            .backend(pprof_backend(PprofConfig::new().sample_rate(100)))
+            .build()
+        {
+            Ok(agent) => agent,
+            Err(error) => {
+                tracing::warn!(%error, "failed to configure Pyroscope profiler");
+                return None;
+            }
+        };
+        match agent.start() {
+            Ok(agent) => {
+                tracing::info!(service = "pay-gateway", "Pyroscope profiling enabled");
+                Some(agent)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to start Pyroscope profiler");
+                None
+            }
+        }
+    });
+
     // ── Debugger proxy ─────────────────────────────────────────────────────
     //
     // When `--debugger` is set, spin up a forward proxy + PDB on port 1402
@@ -227,10 +261,10 @@ fn main() {
         unsafe { std::env::set_var("PAY_PROTOCOL_ENFORCED", "mpp") };
     }
 
-    // ── Legacy keypair source for non-payment commands ─────────────────────
+    // ── Legacy signer fallback for non-payment commands ────────────────────
     //
-    // `pay topup` and server commands still use the original
-    // keystore-source-string flow.
+    // Server commands resolve accounts after reading the spec's network; this
+    // value is only their raw pay.toml/platform-keystore fallback.
     // Launcher commands (`pay claude`/`pay codex`) pass only an explicit
     // `--account` through to the MCP server and must not resolve an account
     // before the first-run setup hook below.
@@ -238,7 +272,7 @@ fn main() {
     // resolve the wallet via `network_override` + `accounts.yml` instead.
     //
     // In sandbox mode, NO command should probe the keychain — that would
-    // defeat the whole point of `--sandbox`. The server start path
+    // defeat the whole point of `--sandbox`. The gate api path
     // resolves its own ephemeral via the network-aware loader instead.
     let keypair_override: Option<String> = if sandbox_mode
         || matches!(
@@ -251,6 +285,7 @@ fn main() {
                 | Command::Catalog { .. }
                 | Command::Install(_)
                 | Command::Send(_)
+                | Command::Fanout(_)
                 | Command::Claude(_)
                 | Command::Codex(_)
                 | Command::Goose(_)
@@ -259,10 +294,13 @@ fn main() {
                 | Command::Wget(_)
                 | Command::Http(_)
                 | Command::Fetch(_)
+                | Command::Acp(_)
                 | Command::Mcp
         ) {
         None
-    } else if matches!(command, Command::Server { .. } | Command::Topup(_)) {
+    } else if matches!(command, Command::Server { .. } | Command::Gate { .. }) {
+        config.legacy_keypair_source()
+    } else if matches!(command, Command::Topup(_)) {
         config.default_active_account_name()
     } else {
         resolve_keypair(&config)
@@ -290,6 +328,14 @@ fn main() {
     // cryptic "no account configured" error mid-flight. Sandbox flows
     // generate ephemeral wallets on first use, so they're exempt.
     if command.requires_account() && !sandbox_mode && !has_any_account() {
+        if matches!(command, Command::Acp(_)) {
+            eprintln!(
+                "{}",
+                "No pay account configured. Run `pay setup` in a terminal before starting an ACP client."
+                    .dimmed()
+            );
+            std::process::exit(1);
+        }
         eprintln!(
             "{}",
             "No pay account configured — running `pay setup` first…".dimmed()
@@ -308,7 +354,7 @@ fn main() {
         }
     }
 
-    if let Err(err) = command.execute(
+    let result = command.execute(
         auto_pay,
         output_fmt,
         opts.yolo_upto,
@@ -318,7 +364,14 @@ fn main() {
         verbose,
         sandbox_mode,
         opts.alt,
-    ) {
+    );
+    #[cfg(feature = "profiling")]
+    if let Some(running) = profiler
+        && let Ok(ready) = running.stop()
+    {
+        ready.shutdown();
+    }
+    if let Err(err) = result {
         if no_dna::should_json(output_fmt) {
             output::error_json(&err.to_string());
         } else {
@@ -591,6 +644,124 @@ mod tests {
     }
 
     #[test]
+    fn gate_inference_is_the_canonical_inference_gateway_command() {
+        let opts =
+            Opts::try_parse_from(["pay", "gate", "inference", "rates.yml", "--no-tui"]).unwrap();
+
+        match opts.command {
+            Some(Command::Gate {
+                command: commands::server::GateCommand::Inference(cmd),
+            }) => {
+                assert_eq!(cmd.rates.as_deref(), Some("rates.yml"));
+                assert!(cmd.no_tui);
+            }
+            _ => panic!("expected gate inference command"),
+        }
+    }
+
+    #[test]
+    fn gate_inference_help_calls_the_positional_input_rates() {
+        let err = match Opts::try_parse_from(["pay", "gate", "inference", "--help"]) {
+            Err(err) => err,
+            Ok(_) => panic!("--help should stop argument parsing"),
+        };
+        let help = err.to_string();
+
+        assert!(help.contains("[RATES]"), "{help}");
+        assert!(!help.contains("[PAYWALL]"), "{help}");
+    }
+
+    #[test]
+    fn serve_inference_remains_as_a_hidden_migration_alias() {
+        let opts = Opts::try_parse_from(["pay", "serve", "inference", "rates.yml"]).unwrap();
+
+        match opts.command {
+            Some(Command::Server {
+                command: commands::server::ServerCommand::Inference(cmd),
+            }) => assert_eq!(cmd.rates.as_deref(), Some("rates.yml")),
+            _ => panic!("expected legacy serve inference command"),
+        }
+    }
+
+    #[test]
+    fn gate_api_routes_to_the_spec_backed_gateway() {
+        let opts = Opts::try_parse_from(["pay", "gate", "api", "paywall.yml"]).unwrap();
+
+        match opts.command {
+            Some(Command::Gate {
+                command: commands::server::GateCommand::Api(cmd),
+            }) => assert_eq!(cmd.paywall, "paywall.yml"),
+            _ => panic!("expected gate api command"),
+        }
+    }
+
+    #[test]
+    fn server_start_remains_backward_compatible() {
+        let opts = Opts::try_parse_from(["pay", "server", "start", "paywall.yml"]).unwrap();
+
+        match opts.command {
+            Some(Command::Server {
+                command: commands::server::ServerCommand::Start(cmd),
+            }) => assert_eq!(cmd.paywall, "paywall.yml"),
+            _ => panic!("expected legacy server start command"),
+        }
+    }
+
+    #[test]
+    fn server_start_accepts_native_tls_paths() {
+        let opts = Opts::try_parse_from([
+            "pay",
+            "server",
+            "start",
+            "paywall.yml",
+            "--tls-cert",
+            "/etc/pay/tls/server.crt",
+            "--tls-key",
+            "/etc/pay/tls/server.key",
+        ])
+        .unwrap();
+
+        match opts.command {
+            Some(Command::Server {
+                command: commands::server::ServerCommand::Start(cmd),
+            }) => {
+                assert_eq!(cmd.tls_cert.as_deref(), Some("/etc/pay/tls/server.crt"));
+                assert_eq!(cmd.tls_key.as_deref(), Some("/etc/pay/tls/server.key"));
+            }
+            _ => panic!("expected legacy server start command"),
+        }
+    }
+
+    #[test]
+    fn server_start_rejects_incomplete_tls_paths() {
+        let err = match Opts::try_parse_from([
+            "pay",
+            "server",
+            "start",
+            "paywall.yml",
+            "--tls-cert",
+            "/etc/pay/tls/server.crt",
+        ]) {
+            Ok(_) => panic!("expected incomplete TLS arguments to fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("--tls-key"));
+    }
+
+    #[test]
+    fn scaffold_defaults_to_paywall_yml() {
+        let opts = Opts::try_parse_from(["pay", "server", "scaffold"]).unwrap();
+
+        match opts.command {
+            Some(Command::Server {
+                command: commands::server::ServerCommand::Scaffold(cmd),
+            }) => assert_eq!(cmd.output, "paywall.yml"),
+            _ => panic!("expected server scaffold command"),
+        }
+    }
+
+    #[test]
     fn codex_keeps_native_provider_and_forwards_arguments() {
         let opts = Opts::try_parse_from(["pay", "codex", "--model", "gpt-5", "hello"]).unwrap();
 
@@ -653,6 +824,32 @@ mod tests {
                 assert_eq!(cmd.args, ["--model", "qwen3.7-plus"]);
             }
             _ => panic!("expected goose command"),
+        }
+    }
+
+    #[test]
+    fn acp_parses_headless_provider_and_model_without_adapter_leakage() {
+        let opts = Opts::try_parse_from([
+            "pay",
+            "acp",
+            "goose",
+            "--provider",
+            "modelstudio",
+            "--model",
+            "qwen3.7-plus",
+            "--",
+            "--debug",
+        ])
+        .unwrap();
+
+        match opts.command {
+            Some(Command::Acp(cmd)) => {
+                assert_eq!(cmd.harness, commands::acp::AcpHarness::Goose);
+                assert_eq!(cmd.provider.as_deref(), Some("modelstudio"));
+                assert_eq!(cmd.model.as_deref(), Some("qwen3.7-plus"));
+                assert_eq!(cmd.args, ["--debug"]);
+            }
+            _ => panic!("expected acp command"),
         }
     }
 

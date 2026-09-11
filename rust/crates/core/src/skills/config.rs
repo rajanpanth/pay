@@ -30,13 +30,17 @@ pub struct Source {
     /// Resolved URL to the catalog JSON.
     pub url: String,
     /// Marks a transient source — currently the auto-registration written
-    /// by a running `pay server start` so the local API is discoverable
+    /// by a running `pay gate api` so the local API is discoverable
     /// by an MCP agent on the same host. Ephemeral entries are TCP-probed
     /// at boot and reaped if their server is gone, and the catalog loader
     /// bypasses cache for them so live edits to the server's spec become
     /// visible on the next agent call without waiting on the 30 min TTL.
     #[serde(default, skip_serializing_if = "is_false")]
     pub ephemeral: bool,
+    /// User-pinned inference discovery source added from the provider picker.
+    /// These are removed when their server is no longer reachable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub inference: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -64,6 +68,7 @@ impl Default for SkillsConfig {
                 name: "pay-skills".to_string(),
                 url: DEFAULT_SOURCE.to_string(),
                 ephemeral: false,
+                inference: false,
             }],
         }
     }
@@ -108,13 +113,35 @@ impl SkillsConfig {
             name: derive_name(source),
             url,
             ephemeral: false,
+            inference: false,
+        });
+        true
+    }
+
+    /// Add or mark a durable source as a provider-picker inference pin.
+    /// Returns true when the persisted config changed.
+    pub fn add_inference_source(&mut self, source: &str) -> bool {
+        let url = resolve_source_url(source);
+        if let Some(existing) = self.sources.iter_mut().find(|existing| existing.url == url) {
+            if existing.inference {
+                return false;
+            }
+            existing.inference = true;
+            existing.ephemeral = false;
+            return true;
+        }
+        self.sources.push(Source {
+            name: derive_name(source),
+            url,
+            ephemeral: false,
+            inference: true,
         });
         true
     }
 
     /// Add a source marked as ephemeral (auto-removed on graceful shutdown,
     /// reaped at boot if its server isn't reachable). Caller supplies the
-    /// display `name` so multiple concurrent `pay server start` instances
+    /// display `name` so multiple concurrent `pay gate api` instances
     /// don't collide on the URL-derived default. Returns true if new.
     pub fn add_ephemeral_source(&mut self, name: &str, url: &str) -> bool {
         if self.sources.iter().any(|s| s.url == url) {
@@ -124,6 +151,7 @@ impl SkillsConfig {
             name: name.to_string(),
             url: url.to_string(),
             ephemeral: true,
+            inference: false,
         });
         true
     }
@@ -153,7 +181,7 @@ impl SkillsConfig {
     /// True when at least one ephemeral source is registered. Catalog
     /// callers use this to skip the on-disk cache and re-fetch every
     /// load — ephemeral specs change as the developer edits + restarts
-    /// `pay server`, and a 30 min TTL would hide those edits from the
+    /// `pay gate api`, and a 30 min TTL would hide those edits from the
     /// MCP agent in the same shell.
     pub fn has_ephemeral_sources(&self) -> bool {
         self.sources.iter().any(|s| s.ephemeral)
@@ -210,12 +238,20 @@ impl SkillsConfig {
         dir.join(format!("skills-{ts}-{hash}.json"))
     }
 
-    /// Remove every `skills-*.json` cache file except `keep`.
+    /// Remove `skills-*.json` cache files older than `keep`.
     ///
     /// Catalog files are timestamped, so even with an unchanged source hash
     /// each successful update writes a new file. Without this prune, repeat
     /// `pay skills update` calls would accumulate one stale catalog per run.
+    ///
+    /// Only files whose filename timestamp is strictly older than `keep`'s
+    /// are removed. Many pay processes (CLI, gateways, one MCP server per
+    /// agent session) refresh this cache independently; deleting everything
+    /// except our own write lets two racing refreshes delete each other's
+    /// file and leave no catalog at all, which downstream consumers read as
+    /// "catalog unavailable" long after both refreshes succeeded.
     pub fn clean_stale_caches(&self, keep: &std::path::Path) {
+        let keep_ts = cache_file_timestamp(keep);
         let dir = cache_dir();
         let Ok(entries) = std::fs::read_dir(&dir) else {
             return;
@@ -226,11 +262,25 @@ impl SkillsConfig {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("skills-") && name.ends_with(".json") {
+            if name.starts_with("skills-")
+                && name.ends_with(".json")
+                && cache_file_timestamp(&path) < keep_ts
+            {
                 let _ = std::fs::remove_file(&path);
             }
         }
     }
+}
+
+/// Unix timestamp embedded in a `skills-<ts>-<hash>.json` cache filename,
+/// or 0 when the name doesn't carry one (legacy files sort as oldest).
+fn cache_file_timestamp(path: &std::path::Path) -> u64 {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("skills-"))
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|ts| ts.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Resolve a source shorthand to a URL.
@@ -312,6 +362,31 @@ mod tests {
         let last = cfg.sources.last().unwrap();
         assert_eq!(last.name, "company/apis");
         assert!(last.url.contains("raw.githubusercontent.com"));
+    }
+
+    #[test]
+    fn inference_source_is_marked_and_deduplicated() {
+        let mut config = SkillsConfig::default();
+        let source = "http://127.0.0.1:1402/openapi.json";
+
+        assert!(config.add_source(source));
+        assert!(config.add_inference_source(source));
+        assert!(!config.add_inference_source(source));
+        assert_eq!(
+            config
+                .sources
+                .iter()
+                .filter(|entry| entry.url == source)
+                .count(),
+            1
+        );
+        let saved = config
+            .sources
+            .iter()
+            .find(|entry| entry.url == source)
+            .unwrap();
+        assert!(saved.inference);
+        assert!(!saved.ephemeral);
     }
 
     #[test]
@@ -429,5 +504,23 @@ mod tests {
     #[test]
     fn default_ttl_value() {
         assert_eq!(default_ttl(), 30);
+    }
+
+    #[test]
+    fn cache_file_timestamps_order_racing_refreshes() {
+        let older = std::path::Path::new("/tmp/skills-1785600000-aaaa1111.json");
+        let newer = std::path::Path::new("/tmp/skills-1785600042-bbbb2222.json");
+        assert_eq!(cache_file_timestamp(older), 1_785_600_000);
+        assert_eq!(cache_file_timestamp(newer), 1_785_600_042);
+        // A refresh only prunes strictly-older files, so two concurrent
+        // refreshes can never delete each other's write and leave zero
+        // catalogs behind.
+        assert!(cache_file_timestamp(older) < cache_file_timestamp(newer));
+        // Legacy names without a timestamp sort as oldest and are pruned
+        // by any timestamped write; an unparseable `keep` prunes nothing.
+        assert_eq!(
+            cache_file_timestamp(std::path::Path::new("/tmp/skills-cache.json")),
+            0
+        );
     }
 }

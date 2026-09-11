@@ -23,6 +23,15 @@ pub enum AuthIntent {
     OpenSession(String),
     UseGatewayFeePayer(String),
     UseAccount(String),
+    /// One-approval authorization for a `pay push` CSV batch. Shown once
+    /// after read-only preflight, naming the exact recipient count, token
+    /// total, and worst-case ceiling (including gasless reimbursement) the
+    /// resulting signing permit may sign — never a generic "N payments"
+    /// allowance. See `pay_core::client::push::permit`.
+    AuthorizeBatch {
+        message: String,
+        limit: Option<PaymentLimit>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +52,31 @@ pub enum PaymentLimit {
     Usd25,
     Usd50,
     AboveUsd50,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaymentAmountKind {
+    Exact,
+    Maximum,
+    Escrow,
+}
+
+impl PaymentAmountKind {
+    const fn headline(self) -> &'static str {
+        match self {
+            Self::Exact => "authorize a payment.",
+            Self::Maximum => "authorize a series of payments.",
+            Self::Escrow => "authorize a channel escrow deposit.",
+        }
+    }
+
+    const fn field_label(self) -> &'static str {
+        match self {
+            Self::Exact => "amount",
+            Self::Maximum => "total allowance",
+            Self::Escrow => "escrow deposit",
+        }
+    }
 }
 
 impl PaymentLimit {
@@ -127,20 +161,33 @@ impl AuthIntent {
     }
 
     pub fn authorize_payment_details(amount: &str, reason: &str, operator: &str) -> Self {
-        let mut message = format!("authorize a payment of {amount}.");
-        message.push_str("\n\nreason: ");
-        message.push_str(&truncate_detail(&prompt_detail(reason), 64));
-        // Skip the "operator: ..." line when we don't have a meaningful
-        // domain (e.g. localhost/loopback requests where the prompt would
-        // render the placeholder "unknown" or an empty value). Keeps the
-        // Touch ID panel tight instead of advertising a blank field.
-        if let Some(label) = meaningful_operator(operator) {
-            message.push_str("\n\noperator: ");
-            message.push_str(&label);
-        }
-
         Self::AuthorizePayment {
-            message,
+            message: payment_authorization_message(
+                PaymentAmountKind::Exact,
+                amount,
+                Some(reason),
+                operator,
+            ),
+            limit: PaymentLimit::from_amount(amount),
+        }
+    }
+
+    /// Authorize a payment-channel escrow deposit.
+    ///
+    /// `amount` is the canonical monetary value of the deposit (e.g. `$25.00`),
+    /// used both to derive the amount-specific spend limit and to display the
+    /// deposit being signed. It must stay a bare amount — the "escrow" framing
+    /// comes from the headline, not from a prefix on `amount`, so that
+    /// [`PaymentLimit::from_amount`] can still parse it and select an
+    /// amount-specific authorization action instead of the generic fallback.
+    pub fn authorize_channel_escrow(amount: &str, reason: &str, operator: &str) -> Self {
+        Self::AuthorizePayment {
+            message: payment_authorization_message(
+                PaymentAmountKind::Escrow,
+                amount,
+                Some(reason),
+                operator,
+            ),
             limit: PaymentLimit::from_amount(amount),
         }
     }
@@ -190,8 +237,53 @@ impl AuthIntent {
         Self::OpenSession("authorize opening a pay session".to_string())
     }
 
+    pub fn authorize_spend_up_to(amount: Option<&str>, limit: &str, operator: &str) -> Self {
+        Self::AuthorizePayment {
+            message: payment_authorization_message(
+                PaymentAmountKind::Maximum,
+                limit,
+                None,
+                operator,
+            ),
+            limit: amount.and_then(PaymentLimit::from_amount),
+        }
+    }
+
     pub fn use_gateway_fee_payer() -> Self {
         Self::UseGatewayFeePayer("use your pay account as the gateway fee payer".to_string())
+    }
+
+    /// Build the one-approval `pay push` batch authorization prompt.
+    ///
+    /// `recipient_total_display` and `max_total_display` are pre-formatted
+    /// decimal amounts (e.g. `"1234.56 USDG"`); `max_total_usd` is the same
+    /// maximum expressed as a `"$..."` string used only to pick the Linux
+    /// Polkit action bucket (stablecoins are USD-pegged 1:1, so the raw
+    /// batch ceiling doubles as its own USD estimate).
+    #[allow(clippy::too_many_arguments)]
+    pub fn authorize_batch(
+        account: &str,
+        recipient_count: usize,
+        recipient_total_display: &str,
+        max_total_display: &str,
+        max_total_usd: &str,
+        currency: &str,
+        network: &str,
+        manifest_hash_prefix: &str,
+    ) -> Self {
+        let message = batch_authorization_message(
+            account,
+            recipient_count,
+            recipient_total_display,
+            max_total_display,
+            currency,
+            network,
+            manifest_hash_prefix,
+        );
+        Self::AuthorizeBatch {
+            message,
+            limit: PaymentLimit::from_amount(max_total_usd),
+        }
     }
 
     pub fn use_account(message: impl Into<String>) -> Self {
@@ -228,6 +320,7 @@ impl AuthIntent {
     pub fn message(&self) -> &str {
         match self {
             Self::AuthorizePayment { message, .. }
+            | Self::AuthorizeBatch { message, .. }
             | Self::CreateAccount(message)
             | Self::ImportAccount(message)
             | Self::ExportAccount(message)
@@ -240,7 +333,7 @@ impl AuthIntent {
 
     pub fn payment_limit(&self) -> Option<PaymentLimit> {
         match self {
-            Self::AuthorizePayment { limit, .. } => *limit,
+            Self::AuthorizePayment { limit, .. } | Self::AuthorizeBatch { limit, .. } => *limit,
             _ => None,
         }
     }
@@ -309,8 +402,71 @@ fn truncate_detail(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn payment_authorization_message(
+    amount_kind: PaymentAmountKind,
+    amount: &str,
+    reason: Option<&str>,
+    operator: &str,
+) -> String {
+    let mut message = amount_kind.headline().to_string();
+    message.push_str("\n\n");
+    message.push_str(amount_kind.field_label());
+    message.push_str(": ");
+    message.push_str(&truncate_detail(&prompt_detail(amount), 48));
+
+    if let Some(reason) = reason {
+        message.push_str("\n\nreason: ");
+        message.push_str(&truncate_detail(&prompt_detail(reason), 64));
+    }
+
+    if let Some(label) = meaningful_operator(operator) {
+        message.push_str("\n\noperator: ");
+        message.push_str(&label);
+    }
+
+    message
+}
+
+#[allow(clippy::too_many_arguments)]
+fn batch_authorization_message(
+    account: &str,
+    recipient_count: usize,
+    recipient_total_display: &str,
+    max_total_display: &str,
+    currency: &str,
+    network: &str,
+    manifest_hash_prefix: &str,
+) -> String {
+    let account = truncate_detail(&prompt_detail(account), 64);
+    let currency = truncate_detail(&prompt_detail(currency), 24);
+    let network = truncate_detail(&prompt_detail(network), 24);
+    let manifest_hash_prefix = truncate_detail(&prompt_detail(manifest_hash_prefix), 24);
+
+    format!(
+        "authorize a batch payout from {account}.\n\n\
+         recipients: {recipient_count}\n\n\
+         recipient total: {recipient_total} {currency}\n\n\
+         maximum total: {max_total} {currency}\n\n\
+         network: {network}\n\n\
+         manifest: {manifest_hash_prefix}",
+        recipient_total = truncate_detail(&prompt_detail(recipient_total_display), 32),
+        max_total = truncate_detail(&prompt_detail(max_total_display), 32),
+    )
+}
+
 fn payment_message_with_account(message: &str, account: &str) -> String {
-    if !message.trim_start().starts_with("authorize a payment of ") {
+    let trimmed = message.trim_start();
+    // Recognizes every current `PaymentAmountKind` headline plus one older,
+    // no-longer-produced phrasing kept for defensiveness. A headline added
+    // here without a matching arm silently drops the funding account from
+    // the approval prompt — as `Escrow`'s did until this fix — so match
+    // against the enum's own headline constants rather than duplicating the
+    // wording as an independent literal.
+    if !trimmed.starts_with("authorize a payment of ")
+        && !trimmed.starts_with(PaymentAmountKind::Exact.headline())
+        && !trimmed.starts_with(PaymentAmountKind::Maximum.headline())
+        && !trimmed.starts_with(PaymentAmountKind::Escrow.headline())
+    {
         return message.to_string();
     }
 
@@ -435,11 +591,38 @@ mod tests {
     }
 
     #[test]
+    fn session_prompt_names_spending_limit_and_operator() {
+        assert_eq!(
+            AuthIntent::authorize_spend_up_to(
+                Some("$1.00"),
+                "$1.00",
+                "modelstudio.alibaba.gateway-402.com",
+            )
+            .prompt_message(),
+            "authorize a series of payments.\n\ntotal allowance: $1.00\n\noperator: modelstudio.alibaba.gateway-402.com"
+        );
+    }
+
+    #[test]
+    fn session_prompt_includes_account_on_first_sentence() {
+        assert_eq!(
+            AuthIntent::authorize_spend_up_to(
+                Some("$1.00"),
+                "$1.00",
+                "modelstudio.alibaba.gateway-402.com",
+            )
+            .with_account_context("default")
+            .prompt_message(),
+            "authorize a series of payments from default.\n\ntotal allowance: $1.00\n\noperator: modelstudio.alibaba.gateway-402.com"
+        );
+    }
+
+    #[test]
     fn payment_details_render_touch_id_context() {
         assert_eq!(
             AuthIntent::authorize_payment_details("$1.00", "Run a SQL query", "gateway-402.com")
                 .prompt_message(),
-            "authorize a payment of $1.00.\n\nreason: Run a SQL query\n\noperator: gateway-402.com"
+            "authorize a payment.\n\namount: $1.00\n\nreason: Run a SQL query\n\noperator: gateway-402.com"
         );
     }
 
@@ -449,7 +632,7 @@ mod tests {
             AuthIntent::authorize_payment_details("$0.30", "Send USDC", "gateway-402.com")
                 .with_account_context("test")
                 .prompt_message(),
-            "authorize a payment of $0.30 from test.\n\nreason: Send USDC\n\noperator: gateway-402.com"
+            "authorize a payment from test.\n\namount: $0.30\n\nreason: Send USDC\n\noperator: gateway-402.com"
         );
     }
 
@@ -462,7 +645,7 @@ mod tests {
                 .prompt_message();
 
         assert!(message.starts_with(
-            "authorize a payment of $0.30 from aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..."
+            "authorize a payment from aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa..."
         ));
     }
 
@@ -484,7 +667,7 @@ mod tests {
 
         assert_eq!(
             message,
-            "authorize a payment of $1.00.\n\nreason: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...\n\noperator: gateway-402.com"
+            "authorize a payment.\n\namount: $1.00\n\nreason: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa...\n\noperator: gateway-402.com"
         );
         assert_eq!(
             message
@@ -495,6 +678,21 @@ mod tests {
                 .count(),
             64
         );
+    }
+
+    #[test]
+    fn authorize_batch_names_every_required_field() {
+        let intent = AuthIntent::authorize_batch(
+            "default", 1_000, "1234.56", "1250.00", "$1250.00", "USDG", "mainnet", "a42f82c1",
+        );
+        let message = intent.prompt_message();
+        assert!(message.starts_with("authorize a batch payout from default."));
+        assert!(message.contains("recipients: 1000"));
+        assert!(message.contains("recipient total: 1234.56 USDG"));
+        assert!(message.contains("maximum total: 1250.00 USDG"));
+        assert!(message.contains("network: mainnet"));
+        assert!(message.contains("manifest: a42f82c1"));
+        assert_eq!(intent.payment_limit(), Some(PaymentLimit::AboveUsd50));
     }
 
     #[test]
@@ -602,6 +800,15 @@ mod tests {
     }
 
     #[test]
+    fn session_budget_uses_existing_payment_limit_bucket() {
+        assert_eq!(
+            AuthIntent::authorize_spend_up_to(Some("$1.00"), "$1.00", "api.example.com",)
+                .payment_limit(),
+            Some(PaymentLimit::Usd1)
+        );
+    }
+
+    #[test]
     fn authorize_payment_details_omits_operator_line_for_loopback() {
         let intent = AuthIntent::authorize_payment_details("$1.00", "API access", "localhost");
         let AuthIntent::AuthorizePayment { message, .. } = intent else {
@@ -631,5 +838,40 @@ mod tests {
             panic!("expected AuthorizePayment");
         };
         assert!(message.contains("operator: api.example.com"));
+    }
+
+    #[test]
+    fn authorize_channel_escrow_keeps_amount_specific_limit() {
+        // Regression: the escrow framing must not be folded into the amount, or
+        // `PaymentLimit::from_amount` fails to parse it and the authorization
+        // silently drops to the generic (no-limit) action. A bare "$25.00" must
+        // still resolve to the Usd25 bucket.
+        let intent = AuthIntent::authorize_channel_escrow("$25.00", "channel", "api.example.com");
+        assert_eq!(intent.payment_limit(), Some(PaymentLimit::Usd25));
+        let AuthIntent::AuthorizePayment { message, .. } = intent else {
+            panic!("expected AuthorizePayment");
+        };
+        assert!(
+            message.contains("escrow deposit: $25.00"),
+            "escrow context should be in the headline/field, not the amount; got: {message:?}"
+        );
+    }
+
+    #[test]
+    fn authorize_channel_escrow_identifies_the_funding_account() {
+        // Regression: payment_message_with_account's headline allowlist did
+        // not include Escrow's, so with_account_context silently dropped the
+        // funding account from every channel-escrow approval prompt — a
+        // payer could not see which account was being drained before
+        // approving.
+        let intent = AuthIntent::authorize_channel_escrow("$25.00", "channel", "api.example.com")
+            .with_account_context("trading");
+        let AuthIntent::AuthorizePayment { message, .. } = intent else {
+            panic!("expected AuthorizePayment");
+        };
+        assert!(
+            message.contains("from trading"),
+            "escrow approval should name the funding account; got: {message:?}"
+        );
     }
 }

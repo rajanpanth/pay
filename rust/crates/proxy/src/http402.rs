@@ -28,13 +28,16 @@ use futures_util::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use pay_core::PaymentState;
 use pay_core::server::gate::{
-    GateDecision, GateRequest, GateResponse, PaymentGate, ReceiptAnnotation, SessionForward,
+    BatchForward, GateDecision, GateRequest, GateResponse, MAX_BATCH_CACHED_RESPONSE_BYTES,
+    PaidRequestTelemetry, PaymentGate, ReceiptAnnotation, SessionForward, UptoPaymentTelemetry,
+    batch_cached_response, cache_batch_response, commit_batch, release_batch, settle_batch,
     settle_delegated_session as settle_delegated_session_forward, settle_upto, settle_upto_metered,
 };
 use pay_core::server::metering::{self, UptoSettlementPlan};
 use pay_core::server::proxy::{
     STRIP_HEADERS, UpstreamPlan, prepare_upstream, routing_signs_request_body,
 };
+use pay_core::server::telemetry;
 use pay_kit::x402::server::VerifiedUptoOpen;
 use pay_types::metering::ApiSpec;
 use pingora::http::{RequestHeader, ResponseHeader};
@@ -53,6 +56,8 @@ enum Target {
         sni: String,
         host_header: String,
         path_and_query: String,
+        subdomain: String,
+        upstream: String,
         /// Forwarded client headers (minus stripped) + injected auth headers.
         headers: Vec<(String, String)>,
     },
@@ -68,10 +73,19 @@ pub struct Ctx {
     /// (debit on success) or `logging` (refund when the upstream never
     /// responded). Taken when settled, so it's never double-settled.
     upto: Option<PendingUpto>,
+    batch: Option<BatchForward>,
+    /// A successfully committed streaming response whose body is still being
+    /// captured for idempotent replay. Keeping the outcome until `logging`
+    /// lets pay-kit attach the complete representation after end-of-stream.
+    batch_cache: Option<BatchForward>,
+    batch_response: Option<BatchResponseCapture>,
     /// A delegated MPP session opened pre-serve. Responses are buffered and
     /// rated with the same usage pipeline as x402 `upto`, then the gateway
     /// signs and persists the cumulative voucher before returning the body.
     session: Option<SessionForward>,
+    /// Present only for payment-backed forwards. Consumed by `logging`, where
+    /// Pingora exposes the final downstream status for every forwarding path.
+    paid_request: Option<PaidRequestTelemetry>,
     /// Captured at `request_filter` for the Payment Debugger exchange emitted
     /// in `logging` (the data plane is Pingora, so the old axum logging
     /// middleware never sees proxied traffic).
@@ -89,12 +103,48 @@ pub struct Ctx {
     /// downstream response. Pingora's recorded response can omit headers added
     /// by filters, so keep these explicitly for PDB logging.
     logged_payment_headers: Vec<(HeaderName, HeaderValue)>,
+    /// Normalized request path retained for paid-request and upstream-error
+    /// metrics even when debugger exchange logging is disabled.
+    request_path: String,
 }
 
 struct PendingUpto {
     open: VerifiedUptoOpen,
     settle_amount: u64,
     settlement: Option<UptoSettlementPlan>,
+    telemetry: UptoPaymentTelemetry,
+}
+
+struct BatchResponseCapture {
+    cached: Option<pay_kit::core::store::CachedUpstreamResponse>,
+    complete: bool,
+}
+
+impl BatchResponseCapture {
+    fn start(status: StatusCode, headers: &HeaderMap) -> Option<Self> {
+        let declared = headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
+        if declared.is_some_and(|length| length > MAX_BATCH_CACHED_RESPONSE_BYTES) {
+            return None;
+        }
+        Some(Self {
+            cached: Some(batch_cached_response(status, headers, &[])),
+            complete: declared == Some(0),
+        })
+    }
+
+    fn push(&mut self, chunk: &[u8], end_of_stream: bool) {
+        if let Some(cached) = &mut self.cached {
+            if cached.body.len().saturating_add(chunk.len()) <= MAX_BATCH_CACHED_RESPONSE_BYTES {
+                cached.body.extend_from_slice(chunk);
+            } else {
+                self.cached = None;
+            }
+        }
+        self.complete = end_of_stream;
+    }
 }
 
 /// Request-side facts captured up front for the PDB exchange.
@@ -195,7 +245,7 @@ impl<S: PaymentState> Http402Gate<S> {
         // No body-signing auth → an empty placeholder body is safe for prep.
         match prepare_upstream(api, method, uri, headers, &[]).await {
             Ok(UpstreamPlan::Forward(prepared)) => {
-                ctx.target = Some(target_from_prepared(prepared));
+                ctx.target = Some(target_from_prepared(prepared, api.subdomain.clone()));
                 Ok(false)
             }
             Ok(UpstreamPlan::Respond(resp)) => {
@@ -246,7 +296,7 @@ impl<S: PaymentState> Http402Gate<S> {
         ctx: &mut Ctx,
         served_ok: bool,
     ) -> Vec<(HeaderName, HeaderValue)> {
-        self.drain_payment_headers_with_response(ctx, served_ok, &HeaderMap::new(), None)
+        self.drain_payment_headers_with_response(ctx, served_ok, None, &HeaderMap::new(), None)
             .await
     }
 
@@ -254,6 +304,7 @@ impl<S: PaymentState> Http402Gate<S> {
         &self,
         ctx: &mut Ctx,
         served_ok: bool,
+        response_status: Option<StatusCode>,
         response_headers: &HeaderMap,
         response_body: Option<&[u8]>,
     ) -> Vec<(HeaderName, HeaderValue)> {
@@ -269,6 +320,20 @@ impl<S: PaymentState> Http402Gate<S> {
             && let Some((n, v)) = self
                 .settle_pending_upto(pending, served_ok, response_headers, response_body)
                 .await
+        {
+            extra.push((n, v));
+        }
+        if let Some(pending) = ctx.batch.take()
+            && let Some((n, v)) = settle_batch(
+                &self.state,
+                pending,
+                served_ok,
+                response_status
+                    .zip(response_body)
+                    .filter(|(_, body)| body.len() <= MAX_BATCH_CACHED_RESPONSE_BYTES)
+                    .map(|(status, body)| batch_cached_response(status, response_headers, body)),
+            )
+            .await
         {
             extra.push((n, v));
         }
@@ -298,10 +363,20 @@ impl<S: PaymentState> Http402Gate<S> {
                     served_ok,
                     response_headers,
                     response_body,
+                    pending.telemetry,
                 )
                 .await
             }
-            None => settle_upto(&self.state, pending.open, pending.settle_amount, served_ok).await,
+            None => {
+                settle_upto(
+                    &self.state,
+                    pending.open,
+                    pending.settle_amount,
+                    served_ok,
+                    pending.telemetry,
+                )
+                .await
+            }
         }
     }
 
@@ -389,6 +464,12 @@ impl<S: PaymentState> Http402Gate<S> {
         let upstream = match upstream_req.send().await {
             Ok(resp) => resp,
             Err(e) => {
+                telemetry::record_upstream_error(
+                    &api.subdomain,
+                    uri.path(),
+                    prepared.url.as_str(),
+                    &e.to_string(),
+                );
                 tracing::error!(error = %e, upstream = %prepared.url, "buffered upstream request failed");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
@@ -405,10 +486,24 @@ impl<S: PaymentState> Http402Gate<S> {
 
         let status = StatusCode::from_u16(upstream.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if status.is_server_error() {
+            telemetry::record_upstream_error(
+                &api.subdomain,
+                uri.path(),
+                prepared.url.as_str(),
+                &format!("upstream returned {status}"),
+            );
+        }
         let response_headers = filtered_response_headers(upstream.headers());
         let body = match collect_reqwest_body(upstream, response_limit).await {
             Ok(body) => body,
             Err(e) => {
+                telemetry::record_upstream_error(
+                    &api.subdomain,
+                    uri.path(),
+                    prepared.url.as_str(),
+                    &e.to_string(),
+                );
                 tracing::warn!(error = %e, "failed to buffer response-metered body");
                 let extra = self.drain_payment_headers(ctx, false).await;
                 write_buffered_response(
@@ -450,6 +545,7 @@ impl<S: PaymentState> Http402Gate<S> {
             .drain_payment_headers_with_response(
                 ctx,
                 status.is_success(),
+                Some(status),
                 &response_headers,
                 Some(&body),
             )
@@ -539,7 +635,13 @@ impl<S: PaymentState> Http402Gate<S> {
             }
         }
         let extra = self
-            .drain_payment_headers_with_response(ctx, status.is_success(), &headers, Some(&body))
+            .drain_payment_headers_with_response(
+                ctx,
+                status.is_success(),
+                Some(status),
+                &headers,
+                Some(&body),
+            )
             .await;
         write_buffered_response(session, status, headers, body, extra).await
     }
@@ -553,11 +655,16 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
             target: None,
             receipt: None,
             upto: None,
+            batch: None,
+            batch_cache: None,
+            batch_response: None,
             session: None,
+            paid_request: None,
             log: None,
             observer: None,
             buffered_usage: None,
             logged_payment_headers: Vec::new(),
+            request_path: String::new(),
         }
     }
 
@@ -568,6 +675,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         let headers = rh.headers.clone();
 
         let path = uri.path().trim_start_matches('/').to_string();
+        ctx.request_path = format!("/{path}");
         let str_h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
         let host = str_h("host").map(str::to_string);
 
@@ -576,7 +684,7 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // `/.well-known/*`, `/`) so the debugger only shows real traffic —
         // e.g. the ephemeral `/.well-known/pay-skills.json` that the MCP
         // catalog tools poll must not show up as a failed OLLAMA request.
-        if !is_control_plane(&path) {
+        if !is_control_plane(&path) && self.state.records_http_exchanges() {
             let client_ip = str_h("x-forwarded-for")
                 .and_then(|v| v.split(',').next())
                 .map(|s| s.trim().to_string())
@@ -634,8 +742,15 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 session: session_forward,
                 receipt,
                 upto,
+                batch,
+                paid_request,
             } => {
                 ctx.receipt = receipt;
+                ctx.paid_request = paid_request;
+                // x402 `batch-settlement`: the voucher is verified and the
+                // channel reserved, but nothing is charged until the upstream
+                // has actually served.
+                ctx.batch = batch.map(|b| *b);
                 // x402 `upto`: the channel is open; hold it for post-response
                 // settlement (response_filter on success, logging on failure).
                 ctx.upto = upto.map(|u| {
@@ -644,9 +759,10 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                         open: *u.open,
                         settle_amount: u.settle_amount,
                         settlement: u.settlement,
+                        telemetry: u.telemetry,
                     }
                 });
-                ctx.session = session_forward;
+                ctx.session = session_forward.map(|pending| *pending);
                 // Delegated sessions always settle before releasing a
                 // successful response, including fixed-price endpoints. x402
                 // `upto` only needs this path when pricing consumes response
@@ -765,6 +881,20 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Ctx,
     ) -> pingora::Result<()> {
+        if upstream_response.status.is_server_error()
+            && let Some(Target::Api {
+                subdomain,
+                upstream,
+                ..
+            }) = &ctx.target
+        {
+            telemetry::record_upstream_error(
+                subdomain,
+                &ctx.request_path,
+                upstream,
+                &format!("upstream returned {}", upstream_response.status),
+            );
+        }
         if let Some(receipt) = &ctx.receipt {
             for (name, value) in &receipt.headers {
                 // Pass the HeaderValue through unchanged (a receipt can carry
@@ -803,6 +933,28 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 ctx.logged_payment_headers.push((name, value));
             }
         }
+        // Batch authorization is also post-response. Unlike `upto`, its hot
+        // path commits only Redis state; on-chain claim/distribution belongs
+        // to pay-worker. This must happen here (before headers are sent) so a
+        // successful proxied response cannot drop its reservation uncharged.
+        if let Some(pending) = ctx.batch.take() {
+            let served_ok = upstream_response.status.is_success();
+            if served_ok {
+                if let Some((name, value)) = commit_batch(&self.state, &pending).await {
+                    let _ = upstream_response.insert_header(name.clone(), value.clone());
+                    ctx.logged_payment_headers.push((name, value));
+                }
+                if let Some(capture) = BatchResponseCapture::start(
+                    upstream_response.status,
+                    &upstream_response.headers,
+                ) {
+                    ctx.batch_cache = Some(pending);
+                    ctx.batch_response = Some(capture);
+                }
+            } else {
+                release_batch(&self.state, pending).await;
+            }
+        }
         Ok(())
     }
 
@@ -815,15 +967,18 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         body: &mut Option<bytes::Bytes>,
         end_of_stream: bool,
         ctx: &mut Ctx,
-    ) -> pingora::Result<()> {
+    ) -> pingora::Result<Option<std::time::Duration>> {
+        if let Some(capture) = ctx.batch_response.as_mut() {
+            capture.push(body.as_deref().unwrap_or_default(), end_of_stream);
+        }
         let Some(observer) = ctx.observer.as_mut() else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(log) = ctx.log.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(log_id) = log.log_id else {
-            return Ok(());
+            return Ok(None);
         };
 
         if let Some(chunk) = body.as_ref()
@@ -837,14 +992,14 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         } else if observer.should_emit() {
             self.state.record_exchange_update(log_id, &observer.usage);
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Emit the completed exchange to the Payment Debugger. Pingora is the data
     /// plane, so the old axum `logging_middleware` never sees proxied traffic —
     /// this is what keeps PDB populated. Fires for every request (short-circuit
     /// 402s included); control-plane paths were filtered out at capture time.
-    async fn logging(&self, session: &mut Session, _e: Option<&pingora::Error>, ctx: &mut Ctx)
+    async fn logging(&self, session: &mut Session, error: Option<&pingora::Error>, ctx: &mut Ctx)
     where
         Self::CTX: Send + Sync,
     {
@@ -855,6 +1010,13 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
         // are written in `forward_upto_buffered`, so its receipt reaches the
         // client as a normal PAYMENT-RESPONSE header.
         let mut deferred_payment_headers = Vec::new();
+        if let Some(forward) = ctx.batch_cache.take()
+            && let Some(capture) = ctx.batch_response.take()
+            && capture.complete
+            && let Some(cached) = capture.cached
+        {
+            cache_batch_response(&self.state, &forward, cached).await;
+        }
         // Covers cancellation/disconnect paths that bypassed all explicit
         // drains. Dropping the session releases its capacity lease.
         ctx.session.take();
@@ -864,6 +1026,25 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 .await
         {
             deferred_payment_headers.push(header);
+        }
+        if let Some(paid_request) = ctx.paid_request.take() {
+            let status = session
+                .response_written()
+                .and_then(|response| StatusCode::from_u16(response.status.as_u16()).ok())
+                .unwrap_or_else(|| {
+                    if error.is_some() {
+                        StatusCode::BAD_GATEWAY
+                    } else {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                });
+            telemetry::record_paid_request_completed(
+                paid_request.protocol,
+                &paid_request.subdomain,
+                &ctx.request_path,
+                status,
+                paid_request.payment.as_ref(),
+            );
         }
         let Some(log) = ctx.log.take() else {
             return;
@@ -937,6 +1118,16 @@ impl<S: PaymentState> ProxyHttp for Http402Gate<S> {
                 pingora::ErrorSource::Internal | pingora::ErrorSource::Unset => 500,
             },
         };
+        if code >= 500
+            && let Some(Target::Api {
+                subdomain,
+                upstream,
+                ..
+            }) = &ctx.target
+        {
+            let path = ctx.log.as_ref().map_or("", |log| log.path.as_str());
+            telemetry::record_upstream_error(subdomain, path, upstream, &e.to_string());
+        }
 
         if code > 0 {
             if extra.is_empty() {
@@ -1011,8 +1202,12 @@ fn is_control_plane(path: &str) -> bool {
 }
 
 /// Split a prepared upstream request into a connectable [`Target::Api`].
-fn target_from_prepared(prepared: pay_core::server::proxy::PreparedUpstreamRequest) -> Target {
+fn target_from_prepared(
+    prepared: pay_core::server::proxy::PreparedUpstreamRequest,
+    subdomain: String,
+) -> Target {
     let url = prepared.url;
+    let upstream = url.to_string();
     let tls = url.scheme() == "https";
     let host = url.host_str().unwrap_or("").to_string();
     let port = url
@@ -1034,6 +1229,8 @@ fn target_from_prepared(prepared: pay_core::server::proxy::PreparedUpstreamReque
         sni: host,
         host_header,
         path_and_query,
+        subdomain,
+        upstream,
         headers: prepared.headers,
     }
 }
@@ -1203,9 +1400,10 @@ async fn write_axum_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        buffered_upstream_headers, filtered_response_headers, is_control_plane,
-        is_streamed_response,
+        BatchResponseCapture, MAX_BATCH_CACHED_RESPONSE_BYTES, buffered_upstream_headers,
+        filtered_response_headers, is_control_plane, is_streamed_response,
     };
+    use http::{HeaderMap, HeaderValue, StatusCode, header};
     use pay_core::server::gate::delegated_session_receipt_annotation;
 
     #[test]
@@ -1225,6 +1423,40 @@ mod tests {
         for path in ["v1/messages", "v1/chat/completions", "api/chat"] {
             assert!(!is_control_plane(path), "{path} must be tracked");
         }
+    }
+
+    #[test]
+    fn batch_response_capture_requires_complete_bounded_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from_static("6"));
+        let mut capture =
+            BatchResponseCapture::start(StatusCode::CREATED, &headers).expect("bounded");
+
+        capture.push(b"abc", false);
+        assert!(!capture.complete);
+        capture.push(b"def", true);
+
+        assert!(capture.complete);
+        assert_eq!(
+            capture.cached.as_ref().map(|cached| cached.body.as_slice()),
+            Some(b"abcdef".as_slice())
+        );
+    }
+
+    #[test]
+    fn batch_response_capture_rejects_or_drops_oversized_bodies() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&(MAX_BATCH_CACHED_RESPONSE_BYTES + 1).to_string()).unwrap(),
+        );
+        assert!(BatchResponseCapture::start(StatusCode::OK, &headers).is_none());
+
+        let mut capture = BatchResponseCapture::start(StatusCode::OK, &HeaderMap::new())
+            .expect("unknown length starts bounded");
+        capture.push(&vec![0; MAX_BATCH_CACHED_RESPONSE_BYTES + 1], true);
+        assert!(capture.complete);
+        assert!(capture.cached.is_none());
     }
 
     #[test]
@@ -1310,6 +1542,7 @@ mod tests {
             1,
             1,
             100_000,
+            300,
         )
         .unwrap();
         let headers = annotation
@@ -1328,6 +1561,7 @@ mod tests {
         assert_eq!(decoded.decoded["amount"], "1");
         assert_eq!(decoded.decoded["acceptedCumulative"], "1");
         assert_eq!(decoded.decoded["spent"], "1");
+        assert_eq!(decoded.decoded["idleTimeoutSeconds"], 300);
         assert_eq!(decoded.decoded["remaining"], "99999");
         assert!(headers.iter().any(|(name, value)| {
             name == "payment-receipt-url"

@@ -1,10 +1,15 @@
 pub mod account;
+pub mod acp;
+mod acp_middleware;
+pub(crate) mod agent;
 pub(crate) mod agent_args;
+mod buzz_setup;
 pub mod catalog;
 pub mod claude;
 pub mod codex;
 pub mod curl;
 pub mod docs;
+pub mod fanout;
 pub mod fetch;
 pub mod goose;
 pub mod help;
@@ -46,6 +51,8 @@ pub enum Command {
     Http(http::HttpCommand),
     /// Fetch a URL using the built-in HTTP client (no external tool required).
     Fetch(fetch::FetchCommand),
+    /// Run an ACP agent harness with 402 payment support.
+    Acp(acp::AcpCommand),
     /// Run Claude Code with 402 payment support.
     Claude(claude::ClaudeCommand),
     /// Run Codex with 402 payment support.
@@ -68,15 +75,22 @@ pub enum Command {
     /// Send stablecoins to a recipient address.
     #[command(alias = "push")]
     Send(send::SendCommand),
+    /// Send a CSV stablecoin payout to many recipients concurrently.
+    Fanout(fanout::FanoutCommand),
     /// Generate a keypair, store it, and fund your account.
     Setup(setup::SetupCommand),
     /// Import funds from Venmo, PayPal, or a mobile wallet.
     Topup(topup::TopupCommand),
-    /// Gate your API with stablecoin payments.
+    /// Manage gateway demos, paywall specs, and subscription plans.
     #[command(alias = "serve")]
     Server {
         #[command(subcommand)]
         command: server::ServerCommand,
+    },
+    /// Gate APIs or local inference with stablecoin payments.
+    Gate {
+        #[command(subcommand)]
+        command: server::GateCommand,
     },
     /// Browse, search, and inspect API providers from the skills catalog.
     Skills {
@@ -115,6 +129,7 @@ pub enum ToolKind {
     Wget,
     Http,
     Fetch,
+    Acp,
     Claude,
     Codex,
     Goose,
@@ -126,6 +141,7 @@ impl Command {
     pub fn otlp_sidecar(&self) -> Option<&str> {
         match self {
             Command::Server { command } => command.otlp_sidecar(),
+            Command::Gate { command } => command.otlp_sidecar(),
             _ => None,
         }
     }
@@ -145,11 +161,13 @@ impl Command {
             | Command::Wget(_)
             | Command::Http(_)
             | Command::Fetch(_)
+            | Command::Acp(_)
             | Command::Claude(_)
             | Command::Codex(_)
             | Command::Goose(_)
             | Command::Qodercli(_)
             | Command::Send(_)
+            | Command::Fanout(_)
             | Command::Topup(_) => true,
             Command::Setup(_)
             | Command::Account { .. }
@@ -159,6 +177,7 @@ impl Command {
             | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Server { .. }
+            | Command::Gate { .. }
             | Command::Docs { .. }
             | Command::Mcp => false,
         }
@@ -172,6 +191,7 @@ impl Command {
             Command::Wget(_) => ToolKind::Wget,
             Command::Http(_) => ToolKind::Http,
             Command::Fetch(_) => ToolKind::Fetch,
+            Command::Acp(_) => ToolKind::Acp,
             Command::Claude(_) => ToolKind::Claude,
             Command::Codex(_) => ToolKind::Codex,
             Command::Goose(_) => ToolKind::Goose,
@@ -183,9 +203,11 @@ impl Command {
             | Command::Catalog { .. }
             | Command::Install(_)
             | Command::Send(_)
+            | Command::Fanout(_)
             | Command::Setup(_)
             | Command::Topup(_)
             | Command::Server { .. }
+            | Command::Gate { .. }
             | Command::Docs { .. } => ToolKind::Mcp,
             Command::Mcp => ToolKind::Mcp,
         }
@@ -241,9 +263,15 @@ impl Command {
             Command::Send(cmd) => {
                 return cmd.run(network_override, account_override, verbose);
             }
+            Command::Fanout(cmd) => return cmd.run(network_override, account_override, verbose),
             Command::Setup(cmd) => return cmd.run(),
             Command::Topup(cmd) => return cmd.run(),
-            Command::Server { command } => return command.run(keypair_override, sandbox),
+            Command::Server { command } => {
+                return command.run(keypair_override, account_override, sandbox);
+            }
+            Command::Gate { command } => {
+                return command.run(keypair_override, account_override, sandbox);
+            }
             Command::Mcp => {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -279,6 +307,7 @@ impl Command {
                 network_override,
                 alternate_provider,
             )?),
+            Command::Acp(cmd) => std::process::exit(cmd.run(account_override, network_override)?),
             Command::Docs { command } => return command.run(),
             _ => {}
         }
@@ -523,7 +552,7 @@ fn handle_outcome(
                         "amount_base_units": decoded.amount_base_units,
                         "currency": decoded.currency_label,
                         "mint": decoded.method_details.mint,
-                        "plan": decoded.method_details.plan_id,
+                        "plan": decoded.method_details.plan_address,
                         "puller": decoded.method_details.puller,
                         "recipient": decoded.request.recipient,
                         "period_unit": match decoded.period_unit {
@@ -564,7 +593,10 @@ fn handle_outcome(
             let req: Option<SessionRequest> = challenge.request.decode().ok();
             let cap_display = req
                 .as_ref()
-                .map(|request| display_token_amount(&request.cap, &request.currency))
+                .and_then(|request| {
+                    session_deposit_amount(request)
+                        .map(|deposit| display_token_amount(deposit, &request.currency))
+                })
                 .unwrap_or_else(|| "unknown".to_string());
 
             if auto_pay {
@@ -572,6 +604,7 @@ fn handle_outcome(
                 return pay_session_and_retry(
                     &challenge,
                     req.as_ref(),
+                    &resource_url,
                     tool,
                     output_fmt,
                     fetch_headers,
@@ -587,11 +620,13 @@ fn handle_outcome(
                     "status": 402,
                     "protocol": "mpp-session",
                     "challenge": {
-                        "cap": req.as_ref().map(|r| &r.cap),
+                        "suggested_deposit": req.as_ref().and_then(session_deposit_amount),
                         "cap_display": cap_display,
                         "currency": req.as_ref().map(|r| &r.currency),
-                        "network": req.as_ref().and_then(|r| r.network.as_deref()),
-                        "min_voucher_delta": req.as_ref().and_then(|r| r.min_voucher_delta.as_deref()),
+                        "network": req.as_ref().map(|r| &r.method_details.network),
+                        "min_voucher_delta": req
+                            .as_ref()
+                            .and_then(|r| r.method_details.min_voucher_delta.as_deref()),
                         "recipient": req.as_ref().map(|r| &r.recipient),
                     },
                     "resource": resource_url,
@@ -711,6 +746,56 @@ fn handle_outcome(
                     "{}",
                     format!(
                         "402 Payment Required (x402 upto) — up to {} {}",
+                        challenge.requirements.amount, challenge.requirements.asset
+                    )
+                    .dimmed()
+                );
+            }
+        }
+
+        RunOutcome::X402BatchChallenge {
+            challenge,
+            advertised_challenges,
+            resource_url,
+        } => {
+            print_verbose_challenges(&advertised_challenges, verbose, is_json);
+            if auto_pay {
+                enforce_payment_cap(
+                    &challenge.requirements.amount,
+                    &challenge.requirements.asset,
+                    payment_cap,
+                    "x402",
+                )?;
+                return pay_batch_and_retry(
+                    &challenge,
+                    &resource_url,
+                    PaymentRetryContext {
+                        tool,
+                        output_fmt,
+                        fetch_headers,
+                        network_override,
+                        account_override,
+                        verbose,
+                    },
+                );
+            }
+
+            if is_json {
+                output::print_json(&serde_json::json!({
+                    "status": 402,
+                    "protocol": "x402-batch-settlement",
+                    "challenge": {
+                        "amount": challenge.requirements.amount,
+                        "currency": challenge.requirements.asset,
+                        "recipient": challenge.requirements.pay_to,
+                    },
+                    "resource": resource_url,
+                }))?;
+            } else {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "402 Payment Required (x402 batch-settlement) — {} {} per request",
                         challenge.requirements.amount, challenge.requirements.asset
                     )
                     .dimmed()
@@ -1140,6 +1225,35 @@ fn mpp_challenges_within_cap(
     ))
 }
 
+/// Deposit a session challenge asks the client to lock: the server's
+/// suggestion, falling back to its minimum.
+fn session_deposit_amount(request: &SessionRequest) -> Option<&str> {
+    request
+        .suggested_deposit
+        .as_deref()
+        .or(request.minimum_deposit.as_deref())
+}
+
+/// The exact base-unit deposit `pay_session_and_retry` will sign for. Shared
+/// with `enforce_session_cap` so the cap can never be checked against a
+/// different amount than the one that gets locked: server suggestion,
+/// floored by its minimum, falling back to 1 USDC when the challenge omits
+/// both.
+fn resolve_session_deposit(request: &SessionRequest) -> u64 {
+    let minimum = request
+        .minimum_deposit
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    request
+        .suggested_deposit
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000_000)
+        .max(minimum)
+        .max(1)
+}
+
 fn enforce_session_cap(
     request: Option<&SessionRequest>,
     payment_cap: Option<u64>,
@@ -1152,7 +1266,8 @@ fn enforce_session_cap(
             "session payment cap requires a decoded SessionRequest".to_string(),
         ));
     };
-    let required_micro = amount_as_stablecoin_micro(&request.cap, &request.currency)?;
+    let required = resolve_session_deposit(request).to_string();
+    let required_micro = amount_as_stablecoin_micro(&required, &request.currency)?;
 
     if required_micro <= payment_cap {
         return Ok(());
@@ -1349,10 +1464,9 @@ fn pay_subscription_and_retry(
         .or_else(|| mpp_challenge_network(challenge));
 
     // On any 2xx outcome, persist a best-effort local record. The
-    // `subscription_id` is the deterministic SubscriptionDelegation PDA
-    // (per spec §"Subscription Identifier"), so we can derive it without
-    // round-tripping the Payment-Receipt header — which the curl/wget/httpie
-    // wrappers don't preserve today.
+    // The curl/wget/httpie wrappers do not preserve Payment-Receipt today, so
+    // we cannot recover the server-issued opaque subscriptionId here. Persist
+    // the deterministic delegation PDA as a backward-compatible local key.
     if let RunOutcome::Completed { exit_code, .. } = &retry_outcome
         && *exit_code == 0
     {
@@ -1542,10 +1656,19 @@ fn pay_x402_and_retry(
     )
 }
 
-fn pay_upto_and_retry(
-    challenge: &x402::UptoChallenge,
-    resource_url: &str,
+/// Notify, build the payment header, retry the request, and render the receipt.
+///
+/// Every x402 payment-channel scheme follows this shape; only the header it
+/// builds and the label on the receipt differ, so `build` supplies those and
+/// the rest stays in one place.
+fn pay_channel_and_retry(
+    scheme: &'static str,
+    amount: &str,
+    asset: &str,
+    network: &str,
+    recent_blockhash: Option<&str>,
     ctx: PaymentRetryContext<'_, '_>,
+    build: impl FnOnce(&pay_core::accounts::FileAccountsStore) -> pay_core::Result<x402::BuiltPayment>,
 ) -> pay_core::Result<()> {
     let is_json = no_dna::should_json(ctx.output_fmt);
     validate_tool_request_before_signing(ctx.tool)?;
@@ -1554,35 +1677,19 @@ fn pay_upto_and_retry(
         crate::components::print_notice(
             crate::components::NoticeLevel::Success,
             "Authorizing x402 payment",
-            &payment_authorization_notice_body(
-                &display_x402_upto_amount(
-                    &challenge.requirements.amount,
-                    &challenge.requirements.asset,
-                ),
-                None,
-            ),
+            &payment_authorization_notice_body(&display_token_amount(amount, asset), None),
         );
     }
 
     let store = pay_core::accounts::FileAccountsStore::default_path();
-    let built_payment = x402::build_upto_payment(
-        challenge,
-        &store,
-        ctx.network_override,
-        ctx.account_override,
-        Some(resource_url),
-    )?;
+    let built_payment = build(&store)?;
 
     if let Some(resolved) = built_payment.ephemeral_notice {
         render_generated_wallet_notice(&resolved, is_json)?;
     }
 
-    let receipt_network = x402_receipt_network(
-        ctx.network_override,
-        &challenge.requirements.network,
-        None,
-        challenge.requirements.extra.recent_blockhash.as_deref(),
-    );
+    let receipt_network =
+        x402_receipt_network(ctx.network_override, network, None, recent_blockhash);
     let verbose = ctx.verbose;
     let retry_outcome = retry_with_headers(ctx.tool, &built_payment.headers, ctx.fetch_headers)?;
     handle_retry_outcome(
@@ -1591,14 +1698,78 @@ fn pay_upto_and_retry(
         verbose,
         Some(&receipt_network),
         ReceiptProvenance::PaidRetry(Some(ReceiptDisplayContext {
-            asset: Some(&challenge.requirements.asset),
-            scheme: Some("upto"),
+            asset: Some(asset),
+            scheme: Some(scheme),
         })),
     )
 }
 
-fn display_x402_upto_amount(amount: &str, asset: &str) -> String {
-    display_token_amount(amount, asset)
+fn pay_upto_and_retry(
+    challenge: &x402::UptoChallenge,
+    resource_url: &str,
+    ctx: PaymentRetryContext<'_, '_>,
+) -> pay_core::Result<()> {
+    let requirements = &challenge.requirements;
+    let network_override = ctx.network_override;
+    let account_override = ctx.account_override;
+    pay_channel_and_retry(
+        "upto",
+        &requirements.amount,
+        &requirements.asset,
+        &requirements.network,
+        requirements.extra.recent_blockhash.as_deref(),
+        ctx,
+        |store| {
+            x402::build_upto_payment(
+                challenge,
+                store,
+                network_override,
+                account_override,
+                Some(resource_url),
+            )
+        },
+    )
+}
+
+/// Pay an x402 `batch-settlement` challenge and retry the request.
+///
+/// A one-shot CLI run has nowhere to keep a channel between invocations, so it
+/// opens one, escrows exactly this request's price, and spends it. The scheme
+/// pays off in a long-lived host — the MCP server keeps its channels for the
+/// life of the connection, but currently tops up one request at a time. A
+/// larger deposit option can amortize funding transactions in a follow-up. The
+/// escrow is never stranded either way: the payer can force-close and recover
+/// whatever is unspent after the advertised `withdrawDelay`.
+fn pay_batch_and_retry(
+    challenge: &x402::BatchChallenge,
+    resource_url: &str,
+    ctx: PaymentRetryContext<'_, '_>,
+) -> pay_core::Result<()> {
+    let requirements = &challenge.requirements;
+    let network_override = ctx.network_override;
+    let account_override = ctx.account_override;
+    pay_channel_and_retry(
+        "batch-settlement",
+        &requirements.amount,
+        &requirements.asset,
+        &requirements.network,
+        requirements.extra.recent_blockhash.as_deref(),
+        ctx,
+        |store| {
+            let channels = pay_core::client::batch::BatchChannelCache::new();
+            x402::build_batch_payment(
+                challenge,
+                store,
+                &channels,
+                None,
+                network_override,
+                account_override,
+                Some(resource_url),
+                None,
+            )
+            .map(|built| built.payment)
+        },
+    )
 }
 
 fn display_token_amount(amount: &str, asset: &str) -> String {
@@ -1672,6 +1843,7 @@ fn pay_x402_siwx_and_retry(
 fn pay_session_and_retry(
     challenge: &mpp::Challenge,
     req: Option<&SessionRequest>,
+    resource_url: &str,
     tool: &Tool,
     output_fmt: Option<OutputFormat>,
     fetch_headers: Option<Vec<(String, String)>>,
@@ -1680,103 +1852,37 @@ fn pay_session_and_retry(
     sandbox: bool,
     verbose: bool,
 ) -> pay_core::Result<()> {
-    use pay_kit::mpp::{SessionMode, SessionPullVoucherStrategy};
-
     let is_json = no_dna::should_json(output_fmt);
     validate_tool_request_before_signing(tool)?;
 
-    // Deposit = min_voucher_delta * 1000, clamped to [1 USDC, cap].
-    let min_delta = req
-        .and_then(|r| r.min_voucher_delta.as_deref())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1_000);
-    let cap = req
-        .and_then(|r| r.cap.parse::<u64>().ok())
-        .unwrap_or(1_000_000);
-    let deposit = (min_delta * 1_000).max(1_000_000).min(cap);
-    let cap_display = req
-        .map(|request| display_token_amount(&request.cap, &request.currency))
-        .unwrap_or_else(|| format!("{cap} base units"));
-    let deposit_display = req
-        .map(|request| display_token_amount(&deposit.to_string(), &request.currency))
-        .unwrap_or_else(|| format!("{deposit} base units"));
+    let Some(request) = req else {
+        return Err(pay_core::Error::Mpp(
+            "session challenge did not decode into a SessionRequest".to_string(),
+        ));
+    };
+
+    let deposit = resolve_session_deposit(request);
+    let deposit_display = display_token_amount(&deposit.to_string(), &request.currency);
 
     if verbose && !is_json {
         crate::components::print_notice(
             crate::components::NoticeLevel::Success,
             "Authorizing MPP session",
-            &payment_authorization_notice_body(&cap_display, Some(&deposit_display)),
+            &payment_authorization_notice_body(&deposit_display, Some(&deposit_display)),
         );
     }
 
-    let supports_push = req
-        .map(|r| r.modes.is_empty() || r.modes.contains(&SessionMode::Push))
-        .unwrap_or(true);
-    let use_pull = req
-        .map(|r| {
-            r.modes.contains(&SessionMode::Pull)
-                && (!supports_push
-                    || matches!(
-                        r.pull_voucher_strategy.as_ref(),
-                        Some(SessionPullVoucherStrategy::ClientVoucher)
-                    ))
-        })
-        .unwrap_or(false);
-
-    let auth_header = if use_pull {
-        let Some(request) = req else {
-            return Err(pay_core::Error::Mpp(
-                "pull-mode session requires a decoded SessionRequest".to_string(),
-            ));
-        };
-
-        let store = pay_core::accounts::FileAccountsStore::default_path();
-        match request.pull_voucher_strategy.as_ref() {
-            Some(SessionPullVoucherStrategy::ClientVoucher) => {
-                let (_handle, header) =
-                    pay_core::session::open_payment_channel_session_header_with_mode(
-                        challenge,
-                        request,
-                        &store,
-                        network_override,
-                        account_override,
-                        deposit,
-                        SessionMode::Pull,
-                        sandbox,
-                    )?;
-                header
-            }
-            Some(SessionPullVoucherStrategy::OperatedVoucher) => {
-                return Err(pay_core::Error::Mpp(
-                    "operated-voucher pull sessions are no longer supported; \
-                     use a client-voucher payment-channel session instead"
-                        .to_string(),
-                ));
-            }
-            None => {
-                return Err(pay_core::Error::Mpp(
-                    "pull-mode session challenge missing pullVoucherStrategy".to_string(),
-                ));
-            }
-        }
-    } else {
-        if let Some(request) = req {
-            let store = pay_core::accounts::FileAccountsStore::default_path();
-            let (_handle, header) = pay_core::session::open_payment_channel_session_header(
-                challenge,
-                request,
-                &store,
-                network_override,
-                account_override,
-                deposit,
-                sandbox,
-            )?;
-            header
-        } else {
-            let (_handle, header) = pay_core::session::open_session_header(challenge, deposit)?;
-            header
-        }
-    };
+    let store = pay_core::accounts::FileAccountsStore::default_path();
+    let (_handle, auth_header) = pay_core::session::open_payment_channel_session_header(
+        challenge,
+        request,
+        &store,
+        network_override,
+        account_override,
+        deposit,
+        resource_url,
+        sandbox,
+    )?;
 
     let receipt_network = network_override
         .map(str::to_string)
@@ -1997,6 +2103,60 @@ fn handle_retry_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pay_kit::mpp::SessionMethodDetails;
+
+    fn test_session_request_with_deposits(
+        minimum_deposit: Option<&str>,
+        suggested_deposit: Option<&str>,
+    ) -> SessionRequest {
+        SessionRequest {
+            amount: "25".to_string(),
+            currency: "USDC".to_string(),
+            recipient: solana_pubkey::Pubkey::new_unique().to_string(),
+            description: None,
+            external_id: None,
+            minimum_deposit: minimum_deposit.map(str::to_string),
+            suggested_deposit: suggested_deposit.map(str::to_string),
+            unit_type: None,
+            method_details: SessionMethodDetails {
+                network: "localnet".to_string(),
+                channel_program: solana_pubkey::Pubkey::new_unique().to_string(),
+                channel_id: None,
+                recent_blockhash: Some("11111111111111111111111111111111".to_string()),
+                recent_slot: Some(1),
+                decimals: Some(6),
+                token_program: None,
+                fee_payer: None,
+                fee_payer_key: None,
+                voucher_signer: None,
+                operator: None,
+                min_voucher_delta: None,
+                ttl_seconds: None,
+                idle_timeout_options_seconds: None,
+                idle_timeout_seconds: None,
+                grace_period_seconds: None,
+                distribution_splits: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn enforce_session_cap_bounds_the_exact_amount_that_gets_signed() {
+        // A challenge with neither `suggested_deposit` nor `minimum_deposit`
+        // set: `resolve_session_deposit` (and therefore
+        // `pay_session_and_retry`) falls back to signing 1 USDC. The cap
+        // check must reject this against a $0.10 cap instead of silently
+        // treating the required amount as zero.
+        let request = test_session_request_with_deposits(None, None);
+        assert_eq!(resolve_session_deposit(&request), 1_000_000);
+
+        let cap_10_cents = 100_000u64;
+        let result = enforce_session_cap(Some(&request), Some(cap_10_cents));
+        assert!(
+            result.is_err(),
+            "a deposit-less challenge must be capped at what it will actually sign, not 0"
+        );
+    }
 
     #[test]
     fn verbose_challenge_rendering_groups_decoded_protocols() {
@@ -2307,10 +2467,13 @@ mod tests {
         );
     }
 
+    /// Both channel schemes render their authorization prompt through
+    /// `pay_channel_and_retry`, so this formatting is what a payer actually
+    /// reads before approving either one.
     #[test]
-    fn x402_upto_notice_uses_a_human_stablecoin_amount() {
+    fn x402_channel_notice_uses_a_human_stablecoin_amount() {
         assert_eq!(
-            display_x402_upto_amount("250000", pay_types::stablecoin_mints::USDC_MAINNET),
+            display_token_amount("250000", pay_types::stablecoin_mints::USDC_MAINNET),
             "0.25 USDC"
         );
     }
