@@ -605,7 +605,7 @@ impl BenchScheme for BatchSettlement {
         // the challenged blockhash + slot. The sponsor co-signs and broadcasts.
         let token_program = pc::parse_pubkey(&requirements.extra.token_program)
             .map_err(|e| anyhow::anyhow!("bad extra.tokenProgram: {e}"))?;
-        let terms = resolve_terms_with_token_program(&requirements, token_program)
+        let terms = resolve_terms_with_token_program(&requirements, token_program, None)
             .map_err(|e| anyhow::anyhow!("resolve batch terms: {e}"))?;
         let (blockhash, open_slot) = open_hints(&requirements)?;
         let payer_signer = MemorySigner::from_bytes(&ctx.wallet.keypair)
@@ -820,7 +820,7 @@ impl BenchScheme for BatchSettlement {
             .context("close: batch recovery challenge")?;
         let token_program = pc::parse_pubkey(&requirements.extra.token_program)
             .map_err(|e| anyhow::anyhow!("close: bad extra.tokenProgram: {e}"))?;
-        let terms = resolve_terms_with_token_program(&requirements, token_program)
+        let terms = resolve_terms_with_token_program(&requirements, token_program, None)
             .map_err(|e| anyhow::anyhow!("close: resolve batch terms: {e}"))?;
         let (blockhash, _open_slot) = open_hints(&requirements)?;
         let signer = MemorySigner::from_bytes(&ctx.wallet.keypair)

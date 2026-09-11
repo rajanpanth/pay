@@ -612,6 +612,7 @@ fn pack_reclaim_candidates(
         version,
         candidates,
         fee_payer,
+        None,
         pay_kit::core::payment_channels::max_reclaims_per_tx(version),
     )
 }
@@ -640,7 +641,8 @@ async fn process_reclaim_batches(
             .flat_map(|candidate| candidate.instructions)
             .collect();
         let max_tx_bytes = tx_version.limits().max_bytes;
-        let serialized_size = tx_size(tx_version, &instructions, &fee_payer).unwrap_or(usize::MAX);
+        let serialized_size =
+            tx_size(tx_version, &instructions, &fee_payer, None).unwrap_or(usize::MAX);
 
         if serialized_size > max_tx_bytes {
             outcome.failures += channel_count;
@@ -870,7 +872,7 @@ mod tests {
                 .flat_map(|candidate| candidate.instructions)
                 .collect();
             assert!(
-                tx_size(TxVersion::V0, &instructions, &fee_payer).unwrap()
+                tx_size(TxVersion::V0, &instructions, &fee_payer, None).unwrap()
                     <= TxVersion::V0.limits().max_bytes
             );
         }
@@ -895,7 +897,7 @@ mod tests {
                 .flat_map(|candidate| candidate.instructions)
                 .collect();
             assert!(
-                tx_size(TxVersion::V0, &instructions, &fee_payer).unwrap()
+                tx_size(TxVersion::V0, &instructions, &fee_payer, None).unwrap()
                     <= TxVersion::V0.limits().max_bytes
             );
         }
