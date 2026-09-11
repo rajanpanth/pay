@@ -168,7 +168,20 @@ mod tests {
             .port()
     }
 
-    fn start_redis_on(port: u16) -> Child {
+    /// RAII guard around the spawned `redis-server` process. `Child` alone
+    /// leaves the process running (a zombie, once the test process exits)
+    /// if a test panics before an explicit kill+wait — `Drop` guarantees
+    /// cleanup on every exit path, panic included.
+    struct RedisGuard(Child);
+
+    impl Drop for RedisGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn start_redis_on(port: u16) -> RedisGuard {
         let child = Command::new("redis-server")
             .args([
                 "--port",
@@ -182,19 +195,18 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn redis-server");
+        // Wrap immediately, before the readiness-polling loop below — the
+        // panic on timeout must also drop a guarded `RedisGuard` (whose
+        // `Drop` kills+waits), never a bare `Child`.
+        let guard = RedisGuard(child);
         let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).expect("valid url");
         for _ in 0..50 {
             if client.get_connection().is_ok() {
-                return child;
+                return guard;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("redis-server on port {port} did not become ready in time");
-    }
-
-    fn stop(mut child: Child) {
-        let _ = child.kill();
-        let _ = child.wait();
     }
 
     fn sample_event() -> BillingEvent {
@@ -250,7 +262,7 @@ mod tests {
             return;
         }
         let port = ephemeral_port();
-        let server = start_redis_on(port);
+        let _server = start_redis_on(port);
 
         let sink = BillingSink::spawn_with_stream_cap(format!("redis://127.0.0.1:{port}"), 1000);
         sink.report(sample_event());
@@ -258,8 +270,6 @@ mod tests {
         let mut conn = connect_multiplexed(port).await;
         let len = wait_until_len_at_least(&mut conn, 1, Duration::from_secs(5)).await;
         assert_eq!(len, 1);
-
-        stop(server);
     }
 
     /// Regression test for "startup failure disables export": `drain` used
@@ -283,15 +293,13 @@ mod tests {
         // before Redis exists on this port at all.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let server = start_redis_on(port);
+        let _server = start_redis_on(port);
         let mut conn = connect_multiplexed(port).await;
         let len = wait_until_len_at_least(&mut conn, 1, Duration::from_secs(10)).await;
         assert_eq!(
             len, 1,
             "an event queued before Redis was reachable must still be delivered once it recovers"
         );
-
-        stop(server);
     }
 
     /// Regression test for "Redis stream grows forever": asserts `XADD
@@ -304,7 +312,7 @@ mod tests {
             return;
         }
         let port = ephemeral_port();
-        let server = start_redis_on(port);
+        let _server = start_redis_on(port);
 
         const CAP: u64 = 5;
         const TOTAL: usize = 40;
@@ -327,7 +335,5 @@ mod tests {
             len < TOTAL as u64,
             "expected trimming to bound the stream below all {TOTAL} XADDed entries, got {len}"
         );
-
-        stop(server);
     }
 }
