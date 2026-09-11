@@ -160,18 +160,16 @@ async fn main() -> std::process::ExitCode {
         };
     }
 
-    let interval_seconds = match parse_u64_env(
-        "BILLING_EXPORT_INTERVAL_SECONDS",
-        DEFAULT_INTERVAL_SECONDS,
-    ) {
-        Ok(0) => {
-            return record_startup_failure(JobError::Config(
-                "BILLING_EXPORT_INTERVAL_SECONDS must be greater than zero".into(),
-            ));
-        }
-        Ok(value) => value,
-        Err(error) => return record_startup_failure(error),
-    };
+    let interval_seconds =
+        match parse_u64_env("BILLING_EXPORT_INTERVAL_SECONDS", DEFAULT_INTERVAL_SECONDS) {
+            Ok(0) => {
+                return record_startup_failure(JobError::Config(
+                    "BILLING_EXPORT_INTERVAL_SECONDS must be greater than zero".into(),
+                ));
+            }
+            Ok(value) => value,
+            Err(error) => return record_startup_failure(error),
+        };
     let port = match parse_u64_env("PORT", DEFAULT_PORT) {
         Ok(port) if u16::try_from(port).is_ok() => port as u16,
         Ok(_) => {
@@ -266,8 +264,8 @@ fn consumer_identity() -> String {
 }
 
 async fn connect(redis_url: &str) -> Result<redis::aio::ConnectionManager, JobError> {
-    let client =
-        redis::Client::open(redis_url).map_err(|error| JobError::Config(format!("Redis client: {error}")))?;
+    let client = redis::Client::open(redis_url)
+        .map_err(|error| JobError::Config(format!("Redis client: {error}")))?;
     client
         .get_connection_manager()
         .await

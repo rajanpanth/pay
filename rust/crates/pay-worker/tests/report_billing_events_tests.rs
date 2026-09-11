@@ -20,7 +20,11 @@ struct RedisServer {
 
 impl RedisServer {
     fn start() -> Option<Self> {
-        if Command::new("redis-server").arg("--version").output().is_err() {
+        if Command::new("redis-server")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
             return None;
         }
         let port = ephemeral_port();
@@ -56,7 +60,10 @@ impl RedisServer {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("redis-server on port {} did not become ready in time", self.port);
+        panic!(
+            "redis-server on port {} did not become ready in time",
+            self.port
+        );
     }
 }
 
@@ -80,7 +87,9 @@ fn ephemeral_port() -> u16 {
 #[test]
 fn report_billing_events_drains_and_acks_a_real_event() {
     let Some(redis_server) = RedisServer::start() else {
-        eprintln!("skipping report_billing_events_drains_and_acks_a_real_event: redis-server not found on PATH");
+        eprintln!(
+            "skipping report_billing_events_drains_and_acks_a_real_event: redis-server not found on PATH"
+        );
         return;
     };
 
@@ -271,7 +280,10 @@ fn report_billing_events_reclaims_a_stranded_pending_entry() {
         .arg(STREAM_KEY)
         .query(&mut conn)
         .expect("XLEN");
-    assert_eq!(len, 0, "expected the reclaimed entry to also be XDELed, got {len} remaining");
+    assert_eq!(
+        len, 0,
+        "expected the reclaimed entry to also be XDELed, got {len} remaining"
+    );
 
     let exported: Option<String> = redis::cmd("GET")
         .arg(format!("{EXPORTED_KEY_PREFIX}{seeded_id}"))
@@ -492,7 +504,10 @@ fn report_billing_events_retry_after_a_successful_relocation_does_not_duplicate(
         .arg(STREAM_KEY)
         .query(&mut conn)
         .expect("XLEN");
-    assert_eq!(len, 0, "expected the source entry to be removed once the retry completes, got {len}");
+    assert_eq!(
+        len, 0,
+        "expected the source entry to be removed once the retry completes, got {len}"
+    );
 
     // Exactly one value for this event's key — retrying never produces a
     // second, distinct record the way appending to a stream would.
@@ -612,7 +627,9 @@ fn report_billing_events_leaves_entry_pending_when_relocation_fails() {
 #[test]
 fn report_billing_events_requires_the_redis_url() {
     let Some(redis_server) = RedisServer::start() else {
-        eprintln!("skipping report_billing_events_requires_the_redis_url: redis-server not found on PATH");
+        eprintln!(
+            "skipping report_billing_events_requires_the_redis_url: redis-server not found on PATH"
+        );
         return;
     };
     // The server only needs to exist so this test doesn't accidentally pass

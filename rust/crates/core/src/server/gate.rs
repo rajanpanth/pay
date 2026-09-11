@@ -2825,8 +2825,10 @@ mod tests {
         assert_eq!(outcome.amount_usd, Some(0.02));
 
         // A `!served_ok` settlement resolves to a refund, not a charge.
-        let mut refunded =
-            PaidRequestTelemetry::pending("sub".to_string(), pay_types::metering::Scheme::X402BatchSettlement);
+        let mut refunded = PaidRequestTelemetry::pending(
+            "sub".to_string(),
+            pay_types::metering::Scheme::X402BatchSettlement,
+        );
         refunded.status = crate::ChargeStatus::Refunded;
         let outcome = refunded
             .into_charge_outcome()
@@ -2836,8 +2838,10 @@ mod tests {
 
         // A settlement attempt that errors after serving is `Failed`, not
         // silently reported as a refund or a charge.
-        let mut failed =
-            PaidRequestTelemetry::pending("sub".to_string(), pay_types::metering::Scheme::MppSession);
+        let mut failed = PaidRequestTelemetry::pending(
+            "sub".to_string(),
+            pay_types::metering::Scheme::MppSession,
+        );
         failed.status = crate::ChargeStatus::Failed;
         let outcome = failed
             .into_charge_outcome()
