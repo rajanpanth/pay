@@ -845,6 +845,9 @@ struct AppState {
     x402_upto: Option<pay_kit::x402::server::X402Upto>,
     x402_batch: Option<pay_kit::x402::server::X402BatchSettlement>,
     pdb: Option<pay_pdb::PdbState>,
+    /// Non-blocking billing-event export sink — `None` unless
+    /// `PAY_BILLING_REDIS_URL` is configured. See `billing_export`.
+    billing: Option<super::billing_export::BillingSink>,
 }
 
 impl PaymentState for AppState {
@@ -888,9 +891,14 @@ impl PaymentState for AppState {
         self.x402_batch.as_ref()
     }
     fn records_http_exchanges(&self) -> bool {
-        self.pdb.is_some()
+        self.pdb.is_some() || self.billing.is_some()
     }
     fn record_exchange(&self, exchange: pay_core::HttpExchange) {
+        if let Some(billing) = &self.billing
+            && let Some(event) = pay_core::BillingEvent::from_exchange(&exchange)
+        {
+            billing.report(event);
+        }
         let Some(pdb) = &self.pdb else {
             return;
         };
@@ -2431,6 +2439,7 @@ impl StartCommand {
                 x402_batch,
                 // The gate calls `record_exchange` per proxied request to feed PDB.
                 pdb: pdb_state.clone(),
+                billing: super::billing_export::BillingSink::from_env(),
             };
 
             let verify_pdb = pdb_state.clone();
