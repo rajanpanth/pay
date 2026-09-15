@@ -18,7 +18,7 @@ Done on `feat/pay-cloud` (main plus PR #423):
   components under `src/components/cloud`.
 - `pay setup --backend cloud` and the "Remote wallet" picker entry run the
   loopback flow end to end; the exchange returns `status: pending` because
-  provisioning is not built. `PAY_CLOUD_URL` targets a local server,
+  provisioning is not built. `PAY_CLOUD_LOCAL=1` targets `http://127.0.0.1:8402`, `PAY_CLOUD_URL` any other server,
   `PAY_NO_BROWSER=1` skips opening the browser.
 
 Next: Track A5 to A7 (tenant store, Openfort provisioning, the exchange

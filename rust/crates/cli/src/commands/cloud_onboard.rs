@@ -40,11 +40,15 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOOPBACK_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// Set to skip `webbrowser::open` (headless shells, scripted tests).
 const NO_BROWSER_ENV: &str = "PAY_NO_BROWSER";
-/// Overrides the pay-cloud base URL, e.g. `http://127.0.0.1:8402` for a
-/// local `pay-cloud`.
+/// Overrides the pay-cloud base URL.
 const CLOUD_URL_ENV: &str = "PAY_CLOUD_URL";
+/// Set to anything but `0`/`false` to target a `pay-cloud` running locally
+/// on its default port. `PAY_CLOUD_URL` wins when both are set.
+const CLOUD_LOCAL_ENV: &str = "PAY_CLOUD_LOCAL";
 /// Production pay-cloud.
 const DEFAULT_CLOUD_URL: &str = "https://cloud.pay.sh";
+/// Where `cargo run -p pay-cloud` listens by default.
+const LOCAL_CLOUD_URL: &str = "http://127.0.0.1:8402";
 
 /// `--backend` value that selects the browser-linked remote wallet in
 /// `pay setup` and `pay account new`.
@@ -52,13 +56,30 @@ pub const CLOUD_BACKEND_FLAG: &str = "cloud";
 /// Picker label for the remote wallet.
 pub const CLOUD_BACKEND_LABEL: &str = "Remote wallet (sign in from your browser)";
 
-/// pay-cloud base URL: `PAY_CLOUD_URL` when set, else production.
+/// pay-cloud base URL: `PAY_CLOUD_URL` when set, else the local server when
+/// `PAY_CLOUD_LOCAL` is on, else production.
 pub fn default_cloud_url() -> String {
-    std::env::var(CLOUD_URL_ENV)
-        .ok()
-        .map(|v| v.trim().trim_end_matches('/').to_string())
+    cloud_url_from(
+        std::env::var(CLOUD_URL_ENV).ok().as_deref(),
+        std::env::var(CLOUD_LOCAL_ENV).ok().as_deref(),
+    )
+}
+
+fn cloud_url_from(url: Option<&str>, local: Option<&str>) -> String {
+    if let Some(url) = url
+        .map(|v| v.trim().trim_end_matches('/'))
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| DEFAULT_CLOUD_URL.to_string())
+    {
+        return url.to_string();
+    }
+    let local_on = local
+        .map(str::trim)
+        .is_some_and(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"));
+    if local_on {
+        LOCAL_CLOUD_URL.to_string()
+    } else {
+        DEFAULT_CLOUD_URL.to_string()
+    }
 }
 
 /// `pay setup --backend cloud`: link this terminal through the browser and
@@ -441,6 +462,20 @@ pub fn exchange_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloud_url_prefers_explicit_then_local_then_production() {
+        assert_eq!(cloud_url_from(None, None), DEFAULT_CLOUD_URL);
+        assert_eq!(cloud_url_from(None, Some("1")), LOCAL_CLOUD_URL);
+        assert_eq!(cloud_url_from(None, Some("true")), LOCAL_CLOUD_URL);
+        assert_eq!(cloud_url_from(None, Some("0")), DEFAULT_CLOUD_URL);
+        assert_eq!(cloud_url_from(None, Some("false")), DEFAULT_CLOUD_URL);
+        assert_eq!(
+            cloud_url_from(Some("http://127.0.0.1:9000/"), Some("1")),
+            "http://127.0.0.1:9000"
+        );
+        assert_eq!(cloud_url_from(Some("  "), None), DEFAULT_CLOUD_URL);
+    }
     use axum::Json;
     use axum::routing::post;
 

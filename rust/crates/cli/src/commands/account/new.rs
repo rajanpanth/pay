@@ -688,15 +688,15 @@ pub fn pick_backend() -> pay_core::Result<String> {
         None => Vec::new(),
     };
 
-    // Remote backends sign elsewhere, but their API credentials still
-    // live in the platform secret store — only offer them when one is
-    // available.
+    // The remote wallet is set up from the browser; its token lives in the
+    // platform secret store, so only offer it when one is available. A
+    // bring-your-own custody provider (`--backend openfort`) is a flag, not
+    // a picker entry: the browser flow is the remote wallet.
     if platform.is_some() {
         options.push(Opt {
             id: crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG,
             label: crate::commands::cloud_onboard::CLOUD_BACKEND_LABEL.to_string(),
         });
-        options.extend(pay_core::remote::providers().map(|p| opt(p)));
     }
 
     if options.is_empty() {
