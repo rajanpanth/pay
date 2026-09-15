@@ -8,6 +8,8 @@
     "dev:api": "tsx watch api/index.ts",
     "dev:web": "vite",
     "build": "vite build && tsc --noEmit",
+    "build:cloud": "vite build --config vite.cloud.config.ts",
+    "dev:cloud": "vite --config vite.cloud.config.ts --port 5174",
     "test": "vitest run",
     "start": "tsx api/index.ts",
     "proxy": "tsx proxy/server.ts",

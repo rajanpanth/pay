@@ -17,6 +17,7 @@ bun.lock
 bun.lockb
 tsconfig.tsbuildinfo
 dist/
+dist-cloud/
 .vercel
 
 # CLI binary (downloaded at runtime by run.js)
