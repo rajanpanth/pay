@@ -6,7 +6,7 @@ import react from "@vitejs/plugin-react";
 // rust/crates/cloud embeds with include_dir.
 export default defineConfig({
   root: "cloud",
-  base: "./",
+  base: "/",
   publicDir: false,
   plugins: [react()],
   build: {

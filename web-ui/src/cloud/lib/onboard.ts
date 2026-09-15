@@ -29,13 +29,42 @@ export type LinkParams = OnboardParams &
 
 /** JSON body for `POST /api/onboard/start`. */
 export interface StartRequest {
-  email: string;
+  /** Present on the email-only stub path. */
+  email?: string;
+  /** Wallet driver id (`openfort`); the response then carries `consent`. */
+  provider?: string;
   callback: string;
   state: string;
   code_challenge: string;
   account?: string;
   host?: string;
   cli?: string;
+}
+
+/** Wallet providers the page can offer, in display order. */
+export const PROVIDERS = [{ id: "openfort", name: "Openfort" }] as const;
+
+/**
+ * `/onboard/<provider>/callback` → `<provider>`, or null for any other path.
+ * The provider's consent page redirects here with the grant in the fragment.
+ */
+export function providerCallbackFromPath(pathname: string): string | null {
+  const m = /^\/onboard\/([a-z0-9-]+)\/callback\/?$/.exec(pathname);
+  return m ? m[1] : null;
+}
+
+/** JSON body for `POST /api/onboard/start` when a provider is chosen. */
+export function buildProviderStartRequest(params: LinkParams, provider: string): StartRequest {
+  const req: StartRequest = {
+    provider,
+    callback: params.callback,
+    state: params.state,
+    code_challenge: params.code_challenge,
+  };
+  if (params.account) req.account = params.account;
+  if (params.host) req.host = params.host;
+  if (params.cli) req.cli = params.cli;
+  return req;
 }
 
 /**

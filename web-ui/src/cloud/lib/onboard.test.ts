@@ -92,3 +92,32 @@ describe("buildStartRequest", () => {
     );
   });
 });
+
+describe("providerCallbackFromPath", () => {
+  it("extracts the provider from the consent callback path", async () => {
+    const { providerCallbackFromPath } = await import("./onboard");
+    expect(providerCallbackFromPath("/onboard/openfort/callback")).toBe("openfort");
+    expect(providerCallbackFromPath("/onboard/openfort/callback/")).toBe("openfort");
+    expect(providerCallbackFromPath("/onboard")).toBeNull();
+    expect(providerCallbackFromPath("/onboard/Openfort/callback")).toBeNull();
+    expect(providerCallbackFromPath("/other/openfort/callback")).toBeNull();
+  });
+});
+
+describe("buildProviderStartRequest", () => {
+  it("carries the link params and the provider, no email", async () => {
+    const { buildProviderStartRequest } = await import("./onboard");
+    const req = buildProviderStartRequest(
+      { callback: "http://127.0.0.1:1/callback", state: "s", code_challenge: "c", host: "h" },
+      "openfort",
+    );
+    expect(req).toEqual({
+      provider: "openfort",
+      callback: "http://127.0.0.1:1/callback",
+      state: "s",
+      code_challenge: "c",
+      host: "h",
+    });
+    expect("email" in req).toBe(false);
+  });
+});
