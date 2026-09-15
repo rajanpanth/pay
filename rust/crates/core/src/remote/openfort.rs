@@ -11,7 +11,7 @@
 //! `POST /v2/accounts/backend/{id}/sign`, and verifies the returned
 //! ed25519 signature against the address pinned at init.
 
-use pay_kit::solana_keychain::{OpenfortSigner, SolanaSigner};
+use pay_kit::solana_keychain::{OpenfortSigner, TransactionSigner};
 use serde::Deserialize;
 
 use crate::backend::{Approval, Custody, SigningBackend};
@@ -158,7 +158,11 @@ impl RemoteProvider for Openfort {
          (chain type: Solana / SVM), then run this command again."
     }
 
-    fn connect(&self, credentials: &Credentials, wallet_id: &str) -> Result<Box<dyn SolanaSigner>> {
+    fn connect(
+        &self,
+        credentials: &Credentials,
+        wallet_id: &str,
+    ) -> Result<Box<dyn TransactionSigner>> {
         let secret_key = credentials
             .get("secret_key")
             .ok_or_else(|| Error::Config("Missing the Openfort secret key.".to_string()))?;

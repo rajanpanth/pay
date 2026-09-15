@@ -32,7 +32,7 @@ pub mod openfort;
 
 use std::collections::BTreeMap;
 
-use pay_kit::solana_keychain::SolanaSigner;
+use pay_kit::solana_keychain::TransactionSigner;
 
 use crate::accounts::Account;
 use crate::backend::{Gate, SigningBackend, StoreParams};
@@ -121,7 +121,11 @@ pub trait RemoteProvider: SigningBackend {
     fn no_wallets_hint(&self) -> &'static str;
 
     /// Connect to a wallet, resolving and pinning its address.
-    fn connect(&self, credentials: &Credentials, wallet_id: &str) -> Result<Box<dyn SolanaSigner>>;
+    fn connect(
+        &self,
+        credentials: &Credentials,
+        wallet_id: &str,
+    ) -> Result<Box<dyn TransactionSigner>>;
 }
 
 // ── Credential storage ──────────────────────────────────────────────────────
@@ -472,7 +476,7 @@ mod tests {
                 Err(()) => Err(Error::Config("credentials rejected".to_string())),
             }
         }
-        fn connect(&self, _c: &Credentials, _w: &str) -> Result<Box<dyn SolanaSigner>> {
+        fn connect(&self, _c: &Credentials, _w: &str) -> Result<Box<dyn TransactionSigner>> {
             unimplemented!("tests only exercise the failure path")
         }
     }

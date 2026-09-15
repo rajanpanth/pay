@@ -3,7 +3,7 @@
 //! Thin wrapper around `pay_kit::x402::client::exact` for challenge detection
 //! and payment building.
 
-use pay_kit::x402::solana_keychain::SolanaSigner;
+use pay_kit::x402::solana_keychain::{SolanaSigner, TransactionSigner};
 use pay_kit::x402::solana_rpc_client::rpc_client::RpcClient;
 use pay_kit::x402::{
     PAYMENT_REQUIRED_HEADER, X402_V1_PAYMENT_REQUIRED_HEADER, X402_VERSION_FIELD, X402_VERSION_V1,
@@ -236,7 +236,7 @@ pub fn build_payment_with_override(
     let (payment_header_name, payment_header_value) = match challenge.x402_version {
         X402_VERSION_V1 => {
             let header = rt
-                .block_on(build_payment_header_v1(&signer, &rpc, requirements))
+                .block_on(build_payment_header_v1(&signer, &rpc, requirements, None))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V1_PAYMENT_HEADER, header)
         }
@@ -248,6 +248,7 @@ pub fn build_payment_with_override(
                     &rpc,
                     requirements,
                     extensions,
+                    None,
                 ))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V2_PAYMENT_HEADER, header)
@@ -483,6 +484,7 @@ pub fn build_upto_payment_with_override(
             requirements,
             expires_at,
             nonce,
+            None,
         ))
         .map_err(|e| Error::Mpp(format!("Failed to build x402 upto payment: {e}")))?;
 
@@ -574,7 +576,7 @@ pub fn build_batch_payment(
     // The advertised token program is checked against the mint's real owner:
     // every associated token address in the `open` derives from it, so trusting
     // a wrong value would escrow into accounts the program never touches.
-    let terms = batch_client::resolve_terms(&rpc, requirements)
+    let terms = batch_client::resolve_terms(&rpc, requirements, None)
         .map_err(|e| Error::Mpp(format!("batch-settlement terms rejected: {e}")))?;
 
     let (channel, payload, voucher) = match existing {
@@ -726,7 +728,7 @@ pub fn build_siwx_auth_header_with_override(
 
 fn build_siwx_header(
     challenge: &Challenge,
-    signer: &dyn SolanaSigner,
+    signer: &dyn TransactionSigner,
     network: &str,
     rt: &tokio::runtime::Runtime,
 ) -> Result<Option<(&'static str, String)>> {
@@ -943,6 +945,7 @@ mod tests {
             extra: None,
             accepted: None,
             resource_info: None,
+            transaction_versions: None,
         }
     }
 
@@ -1057,7 +1060,7 @@ mod tests {
                 "maxAmountRequired": "5000",
                 "payTo": "abc123",
                 "asset": "SOL",
-                "resource": "/test"
+                "resource": "/test",
             }]
         })
         .to_string();

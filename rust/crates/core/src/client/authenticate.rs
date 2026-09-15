@@ -17,12 +17,12 @@
 //! outgoing requests are wired separately; this module is the
 //! self-contained protocol layer.
 
+use pay_kit::mpp::solana_keychain::TransactionSigner;
 use std::sync::Arc;
 
 use pay_kit::mpp::{
     PaymentChallenge, parse_www_authenticate,
     program::subscriptions::{default_program_id, find_subscription_pda, parse_pubkey},
-    solana_keychain::SolanaSigner,
 };
 
 use crate::accounts::{AccountsStore, Subscription, SubscriptionStatus};
@@ -68,7 +68,7 @@ pub async fn sign_and_persist(
     plan_id: &str,
     program_id_override: Option<&str>,
     challenge: &PaymentChallenge,
-    signer: Arc<dyn SolanaSigner>,
+    signer: Arc<dyn TransactionSigner>,
 ) -> Result<String> {
     let plan_pubkey = parse_pubkey(plan_id, "plan_id")
         .map_err(|e| Error::Mpp(format!("Invalid plan_id: {e}")))?;

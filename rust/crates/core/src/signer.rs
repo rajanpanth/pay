@@ -9,7 +9,10 @@
 //! descriptor.
 
 use pay_kit::mpp::solana_keychain::MemorySigner;
-use pay_kit::solana_keychain::{SignTransactionResult, SignerError, SolanaSigner};
+use pay_kit::solana_keychain::{
+    SignTransactionResult, SignerError, SolanaSigner, TransactionSigner,
+};
+use solana_transaction::versioned::VersionedTransaction;
 
 use crate::accounts::{
     Account, AccountChoice, AccountsFile, AccountsStore, BackendKind, MAINNET_NETWORK,
@@ -21,10 +24,10 @@ use crate::keystore::{AuthGate, AuthIntent};
 use crate::{Error, Result};
 
 /// Signer resolved from a pay account, together with the backend it came
-/// from. Implements [`SolanaSigner`] by delegation, so both MPP and x402
-/// payment paths accept it wherever a `&dyn SolanaSigner` is expected, and
-/// exposes the backend's capabilities so those paths can pick a compatible
-/// payment scheme.
+/// from. Implements [`SolanaSigner`] and [`TransactionSigner`] by
+/// delegation, so both MPP and x402 payment paths accept it wherever a
+/// `&dyn TransactionSigner` is expected, and exposes the backend's
+/// capabilities so those paths can pick a compatible payment scheme.
 pub struct ResolvedSigner {
     backend: &'static dyn SigningBackend,
     inner: SignerImpl,
@@ -35,7 +38,7 @@ enum SignerImpl {
     Memory(Box<MemorySigner>),
     /// Any provider registered in [`crate::remote`]; pay never needs to
     /// know which one.
-    Remote(Box<dyn SolanaSigner>),
+    Remote(Box<dyn TransactionSigner>),
 }
 
 impl ResolvedSigner {
@@ -48,7 +51,10 @@ impl ResolvedSigner {
     }
 
     /// A signer that signs through a remote or hardware `backend`.
-    pub fn remote(backend: &'static dyn SigningBackend, signer: Box<dyn SolanaSigner>) -> Self {
+    pub fn remote(
+        backend: &'static dyn SigningBackend,
+        signer: Box<dyn TransactionSigner>,
+    ) -> Self {
         Self {
             backend,
             inner: SignerImpl::Remote(signer),
@@ -76,7 +82,7 @@ impl ResolvedSigner {
         self.backend.signs_raw_messages()
     }
 
-    fn as_dyn(&self) -> &dyn SolanaSigner {
+    fn as_dyn(&self) -> &dyn TransactionSigner {
         match &self.inner {
             SignerImpl::Memory(signer) => signer.as_ref(),
             SignerImpl::Remote(signer) => signer.as_ref(),
@@ -90,13 +96,6 @@ impl SolanaSigner for ResolvedSigner {
         self.as_dyn().pubkey()
     }
 
-    async fn sign_transaction(
-        &self,
-        tx: &mut solana_transaction::Transaction,
-    ) -> std::result::Result<SignTransactionResult, SignerError> {
-        self.as_dyn().sign_transaction(tx).await
-    }
-
     async fn sign_message(
         &self,
         message: &[u8],
@@ -106,6 +105,16 @@ impl SolanaSigner for ResolvedSigner {
 
     async fn is_available(&self) -> bool {
         self.as_dyn().is_available().await
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionSigner for ResolvedSigner {
+    async fn sign_transaction(
+        &self,
+        tx: &mut VersionedTransaction,
+    ) -> std::result::Result<SignTransactionResult, SignerError> {
+        self.as_dyn().sign_transaction(tx).await
     }
 }
 

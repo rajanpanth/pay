@@ -382,7 +382,7 @@ impl<'a, B: ChunkBroadcaster> PushExecutor<'a, B> {
 fn sign_off_runtime_thread(
     permit: &mut BatchSigningPermit,
     chunk_index: u32,
-    transaction: &solana_transaction::Transaction,
+    transaction: &solana_transaction::versioned::VersionedTransaction,
     last_valid_block_height: u64,
 ) -> Result<SignedChunk> {
     std::thread::scope(|scope| {

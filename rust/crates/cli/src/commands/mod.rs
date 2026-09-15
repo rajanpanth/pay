@@ -2129,6 +2129,7 @@ mod tests {
                 network: "localnet".to_string(),
                 channel_program: solana_pubkey::Pubkey::new_unique().to_string(),
                 channel_id: None,
+                transaction_versions: None,
                 recent_blockhash: Some("11111111111111111111111111111111".to_string()),
                 recent_slot: Some(1),
                 decimals: Some(6),

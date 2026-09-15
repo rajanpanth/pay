@@ -100,6 +100,10 @@ struct Opts {
 }
 
 fn main() {
+    // Telemetry constructs a reqwest client before the proxy starts. Install
+    // rustls's process-wide provider before either subsystem can initialize.
+    pay_proxy::install_crypto_provider();
+
     if commands::help::root_overview_help_requested() {
         if commands::help::args_include_no_dna() {
             no_dna::enable_for_process();
