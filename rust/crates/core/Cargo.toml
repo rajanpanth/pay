@@ -97,11 +97,12 @@ serde_yml = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "30242a4fe3b87557f3d6f1629f548e2515718242" }
 serde_json = { workspace = true }
 tower = "0.5"
 serial_test = "3"
 solana-client = "3.1"
+solana-keypair = { workspace = true }
+solana-signer = "3.0"
 
 [[test]]
 name = "metering_tests"

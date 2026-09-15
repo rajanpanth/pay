@@ -105,6 +105,10 @@ jobs:
         with:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install Surfpool CLI
+        uses: taiki-e/install-action@v2
+        with:
+          tool: surfpool@1.5.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

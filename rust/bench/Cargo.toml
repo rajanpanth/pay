@@ -62,6 +62,7 @@ opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+opentelemetry-appender-tracing = "0.32"
 
 anyhow = "1"
 async-trait = "0.1"
@@ -79,10 +80,6 @@ solana-program-pack = "3.1"
 # CPU flamegraph profiling → Pyroscope (Grafana). pprof-rs sampling backend.
 pyroscope = "0.5"
 pyroscope_pprofrs = "0.2"
-
-# Embedded validator for rehearsal (fork) runs. Same pinned rev as pay-core's
-# dev-dependency so the lock resolves to a single copy.
-surfpool-sdk = { git = "https://github.com/solana-foundation/surfpool", rev = "30242a4fe3b87557f3d6f1629f548e2515718242" }
 
 [dev-dependencies]
 base64.workspace = true

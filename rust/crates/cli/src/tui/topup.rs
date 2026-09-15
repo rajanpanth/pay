@@ -12,7 +12,7 @@ use pay_core::client::balance::{AccountBalances, ReceivedFunds};
 use qrcode::{QrCode, Version as QrVersion};
 use ratatui::Terminal;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
