@@ -21,8 +21,46 @@ Done on `feat/pay-cloud` (main plus PR #423):
   provisioning is not built. `PAY_CLOUD_LOCAL=1` targets `http://127.0.0.1:8402`, `PAY_CLOUD_URL` any other server,
   `PAY_NO_BROWSER=1` skips opening the browser.
 
-Next: Track A5 to A7 (tenant store, Openfort provisioning, the exchange
-returning a `paycloud` account) and Track B2 (the `paycloud` provider).
+- Openfort onboarding driver (`pay_cloud::drivers::openfort`, `openfort`
+  cargo feature, on by default): the page's "Continue with Openfort" sends
+  the browser to Openfort's own consent page; the fragment comes back to
+  `/onboard/openfort/callback`; the driver registers a fresh wallet secret,
+  records its public key on the project, creates a Solana backend wallet,
+  and the exchange hands the CLI `{secret_key, wallet_secret, wallet_id,
+  pubkey}`. The CLI verifies the address with Openfort and registers a
+  normal `--backend openfort` account. pay-cloud keeps nothing past the
+  five-minute session.
+
+### Decision change (2026-09-15): pay owns no custody account
+
+The earlier revision had pay-cloud own one Openfort project and a backend
+wallet per tenant, which made pay-cloud a custodian with a policy engine.
+Ludo's direction is the opposite: sign users up with the provider
+programmatically and hand them their own project. Openfort's dashboard
+already exposes the pieces its CLI uses (`/oauth/consent` returning the
+project's keys, `register-secret`, `PUT /v1/project/apikey`, `POST
+/v2/accounts/backend`), so the driver replaces six manual steps with one
+browser hop. Consequences:
+
+- Track A5 (tenant store, per-tenant wallets, policy caps) and A6 (signer
+  API) are dropped for the CLI path. The CLI signs with its own Openfort
+  credentials through PR #423's provider, gated by Touch ID as before.
+- The hosted MCP connector (Track A3, A4) still needs a place to sign for
+  a browser-only user. That becomes: the same Openfort project credentials
+  stored per tenant, which does make the connector a credential custodian
+  again. Decide before building A3 whether the connector keeps per-tenant
+  provider credentials or whether the CLI remains the only signer.
+- `OPENFORT_BASE_URL` and `OPENFORT_AUTH_PAGE_URL` (Openfort's own env
+  names) point the driver and pay-core's provider at staging or a mock.
+
+Open, to confirm with Openfort: whether `/oauth/consent` accepts a
+non-loopback `redirect_uri` (Openfort's CLI registers `127.0.0.1`), the
+exact `POST /v2/accounts/backend` request shape for SVM (the SDK sends
+`{ chainType: "SVM" }`), and whether `register-secret` accepts the CLI's
+JWT shape from a server. All three are verified only against a mock.
+
+Next: run the flow against a real Openfort project, then decide the
+connector custody question above.
 
 ## Goals
 
