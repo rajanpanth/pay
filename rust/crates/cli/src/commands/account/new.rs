@@ -400,7 +400,7 @@ fn prompt_credential(
 
 /// Platform secret store used for remote credential blobs, with the
 /// same setup-time gating fallbacks as the keypair backends.
-fn platform_credential_keystore() -> pay_core::Result<Keystore> {
+pub(crate) fn platform_credential_keystore() -> pay_core::Result<Keystore> {
     let platform = pay_core::backend::platform().ok_or_else(|| {
         pay_core::Error::Config(
             "Remote-backend accounts require a platform secret store, which is unavailable on \

@@ -19,6 +19,16 @@ use crate::remote::{CredentialField, Credentials, RemoteProvider, RemoteWallet};
 use crate::{Error, Result};
 
 const API_BASE: &str = "https://api.openfort.io";
+/// Same override Openfort's own CLI honours, for staging or a local mock.
+const API_BASE_ENV: &str = "OPENFORT_BASE_URL";
+
+fn api_base() -> String {
+    std::env::var(API_BASE_ENV)
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| API_BASE.to_string())
+}
 
 /// The Openfort remote backend.
 pub struct Openfort;
@@ -117,7 +127,7 @@ impl RemoteProvider for Openfort {
 
         let page: AccountsPage = rt.block_on(async {
             let response = client
-                .get(format!("{API_BASE}/v2/accounts?limit=100"))
+                .get(format!("{}/v2/accounts?limit=100", api_base()))
                 .bearer_auth(secret_key)
                 .send()
                 .await
@@ -156,16 +166,19 @@ impl RemoteProvider for Openfort {
             .get("wallet_secret")
             .ok_or_else(|| Error::Config("Missing the Openfort wallet secret.".to_string()))?;
 
-        let mut signer = OpenfortSigner::new(
-            secret_key.clone(),
-            wallet_id.to_string(),
-            wallet_secret.clone(),
-        )
-        .map_err(|e| {
-            Error::Config(format!(
-                "Invalid Openfort credentials for `{wallet_id}`: {e}"
-            ))
-        })?;
+        let mut signer =
+            OpenfortSigner::from_config(pay_kit::solana_keychain::openfort::OpenfortSignerConfig {
+                secret_key: secret_key.clone(),
+                account_id: wallet_id.to_string(),
+                wallet_secret: wallet_secret.clone(),
+                api_base_url: Some(api_base()),
+                http_client_config: None,
+            })
+            .map_err(|e| {
+                Error::Config(format!(
+                    "Invalid Openfort credentials for `{wallet_id}`: {e}"
+                ))
+            })?;
 
         // The payment client paths are synchronous and create their own
         // tokio runtimes for header building, so a throwaway current-thread

@@ -31,6 +31,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::oneshot;
 
 use crate::components;
+use owo_colors::OwoColorize;
 
 /// How long to wait for the browser to hit the callback.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -86,23 +87,117 @@ fn cloud_url_from(url: Option<&str>, local: Option<&str>) -> String {
     }
 }
 
-/// `pay setup --backend cloud`: link this terminal through the browser and
-/// report the outcome. Wallet provisioning is not available yet, so no
-/// account is written; the exchange result is shown as is.
-pub fn run_setup_onboarding(account: &str) -> pay_core::Result<()> {
+/// `pay setup --backend cloud`: link this terminal through the browser.
+///
+/// A `ready` result is a wallet provisioned by pay-cloud on the user's own
+/// custody account; it is registered exactly like `pay account new
+/// --backend <provider>` would: credentials in the platform secret store,
+/// the account in `accounts.yml`, after the provider confirms the address.
+/// Anything else is reported as is.
+pub fn run_setup_onboarding(account: &str, force: bool) -> pay_core::Result<()> {
     let result = run_loopback_onboarding(&OnboardRequest {
         cloud_url: default_cloud_url(),
         account: account.to_string(),
     })?;
+    if result.is_ready() {
+        return register_provisioned_account(account, &result, force);
+    }
     print_result(&result);
+    Ok(())
+}
+
+/// Store a `ready` exchange result as a remote account named `account`.
+pub fn register_provisioned_account(
+    account: &str,
+    result: &OnboardResult,
+    force: bool,
+) -> pay_core::Result<()> {
+    let provider = pay_core::remote::provider(&result.provider).ok_or_else(|| {
+        pay_core::Error::Config(format!(
+            "pay-cloud returned a wallet for `{}`, which this build of pay does not support \
+             (known: {}). Update pay and run `pay setup` again.",
+            result.provider,
+            pay_core::remote::provider_ids().join(", ")
+        ))
+    })?;
+    let wallet_id = result
+        .wallet_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| pay_core::Error::Config("pay-cloud returned no wallet id.".to_string()))?;
+    let expected_pubkey = result
+        .pubkey
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            pay_core::Error::Config("pay-cloud returned no wallet address.".to_string())
+        })?;
+    for field in provider.credential_fields() {
+        if !result.credentials.contains_key(field.key) {
+            return Err(pay_core::Error::Config(format!(
+                "pay-cloud returned no `{}` credential for {}.",
+                field.key,
+                provider.display_name()
+            )));
+        }
+    }
+    provider.validate_wallet_id(wallet_id)?;
+
+    if pay_core::remote::credentials_exist(account) && !force {
+        return Err(pay_core::Error::Config(format!(
+            "Account `{account}` already has stored credentials. Re-run with --force to replace them."
+        )));
+    }
+
+    // Confirm the credentials work and resolve to the address the page
+    // showed, before anything is written locally.
+    eprintln!(
+        "  {}",
+        format!("Verifying with {}…", provider.display_name()).dimmed()
+    );
+    let pubkey = pay_core::remote::fetch_wallet_address(provider, &result.credentials, wallet_id)?;
+    if pubkey != expected_pubkey {
+        return Err(pay_core::Error::Config(format!(
+            "{} resolves wallet `{wallet_id}` to {pubkey}, but pay-cloud reported {expected_pubkey}. \
+             Nothing was saved.",
+            provider.display_name()
+        )));
+    }
+
+    let ks = super::account::new::platform_credential_keystore()?;
+    let intent = pay_core::keystore::AuthIntent::create_account(account);
+    pay_core::remote::store_credentials(&ks, account, &result.credentials, &intent)?;
+    super::account::new::save_account_remote(account, provider.id(), &pubkey, wallet_id)?;
+
+    let mut body = format!(
+        "Account `{account}` signs through {}.\nAddress: {pubkey}\nWallet: {wallet_id}",
+        provider.display_name()
+    );
+    if let Some(project) = result.project_id.as_deref().filter(|p| !p.is_empty()) {
+        body.push_str(&format!("\nProject: {project}"));
+    }
+    body.push_str(&format!(
+        "\n\nFund it before making paid requests:\n$ {}",
+        crate::commands::topup::topup_retry_command(account)
+    ));
+    components::print_notice(components::NoticeLevel::Info, "Remote wallet ready", &body);
     Ok(())
 }
 
 fn print_result(result: &OnboardResult) {
     let mut body = format!(
-        "Email: {}\nProvider: {}\nNetwork: {}\nStatus: {}",
-        result.email, result.provider, result.network, result.status
+        "Provider: {}\nNetwork: {}\nStatus: {}",
+        result.provider, result.network, result.status
     );
+    if !result.email.is_empty() {
+        body.push_str(&format!("\nEmail: {}", result.email));
+    }
+    if let Some(wallet_id) = result.wallet_id.as_deref() {
+        body.push_str(&format!("\nWallet: {wallet_id}"));
+    }
+    if let Some(pubkey) = result.pubkey.as_deref() {
+        body.push_str(&format!("\nAddress: {pubkey}"));
+    }
     if let Some(message) = result.message.as_deref().filter(|m| !m.is_empty()) {
         body.push('\n');
         body.push_str(message);
@@ -119,6 +214,10 @@ pub struct OnboardRequest {
 
 /// Response of `POST /v1/onboard/exchange`. Every field defaults so the
 /// server can grow the payload without breaking older CLIs.
+///
+/// `status: "ready"` carries a provisioned wallet: `provider` is a
+/// `pay_core::remote` provider id, `credentials` its declared fields,
+/// `wallet_id` and `pubkey` the account to register.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct OnboardResult {
     #[serde(default)]
@@ -131,6 +230,20 @@ pub struct OnboardResult {
     pub network: String,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub wallet_id: Option<String>,
+    #[serde(default)]
+    pub pubkey: Option<String>,
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub credentials: std::collections::BTreeMap<String, String>,
+}
+
+impl OnboardResult {
+    pub fn is_ready(&self) -> bool {
+        self.status == "ready"
+    }
 }
 
 /// Link this terminal to pay-cloud from the browser (preview).

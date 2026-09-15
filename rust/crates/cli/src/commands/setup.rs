@@ -124,7 +124,7 @@ impl SetupCommand {
         // choice and funding, so none of the local keypair steps below
         // apply. Nothing is installed until provisioning returns an account.
         if backend == super::cloud_onboard::CLOUD_BACKEND_FLAG {
-            return super::cloud_onboard::run_setup_onboarding(&account_name);
+            return super::cloud_onboard::run_setup_onboarding(&account_name, self.force);
         }
 
         // Offer to install the agent skill if npx is available.
