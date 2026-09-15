@@ -1247,6 +1247,7 @@ impl<S: PaymentState> PaymentGate<S> {
             realm,
             fee_payer,
             fee_payer_signer: signer.clone(),
+            store: self.state.subscription_store(),
         };
 
         // Build the 402: subscription challenge + optional authenticate challenge.

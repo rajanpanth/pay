@@ -191,8 +191,8 @@ impl std::fmt::Display for SubscriptionStatus {
 /// `SubscriptionReceiptExtensions` without lossy reformatting.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Subscription {
-    /// Base58 of the on-chain `SubscriptionDelegation` PDA — the stable
-    /// identifier returned in `Payment-Receipt.subscriptionId`.
+    /// Base58 of the on-chain `SubscriptionDelegation` PDA returned in
+    /// `Payment-Receipt.subscriptionDelegation`.
     pub subscription_id: String,
 
     /// Base58 of the on-chain `Plan` PDA (the spec's `externalId`).

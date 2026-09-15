@@ -18,9 +18,10 @@ network_tests = []
 # Activates openssl-sys/vendored which is pulled in transitively by
 # solana-rpc-client → reqwest → native-tls → openssl-sys.
 vendored-openssl = ["openssl-sys/vendored"]
-# Durable MPP session state backed by Redis. Runtime selection still requires
-# PAY_MPP_REDIS_URL; without it the in-memory store remains the default.
-redis-session-store = ["pay-kit/redis-store"]
+# Durable MPP session state and subscription proof bindings backed by Redis.
+# Runtime selection still requires PAY_MPP_REDIS_URL; without it the in-memory
+# stores remain the default.
+redis-session-store = ["pay-kit/redis-store", "dep:redis"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
@@ -64,6 +65,7 @@ five8 = { workspace = true }
 blake3 = { workspace = true }
 dashmap = "5.5"
 reqwest = { workspace = true, features = ["json"] }
+redis = { version = "0.32", features = ["aio", "tokio-comp", "connection-manager"], optional = true }
 pay-keystore = { workspace = true }
 pay-kit = { workspace = true }
 http-body = { workspace = true }

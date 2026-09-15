@@ -129,6 +129,7 @@ mod tests {
             realm: Some("api.example.com"),
             fee_payer: false,
             fee_payer_signer: None,
+            store: None,
         }
     }
 

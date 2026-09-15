@@ -13,12 +13,8 @@
 //! `mpp-specs/specs/methods/solana/draft-solana-subscription-00.md` for the
 //! authoritative wire shapes.
 
-use pay_kit::mpp::client::{
-    BuildSubscriptionActivationOptions, SubscriptionMethodDetails,
-    build_subscription_activation_transaction_with_options,
-};
+use pay_kit::mpp::client::{SubscriptionMethodDetails, build_subscription_activation_credential};
 use pay_kit::mpp::format_authorization;
-use pay_kit::mpp::protocol::core::PaymentCredential;
 use pay_kit::mpp::protocol::intents::{
     SubscriptionPeriodUnit, SubscriptionReceiptExtensions, SubscriptionRequest,
 };
@@ -337,20 +333,13 @@ pub fn build_credential_with_authenticate_and_override(
         }
     }
 
-    let payload = rt
-        .block_on(build_subscription_activation_transaction_with_options(
-            &signer,
-            &rpc,
-            &decoded.method_details,
-            BuildSubscriptionActivationOptions {
-                external_id: decoded.request.external_id.clone(),
-                ..Default::default()
-            },
+    let activation = rt
+        .block_on(build_subscription_activation_credential(
+            &signer, &rpc, challenge,
         ))
-        .map_err(|e| Error::Mpp(format!("Failed to build activation transaction: {e}")))?;
+        .map_err(|e| Error::Mpp(format!("Failed to build activation credential: {e}")))?;
 
-    let credential = PaymentCredential::new(challenge.to_echo(), payload);
-    let authorization = format_authorization(&credential)
+    let authorization = format_authorization(&activation.credential)
         .map_err(|e| Error::Mpp(format!("Failed to format subscription credential: {e}")))?;
 
     // Account name resolution: the override wins, else we re-read the
@@ -501,7 +490,7 @@ fn subscription_from_built_and_extensions(
     parsed: &ParsedSubscriptionReceipt,
 ) -> Subscription {
     Subscription {
-        subscription_id: parsed.extensions.subscription_id.clone(),
+        subscription_id: parsed.extensions.subscription_delegation.clone(),
         plan_id: built.decoded.method_details.plan_address.clone(),
         program_id: if built.decoded.method_details.subscription_program.as_deref()
             == Some(pay_kit::mpp::program::subscriptions::SUBSCRIPTIONS_PROGRAM_ID)
@@ -894,7 +883,7 @@ mod tests {
             "status": "success",
             "timestamp": "2026-01-15T12:03:10Z",
             "reference": "5J8signature",
-            "subscriptionId": "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE",
+            "subscriptionId": "opaque-subscription-id-123",
             "subscriptionDelegation": "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE",
             "periodIndex": 0,
             "periodStart": "2026-01-15T12:03:10Z",
@@ -907,12 +896,34 @@ mod tests {
         assert_eq!(parsed.timestamp.as_deref(), Some("2026-01-15T12:03:10Z"));
         assert_eq!(
             parsed.extensions.subscription_id,
+            "opaque-subscription-id-123"
+        );
+        assert_eq!(
+            parsed.extensions.subscription_delegation,
             "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE"
         );
         assert_eq!(parsed.extensions.period_index, 0);
         assert_eq!(
             parsed.extensions.expires_at.as_deref(),
             Some("2026-07-14T12:00:00Z")
+        );
+
+        let built = BuiltCredential {
+            authorization: String::new(),
+            decoded: decode(&subscription_challenge("mainnet")).unwrap(),
+            subscriber: RECIPIENT.to_string(),
+            account_name: "default".to_string(),
+            network: "mainnet".to_string(),
+            ephemeral_notice: None,
+            resource_url: None,
+            description: None,
+            authenticate_token: None,
+            authenticate_expires_at: None,
+        };
+        let subscription = subscription_from_built_and_extensions(&built, &parsed);
+        assert_eq!(
+            subscription.subscription_id,
+            "BXQGmO5VwTrl5RfFr6Y8XQZ4nPj9QqMOiKkRn3pZ4ZE"
         );
     }
 

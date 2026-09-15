@@ -12,6 +12,7 @@
 //! middleware surfaces as a 501.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use pay_kit::mpp::SubscriptionPeriodUnit;
 use pay_kit::mpp::server::{SubscriptionConfig as SdkSubscriptionConfig, SubscriptionServer};
@@ -59,6 +60,145 @@ pub struct OperatorDefaults<'a> {
     /// from `PaymentState::fee_payer_signer`.
     pub fee_payer_signer:
         Option<std::sync::Arc<dyn pay_kit::mpp::solana_keychain::TransactionSigner>>,
+    /// Shared replay/proof store. The gateway supplies a Redis-backed store
+    /// when configured, and one process-wide memory store otherwise.
+    pub store: Option<Arc<dyn pay_kit::mpp::store::Store>>,
+}
+
+/// Durable subscription proof and replay store for multi-instance gateways.
+#[cfg(feature = "redis-session-store")]
+#[derive(Clone)]
+pub struct RedisSubscriptionStore {
+    connection: redis::aio::ConnectionManager,
+    key_prefix: String,
+}
+
+#[cfg(feature = "redis-session-store")]
+impl RedisSubscriptionStore {
+    pub async fn connect(redis_url: &str, key_prefix: impl Into<String>) -> Result<Self> {
+        let client = redis::Client::open(redis_url)
+            .map_err(|e| Error::Config(format!("invalid subscription Redis URL: {e}")))?;
+        let connection = client.get_connection_manager().await.map_err(|e| {
+            Error::Config(format!("failed to connect subscription Redis store: {e}"))
+        })?;
+        Ok(Self {
+            connection,
+            key_prefix: key_prefix.into(),
+        })
+    }
+
+    fn key(&self, key: &str) -> String {
+        format!("{}{key}", self.key_prefix)
+    }
+}
+
+#[cfg(feature = "redis-session-store")]
+impl pay_kit::mpp::store::Store for RedisSubscriptionStore {
+    fn get(
+        &self,
+        key: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<
+                        Option<serde_json::Value>,
+                        pay_kit::mpp::store::StoreError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        let mut connection = self.connection.clone();
+        let key = self.key(key);
+        Box::pin(async move {
+            let raw: Option<String> = redis::cmd("GET")
+                .arg(key)
+                .query_async(&mut connection)
+                .await
+                .map_err(|e| pay_kit::mpp::store::StoreError::Internal(e.to_string()))?;
+            raw.map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|e| pay_kit::mpp::store::StoreError::Serialization(e.to_string()))
+            })
+            .transpose()
+        })
+    }
+
+    fn put(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<(), pay_kit::mpp::store::StoreError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let mut connection = self.connection.clone();
+        let key = self.key(key);
+        Box::pin(async move {
+            let value = serde_json::to_string(&value)
+                .map_err(|e| pay_kit::mpp::store::StoreError::Serialization(e.to_string()))?;
+            redis::cmd("SET")
+                .arg(key)
+                .arg(value)
+                .query_async::<()>(&mut connection)
+                .await
+                .map_err(|e| pay_kit::mpp::store::StoreError::Internal(e.to_string()))
+        })
+    }
+
+    fn delete(
+        &self,
+        key: &str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<(), pay_kit::mpp::store::StoreError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let mut connection = self.connection.clone();
+        let key = self.key(key);
+        Box::pin(async move {
+            redis::cmd("DEL")
+                .arg(key)
+                .query_async::<()>(&mut connection)
+                .await
+                .map_err(|e| pay_kit::mpp::store::StoreError::Internal(e.to_string()))
+        })
+    }
+
+    fn put_if_absent(
+        &self,
+        key: &str,
+        value: serde_json::Value,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = std::result::Result<bool, pay_kit::mpp::store::StoreError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let mut connection = self.connection.clone();
+        let key = self.key(key);
+        Box::pin(async move {
+            let value = serde_json::to_string(&value)
+                .map_err(|e| pay_kit::mpp::store::StoreError::Serialization(e.to_string()))?;
+            let result: Option<String> = redis::cmd("SET")
+                .arg(key)
+                .arg(value)
+                .arg("NX")
+                .query_async(&mut connection)
+                .await
+                .map_err(|e| pay_kit::mpp::store::StoreError::Internal(e.to_string()))?;
+            Ok(result.is_some())
+        })
+    }
 }
 
 /// Resolve `(amount_base_units, decimals, mint_b58)` from the endpoint
@@ -195,7 +335,7 @@ pub fn build_handler(
         } else {
             None
         },
-        store: None,
+        store: defaults.store.clone(),
         // The on-chain Plan terms (numeric id, bump, created_at) are
         // populated by pay-side spec/yaml plumbing; for now we leave
         // them None and the client falls back to RPC-fetching the Plan.
@@ -529,6 +669,7 @@ mod tests {
             realm: Some("test-realm"),
             fee_payer: false,
             fee_payer_signer: None,
+            store: None,
         }
     }
 

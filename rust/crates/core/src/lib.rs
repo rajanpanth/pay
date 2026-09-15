@@ -80,6 +80,12 @@ pub trait PaymentState: Clone + Send + Sync + 'static {
         None
     }
 
+    /// Shared store for subscription proof bindings and activation replay
+    /// protection. Production hosts should return a durable implementation.
+    fn subscription_store(&self) -> Option<Arc<dyn pay_kit::mpp::store::Store>> {
+        None
+    }
+
     /// x402 `exact` handler, when the server accepts x402 payments.
     fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
         None

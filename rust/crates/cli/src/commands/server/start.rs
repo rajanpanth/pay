@@ -132,6 +132,41 @@ async fn session_channel_store()
     .await
 }
 
+async fn subscription_store() -> pay_core::Result<Arc<dyn pay_kit::mpp::store::Store>> {
+    let redis_url = ["PAY_MPP_REDIS_URL", "PAY_SESSION_REDIS_URL"]
+        .into_iter()
+        .find_map(|var| {
+            std::env::var(var)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        });
+
+    let Some(redis_url) = redis_url else {
+        return Ok(Arc::new(pay_kit::mpp::store::MemoryStore::new()));
+    };
+
+    #[cfg(feature = "redis-session-store")]
+    {
+        let store = pay_core::server::subscription::RedisSubscriptionStore::connect(
+            &redis_url,
+            "pay:subscription:v1:",
+        )
+        .await?;
+        tracing::info!("using durable Redis store for subscription proofs");
+        Ok(Arc::new(store))
+    }
+
+    #[cfg(not(feature = "redis-session-store"))]
+    {
+        let _ = redis_url;
+        Err(pay_core::Error::Config(
+            "an MPP Redis URL is set, but this pay binary was built without the redis-session-store feature"
+                .to_string(),
+        ))
+    }
+}
+
 /// Resolve the channel store backing x402 `batch-settlement`.
 ///
 /// The store holds the only record of what a client has been charged: an
@@ -841,6 +876,7 @@ struct AppState {
     browser_rpc_url: Option<String>,
     fee_payer_wallet: Option<FeePayerWallet>,
     fee_payer_signer: Option<Arc<dyn TransactionSigner>>,
+    subscription_store: Arc<dyn pay_kit::mpp::store::Store>,
     x402: Option<pay_kit::x402::server::X402>,
     x402_upto: Option<pay_kit::x402::server::X402Upto>,
     x402_batch: Option<pay_kit::x402::server::X402BatchSettlement>,
@@ -877,6 +913,9 @@ impl PaymentState for AppState {
     }
     fn fee_payer_signer(&self) -> Option<Arc<dyn TransactionSigner>> {
         self.fee_payer_signer.clone()
+    }
+    fn subscription_store(&self) -> Option<Arc<dyn pay_kit::mpp::store::Store>> {
+        Some(self.subscription_store.clone())
     }
     fn x402(&self) -> Option<&pay_kit::x402::server::X402> {
         self.x402.as_ref()
@@ -1740,6 +1779,7 @@ impl StartCommand {
             // MPP_CHALLENGE_BINDING_SECRET for the subscription middleware —
             // see `payments::init_challenge_binding_secret`.)
             let challenge_binding_secret = payments::init_challenge_binding_secret();
+            let subscription_store = subscription_store().await?;
 
             payments::ensure_payout_recipient_token_accounts(
                 &payout_recipients,
@@ -2433,6 +2473,7 @@ impl StartCommand {
                 browser_rpc_url: Some(BROWSER_RPC_PROXY_PATH.to_string()),
                 fee_payer_wallet,
                 fee_payer_signer: fee_payer_signer.clone(),
+                subscription_store,
                 x402,
                 x402_upto,
                 x402_batch,

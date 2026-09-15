@@ -56,6 +56,7 @@ fn defaults<'a>() -> sub_server::OperatorDefaults<'a> {
         realm: Some("test-realm"),
         fee_payer: false,
         fee_payer_signer: None,
+        store: None,
     }
 }
 
