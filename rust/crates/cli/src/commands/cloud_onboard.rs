@@ -36,6 +36,8 @@ use crate::components;
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Timeout for the code exchange request.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for the pre-flight `/health` probe.
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// Never bind the callback listener to a LAN-reachable interface.
 const LOOPBACK_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// Set to skip `webbrowser::open` (headless shells, scripted tests).
@@ -156,6 +158,7 @@ impl CloudOnboardCommand {
 /// result.
 pub fn run_loopback_onboarding(req: &OnboardRequest) -> pay_core::Result<OnboardResult> {
     let cloud_url = req.cloud_url.trim_end_matches('/').to_string();
+    check_cloud_reachable(&cloud_url)?;
     let pkce = Pkce::generate();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -183,6 +186,38 @@ pub fn run_loopback_onboarding(req: &OnboardRequest) -> pay_core::Result<Onboard
     drop(rt);
 
     exchange_code(&cloud_url, &code, &pkce.code_verifier)
+}
+
+/// Confirm pay-cloud answers before binding a listener or opening the
+/// browser, so a stopped local server is one clear error instead of a
+/// browser tab that cannot connect and a CLI that waits ten minutes.
+fn check_cloud_reachable(cloud_url: &str) -> pay_core::Result<()> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HEALTH_TIMEOUT)
+        .build()
+        .map_err(|e| pay_core::Error::Config(format!("http client: {e}")))?;
+    let health = format!("{cloud_url}/health");
+    match client.get(&health).send() {
+        Ok(response) if response.status().is_success() => Ok(()),
+        Ok(response) => Err(pay_core::Error::Config(format!(
+            "pay-cloud at {cloud_url} answered {} on /health. {}",
+            response.status(),
+            unreachable_hint(cloud_url)
+        ))),
+        Err(e) => Err(pay_core::Error::Config(format!(
+            "Cannot reach pay-cloud at {cloud_url}: {e}. {}",
+            unreachable_hint(cloud_url)
+        ))),
+    }
+}
+
+fn unreachable_hint(cloud_url: &str) -> String {
+    if cloud_url == LOCAL_CLOUD_URL {
+        "Start the local server first: `cargo run -p pay-cloud` (from rust/), then retry."
+            .to_string()
+    } else {
+        format!("Check the URL, or set {CLOUD_LOCAL_ENV}=1 to use a local pay-cloud.")
+    }
 }
 
 // ── PKCE ──────────────────────────────────────────────────────────────────
@@ -462,6 +497,31 @@ pub fn exchange_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unreachable_cloud_fails_before_opening_anything() {
+        // Bind and immediately drop a port so nothing listens on it.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://127.0.0.1:{port}");
+        let err = run_loopback_onboarding(&OnboardRequest {
+            cloud_url: url.clone(),
+            account: "t".into(),
+        })
+        .err()
+        .map(|e| e.to_string())
+        .expect("must fail fast");
+        assert!(err.contains("Cannot reach pay-cloud"), "{err}");
+        assert!(err.contains(&url), "{err}");
+        assert!(err.contains("PAY_CLOUD_LOCAL"), "{err}");
+        assert_eq!(
+            unreachable_hint(LOCAL_CLOUD_URL),
+            "Start the local server first: `cargo run -p pay-cloud` (from rust/), then retry."
+        );
+    }
 
     #[test]
     fn cloud_url_prefers_explicit_then_local_then_production() {
