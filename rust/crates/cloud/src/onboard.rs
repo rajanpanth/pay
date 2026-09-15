@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::AppState;
+use crate::drivers::{DriverError, ProvisionedWallet};
 
 /// How long a minted code stays exchangeable.
 pub const SESSION_TTL: Duration = Duration::from_secs(5 * 60);
@@ -39,22 +40,36 @@ pub struct OnboardSession {
     /// One-time code (32 random bytes, base64url, no padding). Only its
     /// SHA-256 is used as the store key.
     pub code: String,
-    pub email: String,
+    /// Email, when the page collected one (no-provider stub path).
+    pub email: Option<String>,
+    /// CLI CSRF state; also the `state` echoed by the provider's consent page.
     pub state: String,
     pub callback: String,
     pub code_challenge: String,
+    /// Wallet driver chosen on the page (`openfort`), if any.
+    pub provider: Option<String>,
+    /// Filled by `/api/onboard/{provider}/complete` once the driver has run.
+    pub wallet: Option<ProvisionedWallet>,
     pub created_at: Instant,
 }
 
 impl OnboardSession {
     /// Mint a fresh session with a random code, timestamped now.
-    pub fn new(email: String, state: String, callback: String, code_challenge: String) -> Self {
+    pub fn new(
+        email: Option<String>,
+        state: String,
+        callback: String,
+        code_challenge: String,
+        provider: Option<String>,
+    ) -> Self {
         Self {
             code: random_token(),
             email,
             state,
             callback,
             code_challenge,
+            provider,
+            wallet: None,
             created_at: Instant::now(),
         }
     }
@@ -77,7 +92,13 @@ impl OnboardSession {
 /// Body of `POST /api/onboard/start`.
 #[derive(Debug, Deserialize)]
 pub struct StartRequest {
-    pub email: String,
+    /// Required when no `provider` is given.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// Wallet driver id (`openfort`). When set, the response carries the
+    /// provider's consent URL instead of a redirect.
+    #[serde(default)]
+    pub provider: Option<String>,
     pub callback: String,
     pub state: String,
     pub code_challenge: String,
@@ -91,7 +112,28 @@ pub struct StartRequest {
 
 #[derive(Debug, Serialize)]
 pub struct StartResponse {
+    /// Straight back to the CLI (no-provider stub path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub redirect: Option<String>,
+    /// Provider consent page to send the browser to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+}
+
+/// Body of `POST /api/onboard/{provider}/complete`: the URL fragment the
+/// consent page redirected back with, verbatim.
+#[derive(Debug, Deserialize)]
+pub struct CompleteRequest {
+    pub fragment: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompleteResponse {
     pub redirect: String,
+    pub provider: String,
+    pub address: String,
 }
 
 /// Body of `POST /v1/onboard/exchange`.
@@ -101,14 +143,33 @@ pub struct ExchangeRequest {
     pub code_verifier: String,
 }
 
-/// Stub result: no wallet provisioning yet.
+/// Result of `POST /v1/onboard/exchange`.
+///
+/// `ready` carries everything the CLI needs to register a remote account:
+/// the provider id, its credential fields, the wallet id and address. It is
+/// returned once; the session is gone afterwards.
 #[derive(Debug, Serialize)]
-pub struct ExchangeResponse {
-    pub provider: &'static str,
-    pub status: &'static str,
-    pub email: String,
-    pub network: &'static str,
-    pub message: &'static str,
+#[serde(untagged)]
+pub enum ExchangeResponse {
+    Ready {
+        provider: String,
+        status: &'static str,
+        network: &'static str,
+        wallet_id: String,
+        pubkey: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+        credentials: std::collections::BTreeMap<String, String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
+    },
+    Pending {
+        provider: &'static str,
+        status: &'static str,
+        email: String,
+        network: &'static str,
+        message: &'static str,
+    },
 }
 
 /// JSON error envelope: `{ "error": "<code>", "message": "..." }`.
@@ -134,6 +195,27 @@ impl ApiError {
             "invalid_grant",
             "The authorization code is unknown, expired, already used, or the PKCE verifier does not match.",
         )
+    }
+
+    fn from_driver(err: DriverError) -> Self {
+        let status = match &err {
+            DriverError::InvalidGrant(_) => StatusCode::BAD_REQUEST,
+            DriverError::Rejected { .. } | DriverError::Protocol { .. } => StatusCode::BAD_GATEWAY,
+            DriverError::Unreachable { .. } => StatusCode::BAD_GATEWAY,
+            DriverError::Crypto(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        let code = match &err {
+            DriverError::InvalidGrant(_) => "invalid_consent",
+            DriverError::Rejected { .. } => "provider_rejected",
+            DriverError::Unreachable { .. } => "provider_unreachable",
+            DriverError::Protocol { .. } => "provider_protocol",
+            DriverError::Crypto(_) => "internal",
+        };
+        Self {
+            status,
+            error: code,
+            message: err.to_string(),
+        }
     }
 }
 
@@ -264,27 +346,135 @@ fn parse_json<T: for<'de> Deserialize<'de>>(body: &Bytes) -> Result<T, ApiError>
 }
 
 /// `POST /api/onboard/start`
+///
+/// With a `provider`, opens a session and returns the provider's consent
+/// URL; the browser comes back through `/onboard/{provider}/callback` and
+/// `/api/onboard/{provider}/complete`. Without one, the email-only stub
+/// path returns straight to the CLI.
 pub async fn start(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Result<Json<StartResponse>, ApiError> {
     let req: StartRequest = parse_json(&body)?;
-    validate_email(&req.email)?;
     validate_callback(&req.callback)?;
     validate_state(&req.state)?;
     validate_code_challenge(&req.code_challenge)?;
+    if let Some(email) = req.email.as_deref() {
+        validate_email(email)?;
+    }
 
-    let session = OnboardSession::new(req.email, req.state, req.callback, req.code_challenge);
+    let log_context = |session: &OnboardSession| {
+        tracing::info!(
+            provider = session.provider.as_deref().unwrap_or("-"),
+            email = session.email.as_deref().unwrap_or("-"),
+            account = req.account.as_deref().unwrap_or("-"),
+            host = req.host.as_deref().unwrap_or("-"),
+            cli = req.cli.as_deref().unwrap_or("-"),
+            "onboarding started"
+        );
+    };
+
+    match req.provider.as_deref() {
+        Some(provider_id) => {
+            let driver = state.driver(provider_id).ok_or_else(|| {
+                ApiError::bad_request(
+                    "unknown_provider",
+                    format!("No wallet provider `{provider_id}` is available."),
+                )
+            })?;
+            let session = OnboardSession::new(
+                req.email.clone(),
+                req.state.clone(),
+                req.callback.clone(),
+                req.code_challenge.clone(),
+                Some(driver.id().to_string()),
+            );
+            let redirect_uri = state.consent_redirect_uri(driver.id());
+            let consent = driver.consent_url(&redirect_uri, &session.state);
+            log_context(&session);
+            state.insert_session(session);
+            Ok(Json(StartResponse {
+                redirect: None,
+                consent: Some(consent),
+                provider: Some(driver.id().to_string()),
+            }))
+        }
+        None => {
+            let email = req.email.clone().ok_or_else(|| {
+                ApiError::bad_request("invalid_email", "Enter a valid email address.")
+            })?;
+            let session = OnboardSession::new(
+                Some(email),
+                req.state.clone(),
+                req.callback.clone(),
+                req.code_challenge.clone(),
+                None,
+            );
+            let redirect = session.redirect_url();
+            log_context(&session);
+            state.insert_session(session);
+            Ok(Json(StartResponse {
+                redirect: Some(redirect),
+                consent: None,
+                provider: None,
+            }))
+        }
+    }
+}
+
+/// `POST /api/onboard/{provider}/complete`
+///
+/// The consent page redirected the browser back with the grant in the URL
+/// fragment; the page posts that fragment here. The driver turns it into a
+/// wallet, the wallet is parked on the session, and the browser is sent to
+/// the CLI's callback with the one-time code.
+pub async fn complete(
+    State(state): State<AppState>,
+    Path(provider_id): Path<String>,
+    body: Bytes,
+) -> Result<Json<CompleteResponse>, ApiError> {
+    let req: CompleteRequest = parse_json(&body)?;
+    let driver = state.driver(&provider_id).ok_or_else(|| {
+        ApiError::bad_request(
+            "unknown_provider",
+            format!("No wallet provider `{provider_id}` is available."),
+        )
+    })?;
+    let (grant, echoed_state) = driver
+        .parse_grant(&req.fragment)
+        .map_err(ApiError::from_driver)?;
+
+    let session = state
+        .session_by_state(&echoed_state)
+        .filter(|s| s.provider.as_deref() == Some(driver.id()))
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "unknown_session",
+                "This sign-in does not match a pending `pay setup`. Run `pay setup` again.",
+            )
+        })?;
+    if session.wallet.is_some() {
+        return Err(ApiError::bad_request(
+            "already_completed",
+            "This sign-in was already used. Return to your terminal.",
+        ));
+    }
+
+    let wallet = driver
+        .provision(&grant)
+        .await
+        .map_err(ApiError::from_driver)?;
     let redirect = session.redirect_url();
-    tracing::info!(
-        email = %session.email,
-        account = req.account.as_deref().unwrap_or("-"),
-        host = req.host.as_deref().unwrap_or("-"),
-        cli = req.cli.as_deref().unwrap_or("-"),
-        "onboarding started"
-    );
-    state.insert_session(session);
-    Ok(Json(StartResponse { redirect }))
+    let address = wallet.address.clone();
+    tracing::info!(provider = driver.id(), address = %address, "wallet provisioned");
+    if !state.attach_wallet(&echoed_state, wallet) {
+        return Err(ApiError::invalid_grant());
+    }
+    Ok(Json(CompleteResponse {
+        redirect,
+        provider: driver.id().to_string(),
+        address,
+    }))
 }
 
 /// `POST /v1/onboard/exchange`
@@ -299,16 +489,32 @@ pub async fn exchange(
         .take_session(&req.code)
         .ok_or_else(ApiError::invalid_grant)?;
     if !verify_pkce(&req.code_verifier, &session.code_challenge) {
-        tracing::warn!(email = %session.email, "PKCE verifier mismatch");
+        tracing::warn!(state = %session.state, "PKCE verifier mismatch");
         return Err(ApiError::invalid_grant());
     }
-    tracing::info!(email = %session.email, "onboarding code exchanged");
-    Ok(Json(ExchangeResponse {
-        provider: "pay-cloud",
-        status: "pending",
-        email: session.email,
-        network: NETWORK,
-        message: "Wallet provisioning is not available yet.",
+    tracing::info!(
+        provider = session.provider.as_deref().unwrap_or("-"),
+        ready = session.wallet.is_some(),
+        "onboarding code exchanged"
+    );
+    Ok(Json(match session.wallet {
+        Some(wallet) => ExchangeResponse::Ready {
+            provider: wallet.provider.to_string(),
+            status: "ready",
+            network: NETWORK,
+            wallet_id: wallet.wallet_id,
+            pubkey: wallet.address,
+            project_id: wallet.project_id,
+            credentials: wallet.credentials,
+            email: session.email,
+        },
+        None => ExchangeResponse::Pending {
+            provider: "pay-cloud",
+            status: "pending",
+            email: session.email.unwrap_or_default(),
+            network: NETWORK,
+            message: "Wallet provisioning is not available yet.",
+        },
     }))
 }
 
@@ -418,10 +624,12 @@ mod tests {
     fn session(created_at: Instant) -> OnboardSession {
         OnboardSession {
             code: random_token(),
-            email: "a@b.co".into(),
+            email: Some("a@b.co".into()),
             state: "s".repeat(16),
             callback: "http://127.0.0.1:1/callback".into(),
             code_challenge: RFC_CHALLENGE.into(),
+            provider: None,
+            wallet: None,
             created_at,
         }
     }
@@ -434,7 +642,7 @@ mod tests {
         assert!(!fresh.is_expired_at(now + SESSION_TTL));
         assert!(fresh.is_expired_at(now + SESSION_TTL + Duration::from_secs(1)));
 
-        let state = AppState::new();
+        let state = AppState::with_drivers("http://cloud.test", Vec::new());
         let expired = session(
             now.checked_sub(SESSION_TTL + Duration::from_secs(1))
                 .expect("clock far enough from epoch"),
@@ -446,7 +654,7 @@ mod tests {
 
     #[test]
     fn insert_purges_expired_sessions() {
-        let state = AppState::new();
+        let state = AppState::with_drivers("http://cloud.test", Vec::new());
         let now = Instant::now();
         let fresh_a = session(now);
         let code_a = fresh_a.code.clone();
@@ -468,7 +676,7 @@ mod tests {
 
     #[test]
     fn take_session_is_single_use() {
-        let state = AppState::new();
+        let state = AppState::with_drivers("http://cloud.test", Vec::new());
         let s = session(Instant::now());
         let code = s.code.clone();
         state.insert_session(s);

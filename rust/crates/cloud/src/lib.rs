@@ -3,12 +3,17 @@
 //! Serves the embedded onboarding page (`web-ui/dist-cloud`, compiled in via
 //! `include_dir!`) and two JSON endpoints:
 //!
-//! - `POST /api/onboard/start`   — page → server: mint a one-time code.
-//! - `POST /v1/onboard/exchange` — CLI → server: redeem the code with PKCE.
+//! - `POST /api/onboard/start` — page → server: open a session; with a
+//!   `provider`, returns that provider's consent URL.
+//! - `POST /api/onboard/{provider}/complete` — page → server: the consent
+//!   fragment; the driver provisions a wallet onto the session.
+//! - `POST /v1/onboard/exchange` — CLI → server: redeem the code with PKCE
+//!   and receive the wallet's credentials, once.
 //!
-//! No wallet provisioning yet: the exchange returns a `pending` stub. State
-//! is in-memory; sessions expire after [`onboard::SESSION_TTL`].
+//! State is in-memory; sessions expire after [`onboard::SESSION_TTL`].
+//! Wallet drivers live in [`drivers`], each behind a cargo feature.
 
+pub mod drivers;
 pub mod onboard;
 
 use std::collections::HashMap;
@@ -28,22 +33,67 @@ pub use onboard::{OnboardSession, SESSION_TTL};
 
 static ASSETS: Dir<'_> = include_dir!("$OUT_DIR/cloud-dist");
 
-/// Shared server state: pending sessions keyed by `sha256(code)` hex.
-#[derive(Clone, Default)]
+/// Shared server state: pending sessions keyed by `sha256(code)` hex, an
+/// index from CLI `state` to that key (the consent page echoes `state`),
+/// the compiled-in wallet drivers, and the public base URL consent pages
+/// redirect back to.
+#[derive(Clone)]
 pub struct AppState {
     sessions: Arc<Mutex<HashMap<String, OnboardSession>>>,
+    by_state: Arc<Mutex<HashMap<String, String>>>,
+    drivers: Arc<Vec<Box<dyn drivers::WalletDriver>>>,
+    public_url: String,
 }
 
 impl AppState {
-    pub fn new() -> Self {
-        Self::default()
+    /// State with every compiled-in driver. `public_url` is how browsers
+    /// reach this server, e.g. `https://cloud.pay.sh` or
+    /// `http://127.0.0.1:8402`.
+    pub fn new(public_url: impl Into<String>) -> Self {
+        Self::with_drivers(public_url, drivers::all())
+    }
+
+    /// State with an explicit driver set (tests inject a fake).
+    pub fn with_drivers(
+        public_url: impl Into<String>,
+        drivers: Vec<Box<dyn drivers::WalletDriver>>,
+    ) -> Self {
+        Self {
+            sessions: Arc::default(),
+            by_state: Arc::default(),
+            drivers: Arc::new(drivers),
+            public_url: public_url.into().trim_end_matches('/').to_string(),
+        }
+    }
+
+    pub fn public_url(&self) -> &str {
+        &self.public_url
+    }
+
+    /// Where a provider's consent page should send the browser back.
+    pub fn consent_redirect_uri(&self, provider_id: &str) -> String {
+        format!("{}/onboard/{provider_id}/callback", self.public_url)
+    }
+
+    pub fn driver(&self, id: &str) -> Option<&dyn drivers::WalletDriver> {
+        self.drivers
+            .iter()
+            .find(|d| d.id() == id)
+            .map(|d| d.as_ref())
+    }
+
+    pub fn driver_ids(&self) -> Vec<&'static str> {
+        self.drivers.iter().map(|d| d.id()).collect()
     }
 
     /// Store a session, purging expired ones first.
     pub fn insert_session(&self, session: OnboardSession) {
         let now = Instant::now();
         let mut sessions = self.sessions.lock().unwrap();
+        let mut by_state = self.by_state.lock().unwrap();
         sessions.retain(|_, s| !s.is_expired_at(now));
+        by_state.retain(|_, key| sessions.contains_key(key));
+        by_state.insert(session.state.clone(), session.key());
         sessions.insert(session.key(), session);
     }
 
@@ -52,7 +102,30 @@ impl AppState {
     pub fn take_session(&self, code: &str) -> Option<OnboardSession> {
         let key = onboard::sha256_hex(code);
         let session = self.sessions.lock().unwrap().remove(&key)?;
+        self.by_state.lock().unwrap().remove(&session.state);
         (!session.is_expired_at(Instant::now())).then_some(session)
+    }
+
+    /// A live session by its CLI `state`, cloned.
+    pub fn session_by_state(&self, state: &str) -> Option<OnboardSession> {
+        let key = self.by_state.lock().unwrap().get(state)?.clone();
+        let session = self.sessions.lock().unwrap().get(&key)?.clone();
+        (!session.is_expired_at(Instant::now())).then_some(session)
+    }
+
+    /// Park a provisioned wallet on the session for `state`. False when the
+    /// session is gone.
+    pub fn attach_wallet(&self, state: &str, wallet: drivers::ProvisionedWallet) -> bool {
+        let Some(key) = self.by_state.lock().unwrap().get(state).cloned() else {
+            return false;
+        };
+        match self.sessions.lock().unwrap().get_mut(&key) {
+            Some(session) => {
+                session.wallet = Some(wallet);
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn session_count(&self) -> usize {
@@ -65,6 +138,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/onboard/start", post(onboard::start))
+        .route("/api/onboard/{provider}/complete", post(onboard::complete))
         .route("/v1/onboard/exchange", post(onboard::exchange))
         .route("/", get(serve_index))
         .route("/onboard", get(serve_index))
@@ -148,6 +222,67 @@ mod tests {
     const RFC_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
     const STATE: &str = "abcdefghijklmnopqrstuvwxyz012345";
     const CALLBACK: &str = "http://127.0.0.1:53211/callback";
+    const PUBLIC_URL: &str = "https://cloud.test";
+
+    /// A driver that hands back a fixed wallet, or fails when the api key is
+    /// `sk_fail`.
+    struct FakeDriver;
+
+    #[async_trait::async_trait]
+    impl drivers::WalletDriver for FakeDriver {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn display_name(&self) -> &'static str {
+            "Fake custody"
+        }
+        fn consent_url(&self, redirect_uri: &str, state: &str) -> String {
+            format!("https://fake.test/consent?redirect_uri={redirect_uri}&state={state}")
+        }
+        fn parse_grant(
+            &self,
+            fragment: &str,
+        ) -> Result<(drivers::ConsentGrant, String), drivers::DriverError> {
+            let mut grant = drivers::ConsentGrant::default();
+            let mut state = None;
+            for (k, v) in url::form_urlencoded::parse(fragment.trim_start_matches('#').as_bytes()) {
+                match k.as_ref() {
+                    "api_key" => grant.api_key = v.into_owned(),
+                    "state" => state = Some(v.into_owned()),
+                    _ => {}
+                }
+            }
+            let state =
+                state.ok_or_else(|| drivers::DriverError::InvalidGrant("no state".into()))?;
+            Ok((grant, state))
+        }
+        async fn provision(
+            &self,
+            grant: &drivers::ConsentGrant,
+        ) -> Result<drivers::ProvisionedWallet, drivers::DriverError> {
+            if grant.api_key == "sk_fail" {
+                return Err(drivers::DriverError::Rejected {
+                    provider: "fake",
+                    status: 401,
+                    message: "bad key".into(),
+                });
+            }
+            let mut credentials = std::collections::BTreeMap::new();
+            credentials.insert("secret_key".to_string(), grant.api_key.clone());
+            credentials.insert("wallet_secret".to_string(), "ws-b64".to_string());
+            Ok(drivers::ProvisionedWallet {
+                provider: "fake",
+                credentials,
+                wallet_id: "acc_fake".into(),
+                address: "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS".into(),
+                project_id: Some("pro_1".into()),
+            })
+        }
+    }
+
+    fn test_state() -> AppState {
+        AppState::with_drivers(PUBLIC_URL, vec![Box::new(FakeDriver)])
+    }
 
     async fn call(
         app: &Router,
@@ -188,7 +323,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_ok() {
-        let app = router(AppState::new());
+        let app = router(test_state());
         let (status, body) = call(&app, Method::GET, "/health", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, json!({ "status": "ok" }));
@@ -196,7 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_then_exchange_end_to_end() {
-        let state = AppState::new();
+        let state = test_state();
         let app = router(state.clone());
 
         let (status, body) =
@@ -268,8 +403,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_flow_start_complete_exchange_hands_over_credentials() {
+        let state = test_state();
+        let app = router(state.clone());
+
+        // start with a provider → consent URL pointing back at our callback
+        let mut body = start_body();
+        body.as_object_mut().unwrap().remove("email");
+        body["provider"] = json!("fake");
+        let (status, res) = call(&app, Method::POST, "/api/onboard/start", Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["provider"], "fake");
+        assert!(res.get("redirect").is_none());
+        let consent = res["consent"].as_str().unwrap();
+        assert!(
+            consent.contains(&format!("redirect_uri={PUBLIC_URL}/onboard/fake/callback")),
+            "{consent}"
+        );
+        assert!(consent.contains(&format!("state={STATE}")));
+
+        // unknown provider is refused
+        let mut bad = start_body();
+        bad["provider"] = json!("nope");
+        let (status, res) = call(&app, Method::POST, "/api/onboard/start", Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(res["error"], "unknown_provider");
+
+        // complete with a fragment for an unknown state → unknown_session
+        let (status, res) = call(
+            &app,
+            Method::POST,
+            "/api/onboard/fake/complete",
+            Some(json!({ "fragment": "#api_key=sk_ok&state=notastate1234567" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
+        assert_eq!(res["error"], "unknown_session");
+
+        // provider failure surfaces as 502 and leaves the session usable
+        let (status, res) = call(
+            &app,
+            Method::POST,
+            "/api/onboard/fake/complete",
+            Some(json!({ "fragment": format!("#api_key=sk_fail&state={STATE}") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{res}");
+        assert_eq!(res["error"], "provider_rejected");
+
+        // complete for real → redirect to the CLI with the code
+        let (status, res) = call(
+            &app,
+            Method::POST,
+            "/api/onboard/fake/complete",
+            Some(json!({ "fragment": format!("#api_key=sk_ok&state={STATE}") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(res["provider"], "fake");
+        assert_eq!(
+            res["address"],
+            "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS"
+        );
+        let url = url::Url::parse(res["redirect"].as_str().unwrap()).unwrap();
+        assert_eq!(url.path(), "/callback");
+        let code = url
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .map(|(_, v)| v.into_owned())
+            .unwrap();
+
+        // second completion is refused
+        let (status, res) = call(
+            &app,
+            Method::POST,
+            "/api/onboard/fake/complete",
+            Some(json!({ "fragment": format!("#api_key=sk_ok&state={STATE}") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
+        assert_eq!(res["error"], "already_completed");
+
+        // exchange → ready result with the credentials, once
+        let (status, res) = call(
+            &app,
+            Method::POST,
+            "/v1/onboard/exchange",
+            Some(json!({ "code": code, "code_verifier": RFC_VERIFIER })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(
+            res,
+            json!({
+                "provider": "fake",
+                "status": "ready",
+                "network": "mainnet",
+                "wallet_id": "acc_fake",
+                "pubkey": "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS",
+                "project_id": "pro_1",
+                "credentials": { "secret_key": "sk_ok", "wallet_secret": "ws-b64" },
+            })
+        );
+        assert_eq!(state.session_count(), 0);
+        assert!(state.session_by_state(STATE).is_none());
+    }
+
+    #[tokio::test]
     async fn start_rejects_invalid_input_with_json_errors() {
-        let app = router(AppState::new());
+        let app = router(test_state());
 
         let mut bad_callback = start_body();
         bad_callback["callback"] = json!("https://evil.example/callback");
@@ -320,7 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn exchange_unknown_code_is_invalid_grant() {
-        let app = router(AppState::new());
+        let app = router(test_state());
         let (status, body) = call(
             &app,
             Method::POST,
@@ -334,7 +576,7 @@ mod tests {
 
     #[tokio::test]
     async fn spa_routes_serve_index_html() {
-        let app = router(AppState::new());
+        let app = router(test_state());
         for path in [
             "/",
             "/onboard",

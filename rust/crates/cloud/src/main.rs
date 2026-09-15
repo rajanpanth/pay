@@ -15,6 +15,11 @@ struct Args {
     /// TCP port to listen on.
     #[arg(long, default_value_t = 8402)]
     port: u16,
+
+    /// Base URL browsers reach this server at, used as the consent redirect
+    /// target. Defaults to `http://<bind>:<port>`.
+    #[arg(long)]
+    public_url: Option<String>,
 }
 
 #[tokio::main]
@@ -32,7 +37,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local = listener.local_addr()?;
     info!(url = %format!("http://{local}"), "pay-cloud listening");
 
-    let app = pay_cloud::router(AppState::new()).layer(TraceLayer::new_for_http());
+    let public_url = args
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{}:{}", args.bind, args.port));
+    let state = AppState::new(public_url.clone());
+    info!(public_url, drivers = ?state.driver_ids(), "wallet drivers");
+    let app = pay_cloud::router(state).layer(TraceLayer::new_for_http());
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
