@@ -1,0 +1,29 @@
+[package]
+name = "pay-cloud"
+description = "pay-cloud v0: browser onboarding for the pay CLI (PKCE start/exchange + embedded UI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pay-cloud"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true }
+include_dir = "0.7.4"
+mime_guess = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "net", "time"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

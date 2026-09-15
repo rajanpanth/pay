@@ -1,0 +1,479 @@
+//! Onboarding start/exchange: request validation, one-time codes, PKCE.
+//!
+//! Flow (RFC 7636 S256, loopback redirect like `gh auth login`):
+//!
+//! 1. The CLI opens `/onboard?callback=…&state=…&code_challenge=…`.
+//! 2. The page posts the email + those params to `POST /api/onboard/start`.
+//!    We mint a one-time `code`, store the session keyed by `sha256(code)`,
+//!    and answer with `redirect = <callback>?code=…&state=…`.
+//! 3. The browser follows the redirect to the CLI's loopback listener.
+//! 4. The CLI posts `{ code, code_verifier }` to `POST /v1/onboard/exchange`;
+//!    we verify `base64url(sha256(verifier)) == code_challenge`, consume the
+//!    session, and return the (stub) onboarding result.
+
+use std::time::{Duration, Instant};
+
+use axum::Json;
+use axum::body::Bytes;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rand::RngCore;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use url::Url;
+
+use crate::AppState;
+
+/// How long a minted code stays exchangeable.
+pub const SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Network slug reported by the stub exchange response.
+pub const NETWORK: &str = "mainnet";
+
+/// A pending onboarding handshake, created by `/api/onboard/start`.
+#[derive(Clone, Debug)]
+pub struct OnboardSession {
+    /// One-time code (32 random bytes, base64url, no padding). Only its
+    /// SHA-256 is used as the store key.
+    pub code: String,
+    pub email: String,
+    pub state: String,
+    pub callback: String,
+    pub code_challenge: String,
+    pub created_at: Instant,
+}
+
+impl OnboardSession {
+    /// Mint a fresh session with a random code, timestamped now.
+    pub fn new(email: String, state: String, callback: String, code_challenge: String) -> Self {
+        Self {
+            code: random_token(),
+            email,
+            state,
+            callback,
+            code_challenge,
+            created_at: Instant::now(),
+        }
+    }
+
+    pub fn is_expired_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.created_at) > SESSION_TTL
+    }
+
+    /// Store key: hex-encoded SHA-256 of the code.
+    pub fn key(&self) -> String {
+        sha256_hex(&self.code)
+    }
+
+    /// Redirect back to the CLI: `<callback>?code=…&state=…`.
+    pub fn redirect_url(&self) -> String {
+        redirect_url(&self.callback, &self.code, &self.state)
+    }
+}
+
+/// Body of `POST /api/onboard/start`.
+#[derive(Debug, Deserialize)]
+pub struct StartRequest {
+    pub email: String,
+    pub callback: String,
+    pub state: String,
+    pub code_challenge: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub cli: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StartResponse {
+    pub redirect: String,
+}
+
+/// Body of `POST /v1/onboard/exchange`.
+#[derive(Debug, Deserialize)]
+pub struct ExchangeRequest {
+    pub code: String,
+    pub code_verifier: String,
+}
+
+/// Stub result: no wallet provisioning yet.
+#[derive(Debug, Serialize)]
+pub struct ExchangeResponse {
+    pub provider: &'static str,
+    pub status: &'static str,
+    pub email: String,
+    pub network: &'static str,
+    pub message: &'static str,
+}
+
+/// JSON error envelope: `{ "error": "<code>", "message": "..." }`.
+#[derive(Debug, Serialize)]
+pub struct ApiError {
+    #[serde(skip)]
+    pub status: StatusCode,
+    pub error: &'static str,
+    pub message: String,
+}
+
+impl ApiError {
+    pub fn bad_request(error: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error,
+            message: message.into(),
+        }
+    }
+
+    pub fn invalid_grant() -> Self {
+        Self::bad_request(
+            "invalid_grant",
+            "The authorization code is unknown, expired, already used, or the PKCE verifier does not match.",
+        )
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(self)).into_response()
+    }
+}
+
+// ── Validation ────────────────────────────────────────────────────────────
+
+/// One `@`, non-empty local and domain parts, no whitespace.
+pub fn validate_email(email: &str) -> Result<(), ApiError> {
+    let ok = !email.chars().any(char::is_whitespace)
+        && email.matches('@').count() == 1
+        && email
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "invalid_email",
+            "Enter a valid email address.",
+        ))
+    }
+}
+
+/// `http://127.0.0.1:<port>/callback` or `http://localhost:<port>/callback`,
+/// no query, no fragment, no credentials.
+pub fn validate_callback(callback: &str) -> Result<Url, ApiError> {
+    let err = |msg: &str| ApiError::bad_request("invalid_callback", msg);
+    let url = Url::parse(callback).map_err(|e| err(&format!("callback is not a URL: {e}")))?;
+    if url.scheme() != "http" {
+        return Err(err("callback must use http"));
+    }
+    if !matches!(url.host_str(), Some("127.0.0.1") | Some("localhost")) {
+        return Err(err("callback host must be 127.0.0.1 or localhost"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(err("callback must not carry credentials"));
+    }
+    if url.path() != "/callback" {
+        return Err(err("callback path must be /callback"));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(err("callback must not have a query string or fragment"));
+    }
+    Ok(url)
+}
+
+/// `[A-Za-z0-9_-]+` (base64url alphabet, no padding).
+pub fn is_base64url_alphabet(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn validate_token(value: &str, min: usize, max: usize) -> bool {
+    (min..=max).contains(&value.len()) && is_base64url_alphabet(value)
+}
+
+/// 16..=128 base64url chars.
+pub fn validate_state(state: &str) -> Result<(), ApiError> {
+    if validate_token(state, 16, 128) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "invalid_state",
+            "state must be 16 to 128 base64url characters",
+        ))
+    }
+}
+
+/// 43..=128 base64url chars (RFC 7636 §4.2).
+pub fn validate_code_challenge(challenge: &str) -> Result<(), ApiError> {
+    if validate_token(challenge, 43, 128) {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "invalid_code_challenge",
+            "code_challenge must be 43 to 128 base64url characters",
+        ))
+    }
+}
+
+// ── Crypto helpers ────────────────────────────────────────────────────────
+
+/// 32 random bytes, base64url without padding (43 chars).
+pub fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub fn sha256_hex(input: &str) -> String {
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// RFC 7636 S256: `BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))`.
+pub fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+pub fn verify_pkce(verifier: &str, challenge: &str) -> bool {
+    pkce_challenge(verifier) == challenge
+}
+
+/// `<callback>?code=<code>&state=<state>` with URL-encoded values.
+pub fn redirect_url(callback: &str, code: &str, state: &str) -> String {
+    let mut url = Url::parse(callback).expect("callback validated before session creation");
+    url.query_pairs_mut()
+        .append_pair("code", code)
+        .append_pair("state", state);
+    url.to_string()
+}
+
+// ── Handlers ──────────────────────────────────────────────────────────────
+
+fn parse_json<T: for<'de> Deserialize<'de>>(body: &Bytes) -> Result<T, ApiError> {
+    serde_json::from_slice(body)
+        .map_err(|e| ApiError::bad_request("invalid_request", format!("invalid JSON body: {e}")))
+}
+
+/// `POST /api/onboard/start`
+pub async fn start(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<StartResponse>, ApiError> {
+    let req: StartRequest = parse_json(&body)?;
+    validate_email(&req.email)?;
+    validate_callback(&req.callback)?;
+    validate_state(&req.state)?;
+    validate_code_challenge(&req.code_challenge)?;
+
+    let session = OnboardSession::new(req.email, req.state, req.callback, req.code_challenge);
+    let redirect = session.redirect_url();
+    tracing::info!(
+        email = %session.email,
+        account = req.account.as_deref().unwrap_or("-"),
+        host = req.host.as_deref().unwrap_or("-"),
+        cli = req.cli.as_deref().unwrap_or("-"),
+        "onboarding started"
+    );
+    state.insert_session(session);
+    Ok(Json(StartResponse { redirect }))
+}
+
+/// `POST /v1/onboard/exchange`
+pub async fn exchange(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<ExchangeResponse>, ApiError> {
+    let req: ExchangeRequest = parse_json(&body)?;
+    // Single use: the session is removed on lookup regardless of the PKCE
+    // outcome, so a wrong verifier burns the code.
+    let session = state
+        .take_session(&req.code)
+        .ok_or_else(ApiError::invalid_grant)?;
+    if !verify_pkce(&req.code_verifier, &session.code_challenge) {
+        tracing::warn!(email = %session.email, "PKCE verifier mismatch");
+        return Err(ApiError::invalid_grant());
+    }
+    tracing::info!(email = %session.email, "onboarding code exchanged");
+    Ok(Json(ExchangeResponse {
+        provider: "pay-cloud",
+        status: "pending",
+        email: session.email,
+        network: NETWORK,
+        message: "Wallet provisioning is not available yet.",
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RFC_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const RFC_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    #[test]
+    fn callback_accepts_loopback_http() {
+        assert!(validate_callback("http://127.0.0.1:53211/callback").is_ok());
+        assert!(validate_callback("http://localhost:8080/callback").is_ok());
+        assert!(validate_callback("http://127.0.0.1/callback").is_ok());
+    }
+
+    #[test]
+    fn callback_rejects_everything_else() {
+        for bad in [
+            "https://127.0.0.1:53211/callback",
+            "http://example.com/callback",
+            "http://127.0.0.2:53211/callback",
+            "http://[::1]:53211/callback",
+            "http://127.0.0.1:53211/other",
+            "http://127.0.0.1:53211/callback/",
+            "http://127.0.0.1:53211/callback?x=1",
+            "http://127.0.0.1:53211/callback#frag",
+            "http://user:pw@127.0.0.1:53211/callback",
+            "127.0.0.1:53211/callback",
+            "",
+        ] {
+            let err = validate_callback(bad).expect_err(bad);
+            assert_eq!(err.error, "invalid_callback", "{bad}");
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn email_validation() {
+        assert!(validate_email("a@b.co").is_ok());
+        assert!(validate_email("first.last+tag@example.com").is_ok());
+        for bad in ["", "nope", "@b.co", "a@", "a@b@c.co", "a b@c.co", "a@b .co"] {
+            assert_eq!(
+                validate_email(bad).unwrap_err().error,
+                "invalid_email",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn state_alphabet_and_bounds() {
+        assert!(validate_state(&"a".repeat(16)).is_ok());
+        assert!(validate_state(&"a".repeat(128)).is_ok());
+        assert!(validate_state("abcDEF012-_ghijk").is_ok());
+        assert!(validate_state(&"a".repeat(15)).is_err());
+        assert!(validate_state(&"a".repeat(129)).is_err());
+        assert!(validate_state("abcdefghijklmno+").is_err());
+        assert!(validate_state("abcdefghijklmno=").is_err());
+        assert!(validate_state("abcdefghijklmno ").is_err());
+    }
+
+    #[test]
+    fn challenge_alphabet_and_bounds() {
+        assert!(validate_code_challenge(RFC_CHALLENGE).is_ok());
+        assert!(validate_code_challenge(&"a".repeat(43)).is_ok());
+        assert!(validate_code_challenge(&"a".repeat(128)).is_ok());
+        assert!(validate_code_challenge(&"a".repeat(42)).is_err());
+        assert!(validate_code_challenge(&"a".repeat(129)).is_err());
+        assert!(validate_code_challenge(&format!("{}/", "a".repeat(42))).is_err());
+    }
+
+    #[test]
+    fn pkce_matches_rfc_7636_vector() {
+        assert_eq!(pkce_challenge(RFC_VERIFIER), RFC_CHALLENGE);
+        assert!(verify_pkce(RFC_VERIFIER, RFC_CHALLENGE));
+        assert!(!verify_pkce("wrong", RFC_CHALLENGE));
+    }
+
+    #[test]
+    fn random_token_is_43_base64url_chars() {
+        let a = random_token();
+        let b = random_token();
+        assert_eq!(a.len(), 43);
+        assert!(is_base64url_alphabet(&a));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn sha256_hex_known_vector() {
+        assert_eq!(
+            sha256_hex("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn redirect_url_encodes_values() {
+        let url = redirect_url("http://127.0.0.1:53211/callback", "c/o+d=e", "s&t");
+        assert_eq!(
+            url,
+            "http://127.0.0.1:53211/callback?code=c%2Fo%2Bd%3De&state=s%26t"
+        );
+    }
+
+    fn session(created_at: Instant) -> OnboardSession {
+        OnboardSession {
+            code: random_token(),
+            email: "a@b.co".into(),
+            state: "s".repeat(16),
+            callback: "http://127.0.0.1:1/callback".into(),
+            code_challenge: RFC_CHALLENGE.into(),
+            created_at,
+        }
+    }
+
+    #[test]
+    fn session_ttl_expiry() {
+        let now = Instant::now();
+        let fresh = session(now);
+        assert!(!fresh.is_expired_at(now));
+        assert!(!fresh.is_expired_at(now + SESSION_TTL));
+        assert!(fresh.is_expired_at(now + SESSION_TTL + Duration::from_secs(1)));
+
+        let state = AppState::new();
+        let expired = session(
+            now.checked_sub(SESSION_TTL + Duration::from_secs(1))
+                .expect("clock far enough from epoch"),
+        );
+        let expired_code = expired.code.clone();
+        state.insert_session(expired);
+        assert!(state.take_session(&expired_code).is_none());
+    }
+
+    #[test]
+    fn insert_purges_expired_sessions() {
+        let state = AppState::new();
+        let now = Instant::now();
+        let fresh_a = session(now);
+        let code_a = fresh_a.code.clone();
+        state.insert_session(fresh_a);
+        let expired = session(
+            now.checked_sub(SESSION_TTL + Duration::from_secs(1))
+                .unwrap(),
+        );
+        let code_expired = expired.code.clone();
+        state.insert_session(expired);
+        assert_eq!(state.session_count(), 2);
+
+        // The next insert sweeps the expired entry but keeps the live one.
+        state.insert_session(session(now));
+        assert_eq!(state.session_count(), 2);
+        assert!(state.take_session(&code_expired).is_none());
+        assert!(state.take_session(&code_a).is_some());
+    }
+
+    #[test]
+    fn take_session_is_single_use() {
+        let state = AppState::new();
+        let s = session(Instant::now());
+        let code = s.code.clone();
+        state.insert_session(s);
+        assert!(state.take_session(&code).is_some());
+        assert!(state.take_session(&code).is_none());
+        assert!(state.take_session("unknown").is_none());
+    }
+}
