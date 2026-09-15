@@ -1,7 +1,6 @@
 import { useId, useState, type FormEvent } from "react";
 import { isValidEmail, type OnboardParams } from "../../cloud/lib/onboard";
 import { PayWordmark } from "./PayWordmark";
-import { TerminalFrame } from "./TerminalFrame";
 
 interface Props {
   params: OnboardParams;
@@ -11,16 +10,15 @@ interface Props {
 }
 
 /**
- * The onboarding form shown when the page was opened by `pay setup`:
- * the CLI banner, the command that opened it, and an email prompt, all in
- * the terminal's own idiom.
+ * The onboarding form shown when the page was opened by `pay setup`: a
+ * full-screen terminal with the pay.sh wordmark, the command that opened
+ * it, and an email prompt.
  */
 export function TerminalLink({ params, submitting, error, onContinue }: Props) {
   const [email, setEmail] = useState("");
   const id = useId();
   const enabled = isValidEmail(email) && !submitting;
   const who = [params.account, params.host].filter(Boolean).join("@");
-  const title = who ? `pay setup — ${who}` : "pay setup";
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -28,7 +26,7 @@ export function TerminalLink({ params, submitting, error, onContinue }: Props) {
   }
 
   return (
-    <TerminalFrame title={title}>
+    <section className="cloud-term" aria-label="pay setup">
       <div className="cloud-term-banner">
         <PayWordmark />
         <div className="cloud-term-tagline">Toolchain for agentic payments</div>
@@ -81,6 +79,6 @@ export function TerminalLink({ params, submitting, error, onContinue }: Props) {
           </div>
         )}
       </form>
-    </TerminalFrame>
+    </section>
   );
 }

@@ -232,66 +232,22 @@ html[data-cloud-theme="terminal"] #root {
 }
 
 .cloud-page--terminal {
-  padding: 48px 24px;
+  align-items: flex-start;
+  justify-content: flex-start;
+  padding: 40px 48px;
 }
 
+/* No window chrome: the page is the terminal. */
 .cloud-term {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
   width: 100%;
-  max-width: 880px;
-  border: 1px solid var(--term-border);
-  background: var(--term-surface);
+  max-width: 960px;
   font-family: var(--term-font);
   font-size: 15px;
   line-height: 1.5;
   color: var(--term-fg);
-}
-
-.cloud-term-head {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  height: 40px;
-  padding: 0 14px;
-  border-bottom: 1px solid var(--term-border);
-  color: var(--term-fg-subtle);
-  font-size: 13px;
-}
-
-.cloud-term-dots {
-  display: inline-flex;
-  gap: 8px;
-}
-
-.cloud-term-dot {
-  display: inline-block;
-  width: 11px;
-  height: 11px;
-  border-radius: 50%;
-}
-
-.cloud-term-dot--red {
-  background: var(--term-red);
-}
-
-.cloud-term-dot--yellow {
-  background: var(--term-yellow);
-}
-
-.cloud-term-dot--green {
-  background: var(--term-dot-green);
-}
-
-.cloud-term-title {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.cloud-term-body {
-  display: flex;
-  flex-direction: column;
-  gap: 28px;
-  padding: 28px 32px 32px;
 }
 
 .cloud-term-banner {
@@ -432,11 +388,10 @@ html[data-cloud-theme="terminal"] #root {
 
 @media (max-width: 600px) {
   .cloud-page--terminal {
-    padding: 16px 12px;
+    padding: 20px 16px;
   }
 
-  .cloud-term-body {
-    padding: 20px 16px 24px;
+  .cloud-term {
     gap: 20px;
   }
 
