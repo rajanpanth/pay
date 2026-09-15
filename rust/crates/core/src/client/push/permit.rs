@@ -850,7 +850,7 @@ fn validate_memo(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
+    use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
     use crate::client::push::manifest::{ManifestContext, parse_manifest_csv};
     use crate::client::push::planner::{AtaSnapshot, DestinationAtaStatus, pack_chunks};
     use solana_message::Message as LegacyMessage;
@@ -863,7 +863,7 @@ mod tests {
         full.extend_from_slice(&verifying_key.to_bytes());
 
         let account = Account {
-            keystore: Keystore::Ephemeral,
+            backend: BackendKind::Ephemeral,
             provider: None,
             active: false,
             auth_required: Some(false),

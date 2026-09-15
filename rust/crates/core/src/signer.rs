@@ -1,62 +1,111 @@
-//! Resolve a signer from a keypair source — file path, Keychain, 1Password,
-//! or a remote signing backend (`pay_core::remote`).
+//! Resolve a signer for a pay account.
+//!
+//! Every account is described by a [`SigningBackend`] (see
+//! [`crate::backend`]); this module turns an account plus an approval
+//! policy into a [`ResolvedSigner`]. Local keystore backends hand back a
+//! keypair that becomes an in-memory signer; remote providers hand back a
+//! signer that talks to their API. Callers never match on the account kind
+//! here: what a backend can do (export, raw message signing) is asked of the
+//! descriptor.
 
 use pay_kit::mpp::solana_keychain::MemorySigner;
 use pay_kit::solana_keychain::{SignTransactionResult, SignerError, SolanaSigner};
 
 use crate::accounts::{
-    Account, AccountChoice, AccountsFile, AccountsStore, Keystore, MAINNET_NETWORK,
+    Account, AccountChoice, AccountsFile, AccountsStore, BackendKind, MAINNET_NETWORK,
     ResolvedEphemeral, load_or_create_ephemeral_for_network,
     load_or_create_ephemeral_for_network_as, resolve_account_for_network,
 };
+use crate::backend::{Custody, Gate, SigningBackend};
 use crate::keystore::{AuthGate, AuthIntent};
 use crate::{Error, Result};
 
-/// Signer resolved from a pay account — a local in-memory keypair or a
-/// remote backend's signer. Implements [`SolanaSigner`] by delegation, so
-/// both MPP and x402 payment paths accept it wherever a
-/// `&dyn SolanaSigner` is expected.
-pub enum ResolvedSigner {
+/// Signer resolved from a pay account, together with the backend it came
+/// from. Implements [`SolanaSigner`] by delegation, so both MPP and x402
+/// payment paths accept it wherever a `&dyn SolanaSigner` is expected, and
+/// exposes the backend's capabilities so those paths can pick a compatible
+/// payment scheme.
+pub struct ResolvedSigner {
+    backend: &'static dyn SigningBackend,
+    inner: SignerImpl,
+}
+
+enum SignerImpl {
+    /// An in-memory keypair loaded from a local keystore.
     Memory(Box<MemorySigner>),
     /// Any provider registered in [`crate::remote`]; pay never needs to
     /// know which one.
     Remote(Box<dyn SolanaSigner>),
 }
 
+impl ResolvedSigner {
+    /// A signer whose keypair was loaded from `backend` into memory.
+    pub fn local(backend: &'static dyn SigningBackend, signer: MemorySigner) -> Self {
+        Self {
+            backend,
+            inner: SignerImpl::Memory(Box::new(signer)),
+        }
+    }
+
+    /// A signer that signs through a remote or hardware `backend`.
+    pub fn remote(backend: &'static dyn SigningBackend, signer: Box<dyn SolanaSigner>) -> Self {
+        Self {
+            backend,
+            inner: SignerImpl::Remote(signer),
+        }
+    }
+
+    /// The backend this signer came from.
+    pub fn backend(&self) -> &'static dyn SigningBackend {
+        self.backend
+    }
+
+    /// Where the key is held.
+    pub fn custody(&self) -> Custody {
+        self.backend.custody()
+    }
+
+    /// Whether the raw keypair could be read out of this account's backend.
+    pub fn is_exportable(&self) -> bool {
+        self.backend.is_exportable()
+    }
+
+    /// Whether `sign_message` returns a raw ed25519 signature over the
+    /// bytes given. See [`SigningBackend::signs_raw_messages`].
+    pub fn signs_raw_messages(&self) -> bool {
+        self.backend.signs_raw_messages()
+    }
+
+    fn as_dyn(&self) -> &dyn SolanaSigner {
+        match &self.inner {
+            SignerImpl::Memory(signer) => signer.as_ref(),
+            SignerImpl::Remote(signer) => signer.as_ref(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl SolanaSigner for ResolvedSigner {
     fn pubkey(&self) -> solana_pubkey::Pubkey {
-        match self {
-            ResolvedSigner::Memory(signer) => signer.pubkey(),
-            ResolvedSigner::Remote(signer) => signer.pubkey(),
-        }
+        self.as_dyn().pubkey()
     }
 
     async fn sign_transaction(
         &self,
         tx: &mut solana_transaction::Transaction,
     ) -> std::result::Result<SignTransactionResult, SignerError> {
-        match self {
-            ResolvedSigner::Memory(signer) => signer.sign_transaction(tx).await,
-            ResolvedSigner::Remote(signer) => signer.sign_transaction(tx).await,
-        }
+        self.as_dyn().sign_transaction(tx).await
     }
 
     async fn sign_message(
         &self,
         message: &[u8],
     ) -> std::result::Result<solana_signature::Signature, SignerError> {
-        match self {
-            ResolvedSigner::Memory(signer) => signer.sign_message(message).await,
-            ResolvedSigner::Remote(signer) => signer.sign_message(message).await,
-        }
+        self.as_dyn().sign_message(message).await
     }
 
     async fn is_available(&self) -> bool {
-        match self {
-            ResolvedSigner::Memory(signer) => signer.is_available().await,
-            ResolvedSigner::Remote(signer) => signer.is_available().await,
-        }
+        self.as_dyn().is_available().await
     }
 }
 
@@ -195,7 +244,7 @@ pub fn load_signer_for_network_with_intent_and_override(
         }
         if is_lazy_ephemeral_network(network) {
             let resolved = load_or_create_ephemeral_for_network_as(network, name, store)?;
-            let signer = signer_from_ephemeral(&resolved.account)?;
+            let signer = signer_for_ephemeral_account(&resolved.account)?;
             return Ok((signer, Some(resolved)));
         }
         return Err(Error::Config(format!(
@@ -216,7 +265,7 @@ pub fn load_signer_for_network_with_intent_and_override(
         AccountChoice::Missing => {
             if is_lazy_ephemeral_network(network) {
                 let resolved = load_or_create_ephemeral_for_network(network, store)?;
-                let signer = signer_from_ephemeral(&resolved.account)?;
+                let signer = signer_for_ephemeral_account(&resolved.account)?;
                 Ok((signer, Some(resolved)))
             } else {
                 Err(Error::Config(format!(
@@ -244,7 +293,7 @@ fn network_agnostic_fallback<'a>(
         return None;
     }
     file.named_account_for_network(MAINNET_NETWORK, name)
-        .filter(|account| account.keystore == Keystore::Remote)
+        .filter(|account| account.backend == BackendKind::Remote)
 }
 
 /// Network-aware loader for a payment, with the same amount-prefixed
@@ -309,6 +358,8 @@ fn is_lazy_ephemeral_network(network: &str) -> bool {
     matches!(network, "localnet" | "devnet")
 }
 
+// ── Account → keypair bytes ─────────────────────────────────────────────────
+
 pub fn load_keypair_bytes_from_account_with_reason(
     account: &Account,
     name: &str,
@@ -332,8 +383,12 @@ pub fn load_keypair_bytes_from_account_with_intent(
     load_keypair_bytes_from_account_with_intent_and_override(account, name, network, intent, None)
 }
 
-/// Variant of [`load_keypair_bytes_from_account_with_intent`] that accepts an
-/// optional auth-gate override. See [`AuthOverride`] for the rationale.
+/// Read an account's raw 64-byte keypair, applying its approval policy.
+///
+/// Refuses when the account's backend is not exportable (see
+/// [`SigningBackend::is_exportable`]); that is the single place the rule
+/// lives, so `pay account export` and every other raw-key path agree.
+/// Accepts an optional auth-gate override; see [`AuthOverride`].
 pub fn load_keypair_bytes_from_account_with_intent_and_override(
     account: &Account,
     name: &str,
@@ -341,144 +396,48 @@ pub fn load_keypair_bytes_from_account_with_intent_and_override(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
-    let account_intent = intent.with_account_context(name);
-    if account.keystore == Keystore::Remote {
-        let _ = auth_override;
-        let backend = account.provider.as_deref().unwrap_or("remote");
-        return Err(Error::Config(format!(
-            "Account `{name}` signs through the `{backend}` backend: its private key \
-             lives in the provider's custody and cannot be loaded or exported locally."
-        )));
+    let backend = account.descriptor()?;
+    if !backend.is_exportable() {
+        return Err(not_exportable(backend, name));
     }
-    if account.keystore == Keystore::Ephemeral {
-        let _ = auth_override;
-        return account
+
+    match account.backend {
+        BackendKind::Ephemeral => account
             .ephemeral_keypair_bytes()
             .map(crate::keystore::Zeroizing::new)
             .ok_or_else(|| {
                 Error::Config(
                     "Ephemeral account is missing its inline `secret_key_b58` field".to_string(),
                 )
-            });
-    }
-
-    let source = account
-        .signer_source(name)
-        .expect("non-ephemeral accounts must provide a signer source");
-
-    match account.keystore {
-        Keystore::AppleKeychain => {
-            #[cfg(target_os = "macos")]
-            {
-                let ks = if account.auth_required_for_network(network) {
-                    match auth_override {
-                        Some(gate) => crate::keystore::Keystore::from_boxed_auth(
-                            gate,
-                            Box::new(crate::keystore::macos::AppleKeychainStore),
-                            true,
-                        ),
-                        None => crate::keystore::Keystore::apple_keychain(),
-                    }
-                } else {
-                    crate::keystore::Keystore::new(
-                        crate::keystore::auth::NoAuth,
-                        crate::keystore::macos::AppleKeychainStore,
-                        false,
-                    )
-                };
-                ks.load_keypair_with_intent(name, &account_intent)
-                    .map_err(|e| map_keystore_backend_error("keychain", e))
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = auth_override;
-                Err(Error::Config(
-                    "Keychain not available on this platform".to_string(),
-                ))
-            }
+            }),
+        BackendKind::Remote => Err(Error::Config(format!(
+            "Account `{name}` signs through the `{}` backend, which can export its key, \
+             but pay does not implement key export for remote providers yet.",
+            backend.id()
+        ))),
+        _ => {
+            let local = crate::backend::local_by_kind(&account.backend)
+                .expect("descriptor resolved, so the kind is a registered local backend");
+            let gate = Gate::for_policy(account.auth_required_for_network(network), auth_override);
+            let file_path = account.file_path(name);
+            let params = account.store_params(Some(&file_path));
+            let ks = local.keystore(&params, gate)?;
+            ks.load_keypair_with_intent(name, &intent.with_account_context(name))
+                .map_err(|e| map_keystore_backend_error(local.flag(), e))
         }
-        Keystore::GnomeKeyring => {
-            #[cfg(target_os = "linux")]
-            {
-                let ks = if account.auth_required_for_network(network) {
-                    match auth_override {
-                        Some(gate) => crate::keystore::Keystore::from_boxed_auth(
-                            gate,
-                            Box::new(crate::keystore::linux::SecretServiceStore),
-                            true,
-                        ),
-                        None => crate::keystore::Keystore::gnome_keyring(),
-                    }
-                } else {
-                    crate::keystore::Keystore::new(
-                        crate::keystore::auth::NoAuth,
-                        crate::keystore::linux::SecretServiceStore,
-                        false,
-                    )
-                };
-                ks.load_keypair_with_intent(name, &account_intent)
-                    .map_err(|e| map_keystore_backend_error("gnome-keyring", e))
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let _ = source;
-                let _ = auth_override;
-                Err(Error::Config(
-                    "GNOME Keyring not available on this platform".to_string(),
-                ))
-            }
-        }
-        Keystore::WindowsHello => {
-            #[cfg(target_os = "windows")]
-            {
-                let ks = if account.auth_required_for_network(network) {
-                    match auth_override {
-                        Some(gate) => crate::keystore::Keystore::from_boxed_auth(
-                            gate,
-                            Box::new(crate::keystore::windows::WindowsCredentialStore),
-                            true,
-                        ),
-                        None => crate::keystore::Keystore::windows_hello(),
-                    }
-                } else {
-                    crate::keystore::Keystore::new(
-                        crate::keystore::auth::NoAuth,
-                        crate::keystore::windows::WindowsCredentialStore,
-                        false,
-                    )
-                };
-                ks.load_keypair_with_intent(name, &account_intent)
-                    .map_err(|e| map_keystore_backend_error("windows-hello", e))
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = source;
-                let _ = auth_override;
-                Err(Error::Config(
-                    "Windows Hello not available on this platform".to_string(),
-                ))
-            }
-        }
-        Keystore::OnePassword => {
-            // 1Password manages its own auth via the `op` CLI; the
-            // MCP-elicitation override does not apply.
-            let _ = auth_override;
-            let op_account = account.account.clone();
-            let ks = if let Some(vault) = &account.vault {
-                crate::keystore::Keystore::onepassword_with_vault(vault.clone(), op_account)
-            } else {
-                crate::keystore::Keystore::onepassword(op_account)
-            };
-            ks.load_keypair_with_intent(name, &account_intent)
-                .map_err(|e| map_keystore_backend_error("1password", e))
-        }
-        Keystore::File => {
-            maybe_authenticate_file_account(account, network, &account_intent, auth_override)?;
-            load_signer_keypair_bytes_with_intent(&source, &account_intent)
-        }
-        Keystore::Ephemeral | Keystore::Remote => unreachable!("handled above"),
     }
 }
+
+fn not_exportable(backend: &dyn SigningBackend, name: &str) -> Error {
+    Error::Config(format!(
+        "Account `{name}` signs through the `{}` backend: its private key stays {} \
+         and cannot be loaded or exported.",
+        backend.id(),
+        backend.custody().location_phrase()
+    ))
+}
+
+// ── Account → signer ────────────────────────────────────────────────────────
 
 pub fn load_signer_from_account_with_reason(
     account: &Account,
@@ -498,8 +457,8 @@ pub fn load_signer_from_account_with_intent(
     load_signer_from_account_with_intent_and_override(account, name, network, intent, None)
 }
 
-/// Variant of [`load_signer_from_account_with_intent`] that accepts an
-/// optional auth-gate override.
+/// Resolve an account into a signer, applying its approval policy.
+/// Accepts an optional auth-gate override; see [`AuthOverride`].
 pub fn load_signer_from_account_with_intent_and_override(
     account: &Account,
     name: &str,
@@ -507,10 +466,11 @@ pub fn load_signer_from_account_with_intent_and_override(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<ResolvedSigner> {
-    if account.keystore == Keystore::Remote {
+    if account.backend == BackendKind::Remote {
         return crate::remote::load_remote_signer(account, name, network, intent, auth_override);
     }
 
+    let backend = account.descriptor()?;
     let bytes = load_keypair_bytes_from_account_with_intent_and_override(
         account,
         name,
@@ -524,72 +484,21 @@ pub fn load_signer_from_account_with_intent_and_override(
              Re-import the account: `pay account destroy --name {name}` then `pay account new --name {name}`."
         ))
     })?;
-    Ok(ResolvedSigner::Memory(Box::new(memory)))
+    Ok(ResolvedSigner::local(backend, memory))
 }
 
-fn signer_from_ephemeral(account: &Account) -> Result<ResolvedSigner> {
+/// Build a signer for an ephemeral account from its inline keypair. No
+/// prompt: ephemeral wallets are ungated by design.
+pub fn signer_for_ephemeral_account(account: &Account) -> Result<ResolvedSigner> {
     let bytes = account.ephemeral_keypair_bytes().ok_or_else(|| {
         Error::Config("Ephemeral account is missing its inline `secret_key_b58` field".to_string())
     })?;
     MemorySigner::from_bytes(&bytes)
-        .map(|s| ResolvedSigner::Memory(Box::new(s)))
+        .map(|s| ResolvedSigner::local(&crate::backend::Ephemeral, s))
         .map_err(|e| Error::Config(format!("Invalid ephemeral keypair bytes: {e}")))
 }
 
-/// Apply a file-backed account's auth policy before reading its keypair.
-fn maybe_authenticate_file_account(
-    account: &Account,
-    network: &str,
-    intent: &AuthIntent,
-    auth_override: AuthOverride,
-) -> Result<()> {
-    if !account.auth_required_for_network(network) {
-        return Ok(());
-    }
-
-    // When an override is provided, prefer it over the platform gate. It is
-    // already a complete AuthGate, so no backing secret store is needed.
-    if let Some(gate) = auth_override {
-        return gate.authenticate(intent).map_err(map_file_auth_error);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        crate::keystore::Keystore::apple_keychain()
-            .authenticate_intent(intent)
-            .map_err(map_file_auth_error)
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        crate::keystore::Keystore::gnome_keyring()
-            .authenticate_intent(intent)
-            .map_err(map_file_auth_error)
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        crate::keystore::Keystore::windows_hello()
-            .authenticate_intent(intent)
-            .map_err(map_file_auth_error)
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        let _ = intent;
-        Err(Error::Config(
-            "File account auth gating is not available on this platform".to_string(),
-        ))
-    }
-}
-
-fn map_file_auth_error(e: crate::keystore::Error) -> Error {
-    if matches!(e, crate::keystore::Error::AuthDenied(_)) {
-        Error::PaymentRejected("rejected by user at authentication prompt".to_string())
-    } else {
-        Error::Config(format!("file account auth gate: {e}"))
-    }
-}
+// ── Legacy `<flag>:<name>` sources ─────────────────────────────────────────
 
 /// Load a `MemorySigner` with a custom reason string.
 pub fn load_signer_with_reason(source: &str, reason: &str) -> Result<MemorySigner> {
@@ -607,6 +516,27 @@ pub fn load_signer_with_intent(source: &str, intent: &AuthIntent) -> Result<Memo
     })
 }
 
+/// Like [`load_signer_with_intent`], but returns a [`ResolvedSigner`] tagged
+/// with the backend the source names: a registered `<flag>:` prefix, or the
+/// file backend for paths and inline keys.
+pub fn load_resolved_signer_with_intent(
+    source: &str,
+    intent: &AuthIntent,
+) -> Result<ResolvedSigner> {
+    let signer = load_signer_with_intent(source, intent)?;
+    Ok(ResolvedSigner::local(source_backend(source), signer))
+}
+
+/// The backend a legacy source string refers to.
+fn source_backend(source: &str) -> &'static dyn SigningBackend {
+    source
+        .split_once(':')
+        .and_then(|(flag, _)| crate::backend::local_by_flag(flag))
+        .filter(|local| local.kind() != BackendKind::File)
+        .map(|local| local as &'static dyn SigningBackend)
+        .unwrap_or(&crate::backend::File)
+}
+
 pub fn load_signer_keypair_bytes_with_reason(
     source: &str,
     reason: &str,
@@ -614,40 +544,40 @@ pub fn load_signer_keypair_bytes_with_reason(
     load_signer_keypair_bytes_with_intent(source, &AuthIntent::from_reason(reason))
 }
 
+/// Read keypair bytes from a legacy source string: `<flag>:<account>` for
+/// a registered local keystore backend, else a file path or inline key.
 pub fn load_signer_keypair_bytes_with_intent(
     source: &str,
     intent: &AuthIntent,
 ) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
-    if let Some(account) = source.strip_prefix("keychain:") {
-        load_from_keystore_backend("keychain", account, intent)
-    } else if let Some(account) = source.strip_prefix("gnome-keyring:") {
-        load_from_keystore_backend("gnome-keyring", account, intent)
-    } else if let Some(account) = source.strip_prefix("windows-hello:") {
-        load_from_keystore_backend("windows-hello", account, intent)
-    } else if let Some(account) = source.strip_prefix("1password:") {
-        load_from_keystore_backend("1password", account, intent)
-    } else {
-        load_from_file(source)
+    if let Some((flag, account)) = source.split_once(':')
+        && let Some(local) = crate::backend::local_by_flag(flag)
+        && local.kind() != BackendKind::File
+    {
+        let ks = local.keystore(&crate::backend::StoreParams::default(), Gate::Platform)?;
+        return ks
+            .load_keypair_with_intent(account, &intent.with_account_context(account))
+            .map_err(|e| map_keystore_backend_error(local.flag(), e));
     }
+    load_from_file(source)
 }
 
 /// Human-readable name of the auth UI for a given keystore backend, used in
 /// "Payment rejected" messages when the user cancels at the OS prompt.
-fn rejection_source(backend: &str) -> &'static str {
-    match backend {
-        "keychain" => "rejected by user at Apple Keychain",
-        "windows-hello" => "rejected by user at Windows Hello",
-        "gnome-keyring" => "rejected by user at GNOME Keyring",
-        "1password" => "rejected by user at 1Password",
-        _ => "rejected by user at authentication prompt",
+fn rejection_source(backend_flag: &str) -> String {
+    match crate::backend::local_by_flag(backend_flag) {
+        Some(local) if local.kind() != BackendKind::File => {
+            format!("rejected by user at {}", local.display_name())
+        }
+        _ => "rejected by user at authentication prompt".to_string(),
     }
 }
 
-pub(crate) fn map_keystore_backend_error(backend: &str, e: crate::keystore::Error) -> Error {
+pub(crate) fn map_keystore_backend_error(backend_flag: &str, e: crate::keystore::Error) -> Error {
     if matches!(e, crate::keystore::Error::AuthDenied(_)) {
-        Error::PaymentRejected(rejection_source(backend).to_string())
+        Error::PaymentRejected(rejection_source(backend_flag))
     } else {
-        Error::Config(format!("{backend}: {e}"))
+        Error::Config(format!("{backend_flag}: {e}"))
     }
 }
 
@@ -685,56 +615,6 @@ fn parse_private_key_string(input: &str) -> std::result::Result<Vec<u8>, String>
     let bytes = crate::b58::decode_64(trimmed)
         .map_err(|e| format!("Invalid base58 private key (expected 64 bytes): {e}"))?;
     Ok(bytes.to_vec())
-}
-
-fn load_from_keystore_backend(
-    backend: &str,
-    account: &str,
-    intent: &AuthIntent,
-) -> Result<crate::keystore::Zeroizing<Vec<u8>>> {
-    let keystore = match backend {
-        #[cfg(target_os = "macos")]
-        "keychain" => crate::keystore::Keystore::apple_keychain(),
-        #[cfg(not(target_os = "macos"))]
-        "keychain" => {
-            return Err(Error::Config(
-                "Keychain not available on this platform".to_string(),
-            ));
-        }
-
-        #[cfg(target_os = "linux")]
-        "gnome-keyring" => crate::keystore::Keystore::gnome_keyring(),
-        #[cfg(not(target_os = "linux"))]
-        "gnome-keyring" => {
-            return Err(Error::Config(
-                "GNOME Keyring not available on this platform".to_string(),
-            ));
-        }
-
-        #[cfg(target_os = "windows")]
-        "windows-hello" => crate::keystore::Keystore::windows_hello(),
-        #[cfg(not(target_os = "windows"))]
-        "windows-hello" => {
-            return Err(Error::Config(
-                "Windows Hello not available on this platform".to_string(),
-            ));
-        }
-
-        "1password" => crate::keystore::Keystore::onepassword(None),
-
-        _ => {
-            return Err(Error::Config(format!(
-                "Unknown keystore backend: {backend}"
-            )));
-        }
-    };
-
-    let account_intent = intent.with_account_context(account);
-    let bytes = keystore
-        .load_keypair_with_intent(account, &account_intent)
-        .map_err(|e| map_keystore_backend_error(backend, e))?;
-
-    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -844,6 +724,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn source_backend_follows_the_prefix() {
+        assert_eq!(source_backend("keychain:default").id(), "apple-keychain");
+        assert_eq!(source_backend("1password:work").id(), "1password");
+        assert_eq!(source_backend("/tmp/key.json").id(), "file");
+        assert_eq!(source_backend("C:\\keys\\x.json").id(), "file");
+        assert_eq!(source_backend("file:whatever").id(), "file");
+    }
+
+    #[test]
+    fn legacy_source_with_colon_in_a_path_is_a_file() {
+        // `C:\keys\x.json`-style or `dir:name`-style paths are not backend
+        // prefixes and must fall through to the file loader.
+        let err = load_signer("no-such-backend:default").unwrap_err();
+        assert!(err.to_string().contains("Failed to load keypair"), "{err}");
+    }
+
     // ── load_signer_for_network ────────────────────────────────────────────
 
     use crate::accounts::{Account, AccountsFile, MAINNET_NETWORK, MemoryAccountsStore};
@@ -877,7 +774,7 @@ mod tests {
         std::fs::write(&key_path, serde_json::to_string(&keypair_bytes).unwrap()).unwrap();
 
         let account = Account {
-            keystore: Keystore::File,
+            backend: BackendKind::File,
             provider: None,
             active: false,
             auth_required,
@@ -895,7 +792,7 @@ mod tests {
 
     fn remote_account(account_id: Option<&str>) -> Account {
         Account {
-            keystore: Keystore::Remote,
+            backend: BackendKind::Remote,
             provider: Some("openfort".to_string()),
             active: false,
             auth_required: Some(true),
@@ -952,7 +849,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(matches!(signer, ResolvedSigner::Memory(_)));
+        assert_eq!(signer.custody(), Custody::Local);
+        assert_eq!(signer.backend().id(), "ephemeral");
         assert!(
             resolved.is_some_and(|r| r.created),
             "keypair-backed accounts must keep the lazy-ephemeral behavior"
@@ -1030,6 +928,23 @@ mod tests {
         assert_eq!(&*bytes, &expected);
     }
 
+    #[test]
+    fn file_account_resolves_to_a_local_exportable_signer() {
+        let (_temp_dir, account, _) = fresh_file_account(Some(false));
+        let signer = load_signer_from_account_with_intent(
+            &account,
+            "default",
+            MAINNET_NETWORK,
+            &AuthIntent::default_payment(),
+        )
+        .unwrap();
+        assert_eq!(signer.backend().id(), "file");
+        assert_eq!(signer.custody(), Custody::Local);
+        assert!(signer.is_exportable());
+        assert!(signer.signs_raw_messages());
+        assert_eq!(signer.pubkey().to_string(), account.pubkey.unwrap());
+    }
+
     fn fresh_ephemeral_account() -> Account {
         // Build an ephemeral account directly so the test doesn't depend
         // on the lazy-create internals.
@@ -1039,7 +954,7 @@ mod tests {
         full.extend_from_slice(&signing_key.to_bytes());
         full.extend_from_slice(&verifying_key.to_bytes());
         Account {
-            keystore: Keystore::Ephemeral,
+            backend: BackendKind::Ephemeral,
             provider: None,
             active: false,
             auth_required: Some(false),
@@ -1055,7 +970,7 @@ mod tests {
 
     fn fresh_remote_account(account_id: Option<&str>) -> Account {
         Account {
-            keystore: Keystore::Remote,
+            backend: BackendKind::Remote,
             provider: Some("openfort".to_string()),
             active: false,
             auth_required: Some(false),
@@ -1085,8 +1000,34 @@ mod tests {
         // The message names the account's own backend, whichever it is.
         assert!(msg.contains("`openfort` backend"), "wrong error: {msg}");
         assert!(
+            msg.contains("in the provider's custody"),
+            "wrong error: {msg}"
+        );
+        assert!(
             msg.contains("cannot be loaded or exported"),
             "wrong error: {msg}"
+        );
+    }
+
+    #[test]
+    fn remote_account_without_provider_is_a_config_error() {
+        let mut account = fresh_remote_account(Some("acc_test"));
+        account.provider = None;
+        let Err(err) = account.descriptor() else {
+            panic!("no provider must fail");
+        };
+        assert!(
+            err.to_string().contains("missing its `provider` field"),
+            "{err}"
+        );
+
+        account.provider = Some("nope".to_string());
+        let Err(err) = account.descriptor() else {
+            panic!("unknown provider must fail");
+        };
+        assert!(
+            err.to_string().contains("unknown remote backend `nope`"),
+            "{err}"
         );
     }
 
@@ -1141,6 +1082,7 @@ mod tests {
         let (signer, ephemeral) = load_signer_for_network("localnet", &store).unwrap();
         use pay_kit::mpp::solana_keychain::SolanaSigner;
         assert_eq!(signer.pubkey().to_string(), expected_pubkey);
+        assert_eq!(signer.backend().id(), "ephemeral");
         assert!(
             ephemeral.is_none(),
             "must NOT report a creation when the entry already existed"
@@ -1289,9 +1231,9 @@ mod tests {
     }
 
     #[test]
-    fn signer_from_ephemeral_rejects_missing_inline_secret() {
+    fn signer_for_ephemeral_account_rejects_missing_inline_secret() {
         let account = Account {
-            keystore: Keystore::Ephemeral,
+            backend: BackendKind::Ephemeral,
             provider: None,
             active: false,
             auth_required: Some(false),
@@ -1304,7 +1246,9 @@ mod tests {
             subscriptions: std::collections::BTreeMap::new(),
         };
 
-        let err = signer_from_ephemeral(&account).map(|_| ()).unwrap_err();
+        let err = signer_for_ephemeral_account(&account)
+            .map(|_| ())
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("Ephemeral account is missing its inline `secret_key_b58` field")
@@ -1328,6 +1272,10 @@ mod tests {
         assert_eq!(
             rejection_source("1password"),
             "rejected by user at 1Password"
+        );
+        assert_eq!(
+            rejection_source("file"),
+            "rejected by user at authentication prompt"
         );
         assert_eq!(
             rejection_source("unknown"),

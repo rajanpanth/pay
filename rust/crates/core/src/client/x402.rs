@@ -922,7 +922,7 @@ fn x402_version_from_json(body: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
+    use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
     use pay_kit::x402::exact::EXACT_SCHEME;
 
     fn sample_requirements() -> PaymentRequirements {
@@ -1505,7 +1505,7 @@ mod tests {
         ];
         let pubkey = "4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR";
         let account = Account {
-            keystore: Keystore::Ephemeral,
+            backend: BackendKind::Ephemeral,
             provider: None,
             active: true,
             auth_required: Some(false),

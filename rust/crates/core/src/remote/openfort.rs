@@ -14,6 +14,7 @@
 use pay_kit::solana_keychain::{OpenfortSigner, SolanaSigner};
 use serde::Deserialize;
 
+use crate::backend::{Approval, Custody, SigningBackend};
 use crate::remote::{CredentialField, Credentials, RemoteProvider, RemoteWallet};
 use crate::{Error, Result};
 
@@ -35,15 +36,35 @@ static FIELDS: &[CredentialField] = &[
     },
 ];
 
-impl RemoteProvider for Openfort {
+impl SigningBackend for Openfort {
     fn id(&self) -> &'static str {
         "openfort"
     }
-
     fn display_name(&self) -> &'static str {
         "Openfort backend wallet"
     }
+    fn description(&self) -> &'static str {
+        "remote signing, the key stays in Openfort's custody"
+    }
+    fn custody(&self) -> Custody {
+        Custody::Remote
+    }
+    /// Backend wallets are created inside Openfort's TEE and never export.
+    fn is_exportable(&self) -> bool {
+        false
+    }
+    fn signs_raw_messages(&self) -> bool {
+        true
+    }
+    fn approval(&self) -> Approval {
+        Approval::ProviderPolicy
+    }
+    fn is_available(&self) -> bool {
+        true
+    }
+}
 
+impl RemoteProvider for Openfort {
     fn credential_fields(&self) -> &'static [CredentialField] {
         FIELDS
     }

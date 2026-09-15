@@ -236,7 +236,7 @@ fn is_token_usable_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{Account, AccountsFile, Keystore, MemoryAccountsStore};
+    use crate::accounts::{Account, AccountsFile, BackendKind, MemoryAccountsStore};
     use std::collections::BTreeMap;
 
     fn make_sub(
@@ -278,7 +278,7 @@ mod tests {
         accounts_map.insert(
             "default".to_string(),
             Account {
-                keystore: Keystore::Ephemeral,
+                backend: BackendKind::Ephemeral,
                 provider: None,
                 active: false,
                 auth_required: Some(false),

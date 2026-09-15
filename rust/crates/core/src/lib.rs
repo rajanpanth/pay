@@ -1,6 +1,7 @@
 // Shared modules
 pub mod accounts;
 mod b58;
+pub mod backend;
 pub mod config;
 pub mod error;
 pub mod explorer;

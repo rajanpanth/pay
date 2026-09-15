@@ -3435,21 +3435,9 @@ async fn resolve_signer_with_store(
                     ))
                 })?;
             // Use the Account's load path so ephemeral entries work too.
-            let signer = if account.keystore == pay_core::accounts::Keystore::Ephemeral {
-                let bytes = account.ephemeral_keypair_bytes().ok_or_else(|| {
-                    pay_core::Error::Config(format!(
-                        "Account `{name}` is ephemeral but has no inline secret_key_b58"
-                    ))
-                })?;
-                pay_core::signer::ResolvedSigner::Memory(Box::new(
-                    pay_kit::mpp::solana_keychain::MemorySigner::from_bytes(&bytes).map_err(
-                        |e| {
-                            pay_core::Error::Config(format!(
-                                "Invalid keypair bytes for `{name}`: {e}"
-                            ))
-                        },
-                    )?,
-                ))
+            let signer = if account.backend == pay_core::accounts::BackendKind::Ephemeral {
+                pay_core::signer::signer_for_ephemeral_account(account)
+                    .map_err(|e| pay_core::Error::Config(format!("Account `{name}`: {e}")))?
             } else {
                 // Off the async worker — see [`blocking_signer_resolution`].
                 let account = account.clone();
@@ -4825,7 +4813,7 @@ endpoints:
     use super::blocking_signer_resolution;
     use super::resolve_signer_with_store;
     use pay_core::accounts::{
-        Account, AccountsFile, Keystore as AcctKeystore, MemoryAccountsStore,
+        Account, AccountsFile, BackendKind as AcctKeystore, MemoryAccountsStore,
     };
     use pay_types::metering::SignerConfig;
     // SolanaSigner trait is brought into scope by the parent module's
@@ -4857,7 +4845,7 @@ endpoints:
         let pubkey = bs58::encode(&VALID_TEST_KEYPAIR_BYTES[32..]).into_string();
         let acct = Account {
             provider: None,
-            keystore: AcctKeystore::Ephemeral,
+            backend: AcctKeystore::Ephemeral,
             active: false,
             auth_required: Some(false),
             pubkey: Some(pubkey.clone()),
@@ -5070,7 +5058,7 @@ endpoints:
         let mut file = AccountsFile::default();
         let bad = Account {
             provider: None,
-            keystore: AcctKeystore::Ephemeral,
+            backend: AcctKeystore::Ephemeral,
             active: false,
             auth_required: Some(false),
             pubkey: Some("4BuiY9QUUfPoAGNJBja3JapAuVWMc9c7in6UCgyC2zPR".to_string()),

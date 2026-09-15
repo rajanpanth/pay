@@ -916,7 +916,7 @@ async fn mpp_build_credential_with_surfnet() {
             "localnet",
             "default",
             pay_core::accounts::Account {
-                keystore: pay_core::accounts::Keystore::Ephemeral,
+                backend: pay_core::accounts::BackendKind::Ephemeral,
                 provider: None,
                 active: false,
                 auth_required: Some(false),
