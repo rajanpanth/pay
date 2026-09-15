@@ -1,0 +1,621 @@
+//! Loopback onboarding: link this terminal to pay-cloud from the browser.
+//!
+//! Same shape as `gh auth login`:
+//!
+//! 1. Generate `state` and a PKCE verifier/challenge (RFC 7636 S256).
+//! 2. Bind an ephemeral `127.0.0.1` listener with a single `GET /callback`.
+//! 3. Open `{cloud_url}/onboard?callback=…&state=…&code_challenge=…` in the
+//!    browser (the URL is also printed so it can be copied).
+//! 4. pay-cloud redirects the browser to the callback with a one-time
+//!    `code`; the handler checks `state` and hands the code back.
+//! 5. `POST {cloud_url}/v1/onboard/exchange` with the code and verifier.
+//!
+//! Milestone 1: the exchange returns a `pending` stub — no wallet material
+//! is provisioned yet. This module is not wired into `pay setup`; the hidden
+//! `pay cloud-onboard` subcommand drives it for development.
+
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::http::{StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::get;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rand::RngCore;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
+
+use crate::components;
+
+/// How long to wait for the browser to hit the callback.
+const CALLBACK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Timeout for the code exchange request.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Never bind the callback listener to a LAN-reachable interface.
+const LOOPBACK_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
+/// Set to skip `webbrowser::open` (headless shells, scripted tests).
+const NO_BROWSER_ENV: &str = "PAY_NO_BROWSER";
+
+pub struct OnboardRequest {
+    /// pay-cloud base URL, e.g. `http://127.0.0.1:8402`.
+    pub cloud_url: String,
+    /// Account name being linked (informational for now).
+    pub account: String,
+}
+
+/// Response of `POST /v1/onboard/exchange`. Every field defaults so the
+/// server can grow the payload without breaking older CLIs.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OnboardResult {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub network: String,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Link this terminal to pay-cloud from the browser (preview).
+#[derive(clap::Args)]
+pub struct CloudOnboardCommand {
+    /// pay-cloud base URL.
+    #[arg(long, default_value = "http://127.0.0.1:8402")]
+    pub url: String,
+
+    /// Account name to link.
+    #[arg(long, default_value = "default")]
+    pub account: String,
+}
+
+impl CloudOnboardCommand {
+    pub fn run(self) -> pay_core::Result<()> {
+        let result = run_loopback_onboarding(&OnboardRequest {
+            cloud_url: self.url,
+            account: self.account,
+        })?;
+        let mut body = format!(
+            "Email: {}\nProvider: {}\nNetwork: {}\nStatus: {}",
+            result.email, result.provider, result.network, result.status
+        );
+        if let Some(message) = result.message.as_deref().filter(|m| !m.is_empty()) {
+            body.push('\n');
+            body.push_str(message);
+        }
+        components::print_notice(components::NoticeLevel::Info, "Terminal linked", &body);
+        Ok(())
+    }
+}
+
+/// Run the full browser round-trip synchronously and return the exchange
+/// result.
+pub fn run_loopback_onboarding(req: &OnboardRequest) -> pay_core::Result<OnboardResult> {
+    let cloud_url = req.cloud_url.trim_end_matches('/').to_string();
+    let pkce = Pkce::generate();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| pay_core::Error::Config(format!("onboarding runtime: {e}")))?;
+    let code = rt.block_on(async {
+        let listener = bind_callback_listener(&pkce.state).await?;
+        let url = build_browser_url(&BrowserUrlParams {
+            cloud_url: &cloud_url,
+            callback: &listener.callback_url(),
+            state: &pkce.state,
+            code_challenge: &pkce.code_challenge,
+            account: &req.account,
+            host: &local_hostname(),
+            cli: env!("CARGO_PKG_VERSION"),
+        });
+        eprintln!("Opening your browser to link this terminal…");
+        eprintln!("{url}");
+        eprintln!();
+        open_browser(&url);
+        listener.wait_for_code(CALLBACK_TIMEOUT).await
+    })?;
+    // The blocking reqwest client must not be used inside a tokio context.
+    drop(rt);
+
+    exchange_code(&cloud_url, &code, &pkce.code_verifier)
+}
+
+// ── PKCE ──────────────────────────────────────────────────────────────────
+
+/// Per-attempt CSRF state and PKCE pair.
+pub struct Pkce {
+    pub state: String,
+    pub code_verifier: String,
+    pub code_challenge: String,
+}
+
+impl Pkce {
+    pub fn generate() -> Self {
+        let code_verifier = random_token();
+        Self {
+            state: random_token(),
+            code_challenge: pkce_challenge(&code_verifier),
+            code_verifier,
+        }
+    }
+}
+
+/// 32 random bytes, base64url without padding (43 chars).
+pub fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// RFC 7636 S256: `BASE64URL-ENCODE(SHA256(ASCII(code_verifier)))`.
+pub fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+// ── Browser URL ───────────────────────────────────────────────────────────
+
+pub struct BrowserUrlParams<'a> {
+    pub cloud_url: &'a str,
+    pub callback: &'a str,
+    pub state: &'a str,
+    pub code_challenge: &'a str,
+    pub account: &'a str,
+    pub host: &'a str,
+    pub cli: &'a str,
+}
+
+/// `{cloud_url}/onboard?callback=…&state=…&code_challenge=…&account=…&host=…&cli=…`
+pub fn build_browser_url(p: &BrowserUrlParams<'_>) -> String {
+    format!(
+        "{}/onboard?callback={}&state={}&code_challenge={}&account={}&host={}&cli={}",
+        p.cloud_url.trim_end_matches('/'),
+        urlencoding::encode(p.callback),
+        urlencoding::encode(p.state),
+        urlencoding::encode(p.code_challenge),
+        urlencoding::encode(p.account),
+        urlencoding::encode(p.host),
+        urlencoding::encode(p.cli),
+    )
+}
+
+fn local_hostname() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn open_browser(url: &str) {
+    if std::env::var_os(NO_BROWSER_ENV).is_some() {
+        return;
+    }
+    // The URL was already printed; a failure here is not fatal.
+    let _ = webbrowser::open(url);
+}
+
+// ── Callback listener ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CallbackQuery {
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+/// Decide whether a `/callback` hit completes the flow. Pure so the state
+/// check is unit-testable without a socket.
+pub fn accept_callback(
+    code: Option<&str>,
+    state: Option<&str>,
+    expected_state: &str,
+) -> Result<String, &'static str> {
+    match (code, state) {
+        (_, None) => Err("missing state"),
+        (_, Some(s)) if s != expected_state => Err("state mismatch"),
+        (None | Some(""), _) => Err("missing code"),
+        (Some(c), _) => Ok(c.to_string()),
+    }
+}
+
+#[derive(Clone)]
+struct CallbackState {
+    expected_state: Arc<str>,
+    code_tx: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+}
+
+async fn callback_handler(
+    State(st): State<CallbackState>,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    match accept_callback(q.code.as_deref(), q.state.as_deref(), &st.expected_state) {
+        Ok(code) => {
+            if let Some(tx) = st.code_tx.lock().unwrap().take() {
+                let _ = tx.send(code);
+            }
+            (StatusCode::OK, Html(success_page())).into_response()
+        }
+        Err(reason) => (StatusCode::BAD_REQUEST, Html(error_page(reason))).into_response(),
+    }
+}
+
+/// Minimal self-contained page shown in the browser tab after the redirect.
+fn page(heading: &str, body: &str) -> String {
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Pay</title>\
+<style>body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;\
+font-family:Inter,system-ui,-apple-system,sans-serif;background:#fff;color:#111}}\
+main{{text-align:center;padding:24px}}h1{{font-size:28px;margin:0 0 12px}}\
+p{{color:#666;font-size:18px;margin:0}}</style></head>\
+<body><main><h1>{heading}</h1><p>{body}</p></main></body></html>"
+    )
+}
+
+fn success_page() -> String {
+    page("You're all set.", "You can return to your terminal.")
+}
+
+fn error_page(reason: &str) -> String {
+    page(
+        "Something went wrong.",
+        &format!(
+            "This link could not be verified ({reason}). Return to your terminal and run <code>pay setup</code> again."
+        ),
+    )
+}
+
+/// A bound `/callback` listener on `127.0.0.1:<ephemeral>`.
+pub struct CallbackListener {
+    pub addr: SocketAddr,
+    code_rx: oneshot::Receiver<String>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+/// Bind the listener and start serving. Must be called inside a tokio
+/// runtime; the server task lives until [`CallbackListener::wait_for_code`]
+/// returns.
+pub async fn bind_callback_listener(expected_state: &str) -> pay_core::Result<CallbackListener> {
+    let listener = tokio::net::TcpListener::bind((LOOPBACK_IP, 0))
+        .await
+        .map_err(|e| pay_core::Error::Config(format!("onboarding callback bind: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| pay_core::Error::Config(format!("onboarding callback local_addr: {e}")))?;
+
+    let (code_tx, code_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let state = CallbackState {
+        expected_state: Arc::from(expected_state),
+        code_tx: Arc::new(Mutex::new(Some(code_tx))),
+    };
+    let app = Router::new()
+        .route("/callback", get(callback_handler))
+        .with_state(state);
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .ok();
+    });
+
+    Ok(CallbackListener {
+        addr,
+        code_rx,
+        shutdown_tx: Some(shutdown_tx),
+        server,
+    })
+}
+
+impl CallbackListener {
+    pub fn callback_url(&self) -> String {
+        format!("http://{}/callback", self.addr)
+    }
+
+    /// Wait for the browser to deliver the code, then shut the server down
+    /// (letting the success page flush first).
+    pub async fn wait_for_code(self, timeout: Duration) -> pay_core::Result<String> {
+        let CallbackListener {
+            code_rx,
+            mut shutdown_tx,
+            server,
+            ..
+        } = self;
+        let outcome = tokio::time::timeout(timeout, code_rx).await;
+        if let Some(tx) = shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+        match outcome {
+            Ok(Ok(code)) => Ok(code),
+            Ok(Err(_)) => Err(pay_core::Error::Config(
+                "onboarding callback listener closed before a code arrived".to_string(),
+            )),
+            Err(_) => Err(pay_core::Error::Config(
+                "Timed out waiting for the browser to finish linking. Run the command again."
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+// ── Exchange ──────────────────────────────────────────────────────────────
+
+/// `POST {cloud_url}/v1/onboard/exchange`. Must be called outside a tokio
+/// runtime (blocking client).
+pub fn exchange_code(
+    cloud_url: &str,
+    code: &str,
+    code_verifier: &str,
+) -> pay_core::Result<OnboardResult> {
+    #[derive(Deserialize, Default)]
+    struct ErrorBody {
+        #[serde(default)]
+        message: Option<String>,
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(EXCHANGE_TIMEOUT)
+        .build()
+        .map_err(|e| pay_core::Error::Config(format!("pay-cloud HTTP client: {e}")))?;
+    let body = serde_json::json!({ "code": code, "code_verifier": code_verifier });
+    let res = client
+        .post(format!(
+            "{}/v1/onboard/exchange",
+            cloud_url.trim_end_matches('/')
+        ))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&body).expect("static JSON shape"))
+        .send()
+        .map_err(|e| pay_core::Error::Config(format!("pay-cloud exchange request failed: {e}")))?;
+    let status = res.status();
+    let bytes = res
+        .bytes()
+        .map_err(|e| pay_core::Error::Config(format!("pay-cloud exchange read failed: {e}")))?;
+
+    if !status.is_success() {
+        let message = serde_json::from_slice::<ErrorBody>(&bytes)
+            .ok()
+            .and_then(|e| e.message)
+            .filter(|m| !m.is_empty())
+            .unwrap_or_else(|| format!("pay-cloud exchange failed: HTTP {status}"));
+        return Err(pay_core::Error::Config(message));
+    }
+
+    serde_json::from_slice(&bytes).map_err(|e| {
+        pay_core::Error::Config(format!(
+            "pay-cloud exchange returned an unexpected body: {e}"
+        ))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Json;
+    use axum::routing::post;
+
+    const RFC_VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const RFC_CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn pkce_matches_rfc_7636_vector() {
+        assert_eq!(pkce_challenge(RFC_VERIFIER), RFC_CHALLENGE);
+    }
+
+    #[test]
+    fn generated_material_is_base64url_and_consistent() {
+        let pkce = Pkce::generate();
+        for token in [&pkce.state, &pkce.code_verifier, &pkce.code_challenge] {
+            assert_eq!(token.len(), 43);
+            assert!(
+                token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "{token}"
+            );
+        }
+        assert_ne!(pkce.state, pkce.code_verifier);
+        assert_eq!(pkce.code_challenge, pkce_challenge(&pkce.code_verifier));
+    }
+
+    #[test]
+    fn browser_url_is_percent_encoded() {
+        let url = build_browser_url(&BrowserUrlParams {
+            cloud_url: "http://127.0.0.1:8402/",
+            callback: "http://127.0.0.1:53211/callback",
+            state: "st_ate-1234567890",
+            code_challenge: RFC_CHALLENGE,
+            account: "my account&x",
+            host: "ludo's mbp",
+            cli: "0.29.0",
+        });
+        assert_eq!(
+            url,
+            format!(
+                "http://127.0.0.1:8402/onboard?callback=http%3A%2F%2F127.0.0.1%3A53211%2Fcallback\
+&state=st_ate-1234567890&code_challenge={RFC_CHALLENGE}&account=my%20account%26x&host=ludo%27s%20mbp&cli=0.29.0"
+            )
+        );
+    }
+
+    #[test]
+    fn accept_callback_checks_state_and_code() {
+        assert_eq!(
+            accept_callback(Some("abc"), Some("s"), "s").as_deref(),
+            Ok("abc")
+        );
+        assert_eq!(
+            accept_callback(Some("abc"), Some("other"), "s"),
+            Err("state mismatch")
+        );
+        assert_eq!(
+            accept_callback(Some("abc"), None, "s"),
+            Err("missing state")
+        );
+        assert_eq!(accept_callback(None, Some("s"), "s"), Err("missing code"));
+        assert_eq!(
+            accept_callback(Some(""), Some("s"), "s"),
+            Err("missing code")
+        );
+    }
+
+    #[test]
+    fn callback_listener_end_to_end() {
+        let rt = runtime();
+        rt.block_on(async {
+            let mut listener = bind_callback_listener("expected-state").await.unwrap();
+            assert_eq!(listener.addr.ip(), LOOPBACK_IP);
+            let base = listener.callback_url();
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+
+            // Wrong state: 400 page, oneshot untouched.
+            let res = client
+                .get(format!("{base}?code=evil&state=wrong"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
+            assert!(res.text().await.unwrap().contains("state mismatch"));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut listener.code_rx)
+                    .await
+                    .is_err(),
+                "wrong state must not resolve the code"
+            );
+
+            // Right state: success page, code delivered.
+            let res = client
+                .get(format!("{base}?code=the-code&state=expected-state"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), reqwest::StatusCode::OK);
+            assert!(res.text().await.unwrap().contains("You're all set"));
+
+            let code = listener
+                .wait_for_code(Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!(code, "the-code");
+        });
+    }
+
+    #[test]
+    fn callback_listener_times_out() {
+        let rt = runtime();
+        rt.block_on(async {
+            let listener = bind_callback_listener("s").await.unwrap();
+            let err = listener
+                .wait_for_code(Duration::from_millis(50))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Timed out"), "{err}");
+        });
+    }
+
+    /// Serve `app` on an ephemeral loopback port from a background thread
+    /// with its own runtime so the test thread can use the blocking client.
+    fn spawn_stub(app: Router) -> String {
+        let (tx, rx) = std::sync::mpsc::channel::<SocketAddr>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind((LOOPBACK_IP, 0))
+                    .await
+                    .unwrap();
+                tx.send(listener.local_addr().unwrap()).unwrap();
+                axum::serve(listener, app).await.ok();
+            });
+        });
+        format!("http://{}", rx.recv().unwrap())
+    }
+
+    #[test]
+    fn exchange_parses_success_response() {
+        let app = Router::new().route(
+            "/v1/onboard/exchange",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(body["code"], "c0de");
+                assert_eq!(body["code_verifier"], RFC_VERIFIER);
+                Json(serde_json::json!({
+                    "provider": "pay-cloud",
+                    "status": "pending",
+                    "email": "a@b.co",
+                    "network": "mainnet",
+                    "message": "Wallet provisioning is not available yet.",
+                    "future_field": { "ignored": true },
+                }))
+            }),
+        );
+        let base = spawn_stub(app);
+
+        let result = exchange_code(&format!("{base}/"), "c0de", RFC_VERIFIER).unwrap();
+        assert_eq!(result.provider, "pay-cloud");
+        assert_eq!(result.status, "pending");
+        assert_eq!(result.email, "a@b.co");
+        assert_eq!(result.network, "mainnet");
+        assert_eq!(
+            result.message.as_deref(),
+            Some("Wallet provisioning is not available yet.")
+        );
+    }
+
+    #[test]
+    fn exchange_surfaces_server_error_message() {
+        let app = Router::new().route(
+            "/v1/onboard/exchange",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid_grant",
+                        "message": "The authorization code is unknown.",
+                    })),
+                )
+            }),
+        );
+        let base = spawn_stub(app);
+
+        let err = exchange_code(&base, "c0de", RFC_VERIFIER).unwrap_err();
+        assert!(
+            matches!(&err, pay_core::Error::Config(m) if m == "The authorization code is unknown."),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn exchange_falls_back_to_http_status_without_message() {
+        let app = Router::new().route(
+            "/v1/onboard/exchange",
+            post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "boom") }),
+        );
+        let base = spawn_stub(app);
+
+        let err = exchange_code(&base, "c0de", RFC_VERIFIER).unwrap_err();
+        assert!(err.to_string().contains("HTTP 500"), "{err}");
+    }
+}
