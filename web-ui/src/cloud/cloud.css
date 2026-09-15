@@ -204,3 +204,265 @@ body,
     font-size: 19px;
   }
 }
+
+/* ── Terminal theme: shown when the page was opened by `pay setup` ──────────
+   Tokens follow pay.sh: black canvas, #0e0e0e surface, hairline borders,
+   white primary action, green focus. Mono everywhere. */
+
+:root {
+  --term-page: #000000;
+  --term-surface: #0e0e0e;
+  --term-surface-raised: #161616;
+  --term-border: rgba(255, 255, 255, 0.08);
+  --term-fg: #ffffff;
+  --term-fg-subtle: #a6a6a6;
+  --term-fg-dim: #565656;
+  --term-green: #7fec86;
+  --term-red: #ff6159;
+  --term-yellow: #ffbd2e;
+  --term-dot-green: #28c941;
+  --term-font: "JetBrains Mono", Menlo, "SF Mono", ui-monospace, Consolas, monospace;
+}
+
+html[data-cloud-theme="terminal"] body,
+html[data-cloud-theme="terminal"] #root {
+  background: var(--term-page);
+  color: var(--term-fg);
+  font-family: var(--term-font);
+}
+
+.cloud-page--terminal {
+  padding: 48px 24px;
+}
+
+.cloud-term {
+  width: 100%;
+  max-width: 880px;
+  border: 1px solid var(--term-border);
+  background: var(--term-surface);
+  font-family: var(--term-font);
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--term-fg);
+}
+
+.cloud-term-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: 40px;
+  padding: 0 14px;
+  border-bottom: 1px solid var(--term-border);
+  color: var(--term-fg-subtle);
+  font-size: 13px;
+}
+
+.cloud-term-dots {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.cloud-term-dot {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+}
+
+.cloud-term-dot--red {
+  background: var(--term-red);
+}
+
+.cloud-term-dot--yellow {
+  background: var(--term-yellow);
+}
+
+.cloud-term-dot--green {
+  background: var(--term-dot-green);
+}
+
+.cloud-term-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cloud-term-body {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  padding: 28px 32px 32px;
+}
+
+.cloud-term-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* One grid cell per banner character; the glyph colour is carried on
+   `color` so both cell kinds derive from the same gradient. */
+.cloud-term-art {
+  --term-cell-w: 9px;
+  --term-cell-h: 16px;
+  display: grid;
+  grid-auto-rows: var(--term-cell-h);
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.cloud-term-cell {
+  display: block;
+  width: var(--term-cell-w);
+  height: var(--term-cell-h);
+}
+
+.cloud-term-cell--block {
+  background: currentColor;
+}
+
+.cloud-term-cell--frame {
+  background: currentColor;
+  opacity: 0.28;
+}
+
+.cloud-term-tagline {
+  color: var(--term-fg);
+}
+
+.cloud-term-lines,
+.cloud-term-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cloud-term-line {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.cloud-term-line--muted {
+  color: var(--term-fg-subtle);
+}
+
+.cloud-term-line--error {
+  color: var(--term-red);
+}
+
+.cloud-term-prompt {
+  color: var(--term-green);
+  font-weight: 700;
+}
+
+.cloud-term-prompt--field {
+  flex: none;
+  padding-top: 11px;
+}
+
+.cloud-term-field {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-top: 12px;
+  cursor: text;
+}
+
+.cloud-term-input {
+  flex: 1;
+  min-width: 0;
+  height: 44px;
+  padding: 0 12px;
+  border: 1px solid var(--term-border);
+  border-radius: 0;
+  background: var(--term-surface-raised);
+  color: var(--term-fg);
+  font: inherit;
+  caret-color: var(--term-green);
+  outline: none;
+  transition: border-color 120ms ease;
+}
+
+.cloud-term-input::placeholder {
+  color: var(--term-fg-dim);
+}
+
+.cloud-term-input:focus {
+  border-color: var(--term-green);
+}
+
+.cloud-term-input:disabled {
+  color: var(--term-fg-subtle);
+}
+
+.cloud-term-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  margin-top: 4px;
+}
+
+.cloud-term-button {
+  height: 44px;
+  padding: 0 28px;
+  border: 1px solid var(--term-fg);
+  border-radius: 0;
+  background: var(--term-fg);
+  color: #000000;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease;
+}
+
+.cloud-term-button:hover:enabled {
+  background: var(--term-green);
+  border-color: var(--term-green);
+}
+
+.cloud-term-button:disabled {
+  background: transparent;
+  color: var(--term-fg-dim);
+  border-color: var(--term-border);
+  cursor: default;
+}
+
+.cloud-term-button:focus-visible {
+  outline: 2px solid var(--term-green);
+  outline-offset: 2px;
+}
+
+.cloud-term-hint {
+  color: var(--term-fg-subtle);
+  font-size: 13px;
+}
+
+@media (max-width: 600px) {
+  .cloud-page--terminal {
+    padding: 16px 12px;
+  }
+
+  .cloud-term-body {
+    padding: 20px 16px 24px;
+    gap: 20px;
+  }
+
+  .cloud-term-art {
+    --term-cell-w: 6px;
+    --term-cell-h: 11px;
+  }
+
+  .cloud-term-field {
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .cloud-term-prompt--field {
+    padding-top: 0;
+  }
+}
