@@ -300,31 +300,19 @@ html[data-cloud-theme="terminal"] #root {
   gap: 8px;
 }
 
-/* One grid cell per banner character; the glyph colour is carried on
-   `color` so both cell kinds derive from the same gradient. */
-.cloud-term-art {
-  --term-cell-w: 9px;
-  --term-cell-h: 16px;
-  display: grid;
-  grid-auto-rows: var(--term-cell-h);
-  width: max-content;
-  max-width: 100%;
-  overflow-x: auto;
-}
-
-.cloud-term-cell {
+/* pay-web-ui's tiled wordmark, at the hero's 80px height. The gaps and
+   outline frames between tiles are part of the asset. */
+.cloud-term-wordmark {
   display: block;
-  width: var(--term-cell-w);
-  height: var(--term-cell-h);
+  height: 80px;
+  color: var(--term-fg);
 }
 
-.cloud-term-cell--block {
-  background: currentColor;
-}
-
-.cloud-term-cell--frame {
-  background: currentColor;
-  opacity: 0.28;
+.cloud-term-wordmark svg {
+  display: block;
+  height: 100%;
+  width: auto;
+  max-width: 100%;
 }
 
 .cloud-term-tagline {
@@ -452,9 +440,8 @@ html[data-cloud-theme="terminal"] #root {
     gap: 20px;
   }
 
-  .cloud-term-art {
-    --term-cell-w: 6px;
-    --term-cell-h: 11px;
+  .cloud-term-wordmark {
+    height: 56px;
   }
 
   .cloud-term-field {

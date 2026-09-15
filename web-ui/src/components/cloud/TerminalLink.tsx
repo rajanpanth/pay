@@ -1,6 +1,6 @@
 import { useId, useState, type FormEvent } from "react";
 import { isValidEmail, type OnboardParams } from "../../cloud/lib/onboard";
-import { PayBanner } from "./PayBanner";
+import { PayWordmark } from "./PayWordmark";
 import { TerminalFrame } from "./TerminalFrame";
 
 interface Props {
@@ -29,7 +29,10 @@ export function TerminalLink({ params, submitting, error, onContinue }: Props) {
 
   return (
     <TerminalFrame title={title}>
-      <PayBanner />
+      <div className="cloud-term-banner">
+        <PayWordmark />
+        <div className="cloud-term-tagline">Toolchain for agentic payments</div>
+      </div>
 
       <div className="cloud-term-lines">
         <div className="cloud-term-line">
