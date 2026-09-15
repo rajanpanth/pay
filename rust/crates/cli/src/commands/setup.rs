@@ -20,8 +20,9 @@ pub struct SetupCommand {
     pub force: bool,
 
     /// Storage backend: "keychain" (macOS), "gnome-keyring" (Linux),
-    /// "windows-hello" (Windows), "file" (headless fallback), or a remote
-    /// signing backend registered in `pay_core::remote` ("openfort").
+    /// "windows-hello" (Windows), "file" (headless fallback), "cloud" (a
+    /// remote wallet linked from your browser), or a remote signing backend
+    /// registered in `pay_core::remote` ("openfort").
     #[arg(long)]
     pub backend: Option<String>,
 
@@ -111,6 +112,13 @@ impl SetupCommand {
         // Resolve the backend first so an unavailable headless Secret Service
         // does not leave MCP/agent configuration partially installed.
         let backend = super::account::new::resolve_backend(self.backend.as_deref())?;
+
+        // Browser-linked remote wallet: the page owns sign-in, custody
+        // choice and funding, so none of the local keypair steps below
+        // apply. Nothing is installed until provisioning returns an account.
+        if backend == super::cloud_onboard::CLOUD_BACKEND_FLAG {
+            return super::cloud_onboard::run_setup_onboarding(&account_name);
+        }
 
         // Offer to install the agent skill if npx is available.
         maybe_install_skill();

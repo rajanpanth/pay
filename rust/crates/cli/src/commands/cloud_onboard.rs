@@ -40,6 +40,50 @@ const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const LOOPBACK_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// Set to skip `webbrowser::open` (headless shells, scripted tests).
 const NO_BROWSER_ENV: &str = "PAY_NO_BROWSER";
+/// Overrides the pay-cloud base URL, e.g. `http://127.0.0.1:8402` for a
+/// local `pay-cloud`.
+const CLOUD_URL_ENV: &str = "PAY_CLOUD_URL";
+/// Production pay-cloud.
+const DEFAULT_CLOUD_URL: &str = "https://cloud.pay.sh";
+
+/// `--backend` value that selects the browser-linked remote wallet in
+/// `pay setup` and `pay account new`.
+pub const CLOUD_BACKEND_FLAG: &str = "cloud";
+/// Picker label for the remote wallet.
+pub const CLOUD_BACKEND_LABEL: &str = "Remote wallet (sign in from your browser)";
+
+/// pay-cloud base URL: `PAY_CLOUD_URL` when set, else production.
+pub fn default_cloud_url() -> String {
+    std::env::var(CLOUD_URL_ENV)
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| DEFAULT_CLOUD_URL.to_string())
+}
+
+/// `pay setup --backend cloud`: link this terminal through the browser and
+/// report the outcome. Wallet provisioning is not available yet, so no
+/// account is written; the exchange result is shown as is.
+pub fn run_setup_onboarding(account: &str) -> pay_core::Result<()> {
+    let result = run_loopback_onboarding(&OnboardRequest {
+        cloud_url: default_cloud_url(),
+        account: account.to_string(),
+    })?;
+    print_result(&result);
+    Ok(())
+}
+
+fn print_result(result: &OnboardResult) {
+    let mut body = format!(
+        "Email: {}\nProvider: {}\nNetwork: {}\nStatus: {}",
+        result.email, result.provider, result.network, result.status
+    );
+    if let Some(message) = result.message.as_deref().filter(|m| !m.is_empty()) {
+        body.push('\n');
+        body.push_str(message);
+    }
+    components::print_notice(components::NoticeLevel::Info, "Terminal linked", &body);
+}
 
 pub struct OnboardRequest {
     /// pay-cloud base URL, e.g. `http://127.0.0.1:8402`.
@@ -67,9 +111,9 @@ pub struct OnboardResult {
 /// Link this terminal to pay-cloud from the browser (preview).
 #[derive(clap::Args)]
 pub struct CloudOnboardCommand {
-    /// pay-cloud base URL.
-    #[arg(long, default_value = "http://127.0.0.1:8402")]
-    pub url: String,
+    /// pay-cloud base URL. Defaults to `PAY_CLOUD_URL`, else production.
+    #[arg(long)]
+    pub url: Option<String>,
 
     /// Account name to link.
     #[arg(long, default_value = "default")]
@@ -79,18 +123,10 @@ pub struct CloudOnboardCommand {
 impl CloudOnboardCommand {
     pub fn run(self) -> pay_core::Result<()> {
         let result = run_loopback_onboarding(&OnboardRequest {
-            cloud_url: self.url,
+            cloud_url: self.url.unwrap_or_else(default_cloud_url),
             account: self.account,
         })?;
-        let mut body = format!(
-            "Email: {}\nProvider: {}\nNetwork: {}\nStatus: {}",
-            result.email, result.provider, result.network, result.status
-        );
-        if let Some(message) = result.message.as_deref().filter(|m| !m.is_empty()) {
-            body.push('\n');
-            body.push_str(message);
-        }
-        components::print_notice(components::NoticeLevel::Info, "Terminal linked", &body);
+        print_result(&result);
         Ok(())
     }
 }

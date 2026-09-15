@@ -278,6 +278,7 @@ fn main() {
         || matches!(
             command,
             Command::Setup(_)
+                | Command::CloudOnboard(_)
                 | Command::Account { .. }
                 | Command::Whoami(_)
                 | Command::Skills { .. }

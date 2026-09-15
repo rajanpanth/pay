@@ -75,6 +75,13 @@ pub fn create_account(
 ) -> pay_core::Result<(String, &'static str)> {
     let backend_id = resolve_backend(backend)?;
 
+    if backend_id == crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG {
+        return Err(pay_core::Error::Config(
+            "The browser-linked remote wallet is set up with `pay setup --backend cloud`."
+                .to_string(),
+        ));
+    }
+
     if let Some(provider) = pay_core::remote::provider(&backend_id) {
         let inputs = remote.clone().with_env_wallet_id(provider.id());
         return create_remote_account(name, provider, force, &inputs);
@@ -562,6 +569,9 @@ fn available_backends_hint() -> String {
     };
 
     std::iter::once(platform.flag())
+        .chain(std::iter::once(
+            crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG,
+        ))
         .chain(pay_core::remote::providers().map(|p| p.flag()))
         .map(|id| format!("'{id}'"))
         .collect::<Vec<_>>()
@@ -682,6 +692,10 @@ pub fn pick_backend() -> pay_core::Result<String> {
     // live in the platform secret store — only offer them when one is
     // available.
     if platform.is_some() {
+        options.push(Opt {
+            id: crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG,
+            label: crate::commands::cloud_onboard::CLOUD_BACKEND_LABEL.to_string(),
+        });
         options.extend(pay_core::remote::providers().map(|p| opt(p)));
     }
 
