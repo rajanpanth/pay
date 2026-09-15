@@ -63,6 +63,13 @@ impl SetupCommand {
     }
 
     pub fn run(self) -> pay_core::Result<()> {
+        // Same banner as `pay help` and `pay gate api`; empty for agents.
+        let banner = crate::components::render_pay_banner(crate::components::PAY_SH_TAGLINE);
+        if !banner.is_empty() {
+            eprintln!("{banner}");
+            eprintln!();
+        }
+
         if self.update {
             return run_update();
         }
