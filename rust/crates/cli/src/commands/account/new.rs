@@ -669,13 +669,15 @@ pub fn pick_backend() -> pay_core::Result<String> {
 
     struct Opt {
         id: &'static str,
-        label: String,
+        name: String,
+        detail: String,
     }
 
     fn opt(backend: &dyn pay_core::backend::SigningBackend) -> Opt {
         Opt {
             id: backend.flag(),
-            label: format!("{} ({})", backend.display_name(), backend.description()),
+            name: backend.display_name().to_string(),
+            detail: backend.description().to_string(),
         }
     }
 
@@ -695,7 +697,8 @@ pub fn pick_backend() -> pay_core::Result<String> {
     if platform.is_some() {
         options.push(Opt {
             id: crate::commands::cloud_onboard::CLOUD_BACKEND_FLAG,
-            label: crate::commands::cloud_onboard::CLOUD_BACKEND_LABEL.to_string(),
+            name: crate::commands::cloud_onboard::CLOUD_BACKEND_NAME.to_string(),
+            detail: crate::commands::cloud_onboard::CLOUD_BACKEND_DETAIL.to_string(),
         });
     }
 
@@ -709,15 +712,27 @@ pub fn pick_backend() -> pay_core::Result<String> {
         ));
     }
 
-    let items: Vec<String> = options.iter().map(|o| o.label.clone()).collect();
+    // Two aligned columns: the backend name, then what it means for the
+    // user, dimmed. The theme highlights the whole active row.
+    let name_width = options
+        .iter()
+        .map(|o| o.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let items: Vec<String> = options
+        .iter()
+        .map(|o| format!("{:<name_width$}   {}", o.name, o.detail.dimmed()))
+        .collect();
 
     eprintln!();
-    let selection = Select::new()
-        .with_prompt("Where should pay store your account?")
+    let selection = Select::with_theme(&dialoguer::theme::ColorfulTheme::default())
+        .with_prompt("Where should pay keep your wallet?")
         .items(&items)
         .default(0)
-        .interact()
-        .map_err(|e| pay_core::Error::Config(format!("Selection cancelled: {e}")))?;
+        .report(true)
+        .interact_opt()
+        .map_err(|e| pay_core::Error::Config(format!("Selection failed: {e}")))?
+        .ok_or_else(|| pay_core::Error::Config("Setup cancelled.".to_string()))?;
 
     Ok(options[selection].id.to_string())
 }

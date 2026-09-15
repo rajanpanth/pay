@@ -55,8 +55,10 @@ const LOCAL_CLOUD_URL: &str = "http://127.0.0.1:8402";
 /// `--backend` value that selects the browser-linked remote wallet in
 /// `pay setup` and `pay account new`.
 pub const CLOUD_BACKEND_FLAG: &str = "cloud";
-/// Picker label for the remote wallet.
-pub const CLOUD_BACKEND_LABEL: &str = "Remote wallet (sign in from your browser)";
+/// Picker name and detail for the remote wallet.
+pub const CLOUD_BACKEND_NAME: &str = "Remote wallet";
+pub const CLOUD_BACKEND_DETAIL: &str =
+    "sign in from your browser; funds and approvals live at cloud.pay.sh";
 
 /// pay-cloud base URL: `PAY_CLOUD_URL` when set, else the local server when
 /// `PAY_CLOUD_LOCAL` is on, else production.
