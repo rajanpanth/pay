@@ -186,12 +186,16 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    pub fn bad_request(error: &'static str, message: impl Into<String>) -> Self {
+    pub fn new(status: StatusCode, error: &'static str, message: impl Into<String>) -> Self {
         Self {
-            status: StatusCode::BAD_REQUEST,
+            status,
             error,
             message: message.into(),
         }
+    }
+
+    pub fn bad_request(error: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, error, message)
     }
 
     pub fn invalid_grant() -> Self {

@@ -5161,6 +5161,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.22.1",
+ "bs58",
  "clap",
  "include_dir",
  "mime_guess",

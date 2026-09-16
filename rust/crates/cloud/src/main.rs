@@ -43,6 +43,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| format!("http://{}:{}", args.bind, args.port));
     let state = AppState::new(public_url.clone());
     info!(public_url, drivers = ?state.driver_ids(), "wallet drivers");
+    #[cfg(feature = "coinflow")]
+    let state = match pay_cloud::funding::Config::from_env()? {
+        Some(cfg) => {
+            info!(
+                env = ?cfg.env,
+                merchant = %cfg.merchant_id,
+                settle_to_customer = cfg.settle_to_customer,
+                webhooks = cfg.webhook_key.is_some(),
+                "card purchases enabled (Coinflow)"
+            );
+            state.with_funding(pay_cloud::funding::Funding::new(cfg))
+        }
+        None => {
+            info!(
+                "card purchases disabled: set {} to enable",
+                pay_cloud::funding::API_KEY_ENV
+            );
+            state
+        }
+    };
     let app = pay_cloud::router(state).layer(TraceLayer::new_for_http());
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

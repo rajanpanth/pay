@@ -31,6 +31,9 @@ use serde_json::json;
 
 pub use onboard::{OnboardSession, SESSION_TTL};
 
+#[cfg(feature = "coinflow")]
+pub mod funding;
+
 static ASSETS: Dir<'_> = include_dir!("$OUT_DIR/cloud-dist");
 
 /// Most sessions held at once. A session is a few hundred bytes and lives
@@ -63,6 +66,9 @@ pub struct AppState {
     by_state: Arc<Mutex<HashMap<String, String>>>,
     drivers: Arc<Vec<Box<dyn drivers::WalletDriver>>>,
     public_url: String,
+    /// Card purchases through Coinflow; `None` until configured.
+    #[cfg(feature = "coinflow")]
+    funding: Option<Arc<funding::Funding>>,
 }
 
 impl AppState {
@@ -83,7 +89,21 @@ impl AppState {
             by_state: Arc::default(),
             drivers: Arc::new(drivers),
             public_url: public_url.into().trim_end_matches('/').to_string(),
+            #[cfg(feature = "coinflow")]
+            funding: None,
         }
+    }
+
+    /// Enable card purchases with this Coinflow merchant.
+    #[cfg(feature = "coinflow")]
+    pub fn with_funding(mut self, funding: funding::Funding) -> Self {
+        self.funding = Some(Arc::new(funding));
+        self
+    }
+
+    #[cfg(feature = "coinflow")]
+    pub fn funding(&self) -> Option<&funding::Funding> {
+        self.funding.as_deref()
     }
 
     pub fn public_url(&self) -> &str {
@@ -204,7 +224,7 @@ impl AppState {
 
 /// Full pay-cloud router: health, onboarding JSON endpoints, embedded SPA.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/api/onboard/start", post(onboard::start))
         .route("/api/onboard/{provider}/complete", post(onboard::complete))
@@ -212,8 +232,13 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(serve_index))
         .route("/onboard", get(serve_index))
         .route("/onboard/{*rest}", get(serve_index))
-        .fallback(get(serve_static))
-        .with_state(state)
+        .route("/fund", get(serve_index));
+    #[cfg(feature = "coinflow")]
+    let router = router
+        .route("/api/fund/start", post(funding::start))
+        .route("/api/fund/webhook", post(funding::webhook))
+        .route("/api/fund/{payment_id}", get(funding::status));
+    router.fallback(get(serve_static)).with_state(state)
 }
 
 async fn health() -> axum::Json<serde_json::Value> {
