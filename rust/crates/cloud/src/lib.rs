@@ -33,6 +33,26 @@ pub use onboard::{OnboardSession, SESSION_TTL};
 
 static ASSETS: Dir<'_> = include_dir!("$OUT_DIR/cloud-dist");
 
+/// Most sessions held at once. A session is a few hundred bytes and lives
+/// five minutes, so this bounds the store at a few megabytes while leaving
+/// room for far more concurrent sign-ins than one server will see.
+pub const MAX_SESSIONS: usize = 4096;
+
+/// The session store is at capacity with live sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionsFull;
+
+/// Why a session could not be reserved for provisioning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimError {
+    /// No live session for this state and provider.
+    Unknown,
+    /// Another completion for the same sign-in is provisioning right now.
+    InProgress,
+    /// The wallet was already provisioned; the code is waiting to be exchanged.
+    Completed,
+}
+
 /// Shared server state: pending sessions keyed by `sha256(code)` hex, an
 /// index from CLI `state` to that key (the consent page echoes `state`),
 /// the compiled-in wallet drivers, and the public base URL consent pages
@@ -86,15 +106,24 @@ impl AppState {
         self.drivers.iter().map(|d| d.id()).collect()
     }
 
-    /// Store a session, purging expired ones first.
-    pub fn insert_session(&self, session: OnboardSession) {
-        let now = Instant::now();
+    /// Store a session. The store is bounded: when it is full, expired
+    /// sessions are swept, and if it is still full the session is refused.
+    /// Anyone can call `start`, so this is what keeps memory finite under
+    /// a flood; live sessions are never evicted for new ones.
+    pub fn insert_session(&self, session: OnboardSession) -> Result<(), SessionsFull> {
         let mut sessions = self.sessions.lock().unwrap();
         let mut by_state = self.by_state.lock().unwrap();
-        sessions.retain(|_, s| !s.is_expired_at(now));
-        by_state.retain(|_, key| sessions.contains_key(key));
+        if sessions.len() >= MAX_SESSIONS {
+            let now = Instant::now();
+            sessions.retain(|_, s| !s.is_expired_at(now));
+            by_state.retain(|_, key| sessions.contains_key(key));
+            if sessions.len() >= MAX_SESSIONS {
+                return Err(SessionsFull);
+            }
+        }
         by_state.insert(session.state.clone(), session.key());
         sessions.insert(session.key(), session);
+        Ok(())
     }
 
     /// Remove and return the session for `code`. `None` when unknown or
@@ -113,8 +142,47 @@ impl AppState {
         (!session.is_expired_at(Instant::now())).then_some(session)
     }
 
-    /// Park a provisioned wallet on the session for `state`. False when the
-    /// session is gone.
+    /// Reserve the session for `state` for one provisioning run by
+    /// `provider`, returning a copy of it. Provisioning creates a wallet
+    /// at the provider, which cannot be undone, so exactly one completion
+    /// may run per session: a second concurrent one is told it is in
+    /// progress, and a later one that it is already done.
+    pub fn claim_provisioning(
+        &self,
+        state: &str,
+        provider: &str,
+    ) -> Result<OnboardSession, ClaimError> {
+        let Some(key) = self.by_state.lock().unwrap().get(state).cloned() else {
+            return Err(ClaimError::Unknown);
+        };
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(&key).ok_or(ClaimError::Unknown)?;
+        if session.is_expired_at(Instant::now()) || session.provider.as_deref() != Some(provider) {
+            return Err(ClaimError::Unknown);
+        }
+        if session.wallet.is_some() {
+            return Err(ClaimError::Completed);
+        }
+        if session.provisioning {
+            return Err(ClaimError::InProgress);
+        }
+        session.provisioning = true;
+        Ok(session.clone())
+    }
+
+    /// Undo [`claim_provisioning`](Self::claim_provisioning) after the
+    /// provider failed, so the user can retry the sign-in.
+    pub fn release_provisioning(&self, state: &str) {
+        let Some(key) = self.by_state.lock().unwrap().get(state).cloned() else {
+            return;
+        };
+        if let Some(session) = self.sessions.lock().unwrap().get_mut(&key) {
+            session.provisioning = false;
+        }
+    }
+
+    /// Park a provisioned wallet on the session for `state`, ending its
+    /// claim. False when the session is gone.
     pub fn attach_wallet(&self, state: &str, wallet: drivers::ProvisionedWallet) -> bool {
         let Some(key) = self.by_state.lock().unwrap().get(state).cloned() else {
             return false;
@@ -122,6 +190,7 @@ impl AppState {
         match self.sessions.lock().unwrap().get_mut(&key) {
             Some(session) => {
                 session.wallet = Some(wallet);
+                session.provisioning = false;
                 true
             }
             None => false,
@@ -595,5 +664,152 @@ mod tests {
                 .to_string();
             assert!(ct.starts_with("text/html"), "{path}: {ct}");
         }
+    }
+
+    /// A driver whose provisioning blocks until the test opens the gate,
+    /// counting how many times it ran.
+    struct GatedDriver {
+        gate: Arc<tokio::sync::Notify>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl drivers::WalletDriver for GatedDriver {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn display_name(&self) -> &'static str {
+            "Gated custody"
+        }
+        fn consent_url(&self, redirect_uri: &str, state: &str) -> String {
+            FakeDriver.consent_url(redirect_uri, state)
+        }
+        fn parse_grant(
+            &self,
+            fragment: &str,
+        ) -> Result<(drivers::ConsentGrant, String), drivers::DriverError> {
+            FakeDriver.parse_grant(fragment)
+        }
+        async fn provision(
+            &self,
+            grant: &drivers::ConsentGrant,
+        ) -> Result<drivers::ProvisionedWallet, drivers::DriverError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.gate.notified().await;
+            FakeDriver.provision(grant).await
+        }
+    }
+
+    /// Two completions for one sign-in must provision exactly one wallet:
+    /// the second is refused while the first is still at the provider.
+    #[tokio::test]
+    async fn concurrent_completions_provision_once() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = AppState::with_drivers(
+            PUBLIC_URL,
+            vec![Box::new(GatedDriver {
+                gate: gate.clone(),
+                calls: calls.clone(),
+            })],
+        );
+        let app = router(state.clone());
+        let mut body = start_body();
+        body["provider"] = json!("fake");
+        let (status, _) = call(&app, Method::POST, "/api/onboard/start", Some(body)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let complete_body = json!({ "fragment": format!("#api_key=sk_ok&state={STATE}") });
+        let first = tokio::spawn({
+            let app = app.clone();
+            let body = complete_body.clone();
+            async move { call(&app, Method::POST, "/api/onboard/fake/complete", Some(body)).await }
+        });
+        // Let the first completion reach the provider and park there.
+        while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        let (status, res) = call(
+            &app,
+            Method::POST,
+            "/api/onboard/fake/complete",
+            Some(complete_body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{res}");
+        assert_eq!(res["error"], "provisioning");
+
+        gate.notify_one();
+        let (status, res) = first.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{res}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Done: a third attempt is told so, and the code exchanges as ready.
+        let (status, res) = call(
+            &app,
+            Method::POST,
+            "/api/onboard/fake/complete",
+            Some(complete_body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{res}");
+        assert_eq!(res["error"], "already_completed");
+        let session = state.session_by_state(STATE).unwrap();
+        assert!(session.wallet.is_some());
+        assert!(!session.provisioning);
+    }
+
+    fn session_with_state(state: &str) -> OnboardSession {
+        OnboardSession::new(
+            None,
+            state.to_string(),
+            CALLBACK.to_string(),
+            RFC_CHALLENGE.to_string(),
+            Some("fake".to_string()),
+        )
+    }
+
+    #[tokio::test]
+    async fn start_is_refused_when_the_store_is_full_of_live_sessions() {
+        let state = test_state();
+        for i in 0..MAX_SESSIONS {
+            state
+                .insert_session(session_with_state(&format!("state-{i:0>26}")))
+                .unwrap();
+        }
+        assert_eq!(state.session_count(), MAX_SESSIONS);
+        assert_eq!(
+            state.insert_session(session_with_state(STATE)),
+            Err(SessionsFull)
+        );
+
+        let app = router(state.clone());
+        let (status, res) =
+            call(&app, Method::POST, "/api/onboard/start", Some(start_body())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{res}");
+        assert_eq!(res["error"], "busy");
+        assert_eq!(state.session_count(), MAX_SESSIONS, "nothing was evicted");
+    }
+
+    #[test]
+    fn a_full_store_sweeps_expired_sessions_before_refusing() {
+        let state = test_state();
+        let expired_at = Instant::now()
+            .checked_sub(onboard::SESSION_TTL + std::time::Duration::from_secs(1))
+            .unwrap();
+        for i in 0..MAX_SESSIONS {
+            let mut session = session_with_state(&format!("state-{i:0>26}"));
+            session.created_at = expired_at;
+            state.insert_session(session).unwrap();
+        }
+        state.insert_session(session_with_state(STATE)).unwrap();
+        assert_eq!(state.session_count(), 1, "only the live session remains");
+        assert!(state.session_by_state(STATE).is_some());
+        assert!(
+            state
+                .session_by_state("state-00000000000000000000000000")
+                .is_none()
+        );
     }
 }

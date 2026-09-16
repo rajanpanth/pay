@@ -50,6 +50,9 @@ pub struct OnboardSession {
     pub provider: Option<String>,
     /// Filled by `/api/onboard/{provider}/complete` once the driver has run.
     pub wallet: Option<ProvisionedWallet>,
+    /// A completion holds the session while its driver provisions; see
+    /// [`AppState::claim_provisioning`].
+    pub provisioning: bool,
     pub created_at: Instant,
 }
 
@@ -70,6 +73,7 @@ impl OnboardSession {
             code_challenge,
             provider,
             wallet: None,
+            provisioning: false,
             created_at: Instant::now(),
         }
     }
@@ -195,6 +199,34 @@ impl ApiError {
             "invalid_grant",
             "The authorization code is unknown, expired, already used, or the PKCE verifier does not match.",
         )
+    }
+
+    /// The store cannot take another session right now.
+    pub fn busy() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            error: "busy",
+            message: "Too many sign-ins are in progress. Try again in a few minutes.".to_string(),
+        }
+    }
+
+    fn from_claim(err: crate::ClaimError) -> Self {
+        match err {
+            crate::ClaimError::Unknown => Self::bad_request(
+                "unknown_session",
+                "This sign-in does not match a pending `pay setup`. Run `pay setup` again.",
+            ),
+            crate::ClaimError::InProgress => Self {
+                status: StatusCode::CONFLICT,
+                error: "provisioning",
+                message: "This sign-in is already being completed. Return to your terminal."
+                    .to_string(),
+            },
+            crate::ClaimError::Completed => Self::bad_request(
+                "already_completed",
+                "This sign-in was already used. Return to your terminal.",
+            ),
+        }
     }
 
     fn from_driver(err: DriverError) -> Self {
@@ -392,7 +424,9 @@ pub async fn start(
             let redirect_uri = state.consent_redirect_uri(driver.id());
             let consent = driver.consent_url(&redirect_uri, &session.state);
             log_context(&session);
-            state.insert_session(session);
+            state
+                .insert_session(session)
+                .map_err(|_| ApiError::busy())?;
             Ok(Json(StartResponse {
                 redirect: None,
                 consent: Some(consent),
@@ -412,7 +446,9 @@ pub async fn start(
             );
             let redirect = session.redirect_url();
             log_context(&session);
-            state.insert_session(session);
+            state
+                .insert_session(session)
+                .map_err(|_| ApiError::busy())?;
             Ok(Json(StartResponse {
                 redirect: Some(redirect),
                 consent: None,
@@ -444,26 +480,18 @@ pub async fn complete(
         .parse_grant(&req.fragment)
         .map_err(ApiError::from_driver)?;
 
+    // Hold the session for this run before touching the provider: two
+    // completions racing here would otherwise create two wallets.
     let session = state
-        .session_by_state(&echoed_state)
-        .filter(|s| s.provider.as_deref() == Some(driver.id()))
-        .ok_or_else(|| {
-            ApiError::bad_request(
-                "unknown_session",
-                "This sign-in does not match a pending `pay setup`. Run `pay setup` again.",
-            )
-        })?;
-    if session.wallet.is_some() {
-        return Err(ApiError::bad_request(
-            "already_completed",
-            "This sign-in was already used. Return to your terminal.",
-        ));
-    }
-
-    let wallet = driver
-        .provision(&grant)
-        .await
-        .map_err(ApiError::from_driver)?;
+        .claim_provisioning(&echoed_state, driver.id())
+        .map_err(ApiError::from_claim)?;
+    let wallet = match driver.provision(&grant).await {
+        Ok(wallet) => wallet,
+        Err(err) => {
+            state.release_provisioning(&echoed_state);
+            return Err(ApiError::from_driver(err));
+        }
+    };
     let redirect = session.redirect_url();
     let address = wallet.address.clone();
     tracing::info!(provider = driver.id(), address = %address, "wallet provisioned");
@@ -630,6 +658,7 @@ mod tests {
             code_challenge: RFC_CHALLENGE.into(),
             provider: None,
             wallet: None,
+            provisioning: false,
             created_at,
         }
     }
@@ -648,28 +677,30 @@ mod tests {
                 .expect("clock far enough from epoch"),
         );
         let expired_code = expired.code.clone();
-        state.insert_session(expired);
+        state.insert_session(expired).unwrap();
         assert!(state.take_session(&expired_code).is_none());
     }
 
+    /// Expired entries are only swept when the store is full (see
+    /// `AppState::insert_session`); until then every lookup still treats
+    /// them as gone.
     #[test]
-    fn insert_purges_expired_sessions() {
+    fn expired_sessions_are_invisible_before_they_are_swept() {
         let state = AppState::with_drivers("http://cloud.test", Vec::new());
         let now = Instant::now();
         let fresh_a = session(now);
         let code_a = fresh_a.code.clone();
-        state.insert_session(fresh_a);
+        state.insert_session(fresh_a).unwrap();
         let expired = session(
             now.checked_sub(SESSION_TTL + Duration::from_secs(1))
                 .unwrap(),
         );
         let code_expired = expired.code.clone();
-        state.insert_session(expired);
+        let expired_state = expired.state.clone();
+        state.insert_session(expired).unwrap();
         assert_eq!(state.session_count(), 2);
 
-        // The next insert sweeps the expired entry but keeps the live one.
-        state.insert_session(session(now));
-        assert_eq!(state.session_count(), 2);
+        assert!(state.session_by_state(&expired_state).is_none());
         assert!(state.take_session(&code_expired).is_none());
         assert!(state.take_session(&code_a).is_some());
     }
@@ -679,7 +710,7 @@ mod tests {
         let state = AppState::with_drivers("http://cloud.test", Vec::new());
         let s = session(Instant::now());
         let code = s.code.clone();
-        state.insert_session(s);
+        state.insert_session(s).unwrap();
         assert!(state.take_session(&code).is_some());
         assert!(state.take_session(&code).is_none());
         assert!(state.take_session("unknown").is_none());
