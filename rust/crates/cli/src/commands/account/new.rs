@@ -24,10 +24,11 @@ pub struct NewCommand {
     #[arg(long)]
     pub force: bool,
 
-    /// Remote-backend credential as `key=value`, repeatable (e.g.
-    /// `--credential secret_key=sk_live_…`). Each field also reads
+    /// Remote-backend credential read from a file, as `key=@path`,
+    /// repeatable (e.g. `--credential secret_key=@/run/secrets/openfort`).
+    /// Values are never taken from the command line. Each field also reads
     /// `{PROVIDER}_{FIELD}` from the environment.
-    #[arg(long = "credential", value_name = "KEY=VALUE")]
+    #[arg(long = "credential", value_name = "KEY=@FILE")]
     pub credentials: Vec<String>,
 
     /// Remote-backend wallet id (env: `{PROVIDER}_WALLET_ID`). Defaults to
@@ -147,11 +148,13 @@ pub fn create_account(
 /// Remote-backend credentials supplied up front, so setup can run without
 /// a TTY.
 ///
-/// Values are provider-agnostic: `--credential key=value` (repeatable)
-/// names any field the chosen provider declares, and each field also
-/// falls back to a `{PROVIDER}_{FIELD}` environment variable —
-/// `OPENFORT_SECRET_KEY` for Openfort's `secret_key`. Anything still
-/// missing is prompted for interactively.
+/// Values are provider-agnostic: `--credential key=@file` (repeatable)
+/// names any field the chosen provider declares and reads its value from
+/// the file, and each field also falls back to a `{PROVIDER}_{FIELD}`
+/// environment variable — `OPENFORT_SECRET_KEY` for Openfort's
+/// `secret_key`. A value on the command line itself is refused: argv is
+/// readable by every process on the machine and kept in shell history.
+/// Anything still missing is prompted for interactively.
 #[derive(Clone, Default)]
 pub struct RemoteInputs {
     /// Credential values keyed by [`CredentialField::key`](pay_core::remote::CredentialField).
@@ -162,16 +165,15 @@ pub struct RemoteInputs {
 }
 
 impl RemoteInputs {
-    /// Parse repeated `key=value` credential flags and the wallet id.
+    /// Parse repeated `key=@file` credential flags and the wallet id.
+    ///
+    /// Errors never echo the flag: an operator who typed a secret where a
+    /// path belongs must not see it copied into logs.
     pub fn resolve(credentials: &[String], wallet_id: Option<String>) -> pay_core::Result<Self> {
         let mut map = std::collections::BTreeMap::new();
         for entry in credentials {
-            let (key, value) = entry.split_once('=').ok_or_else(|| {
-                pay_core::Error::Config(format!(
-                    "Invalid --credential `{entry}`: expected key=value."
-                ))
-            })?;
-            map.insert(key.trim().to_string(), value.trim().to_string());
+            let (key, value) = parse_credential_flag(entry)?;
+            map.insert(key, value);
         }
         Ok(Self {
             credentials: map,
@@ -206,6 +208,47 @@ impl RemoteInputs {
     }
 }
 
+/// One `--credential KEY=@FILE` flag: the key and the file's trimmed
+/// contents. `KEY=VALUE` is refused with the two accepted alternatives.
+fn parse_credential_flag(entry: &str) -> pay_core::Result<(String, String)> {
+    let Some((key, source)) = entry.split_once('=') else {
+        return Err(pay_core::Error::Config(
+            "Invalid --credential: expected KEY=@FILE.".to_string(),
+        ));
+    };
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(pay_core::Error::Config(
+            "Invalid --credential: the key before `=` is empty.".to_string(),
+        ));
+    }
+    let Some(path) = source.trim().strip_prefix('@') else {
+        return Err(pay_core::Error::Config(format!(
+            "--credential {key}=<value> is not accepted: a value on the command line is visible \
+             to other processes and kept in shell history. Put it in a file and pass \
+             --credential {key}=@/path/to/file, or set the {{PROVIDER}}_{} environment variable.",
+            key.to_uppercase()
+        )));
+    };
+    if path.is_empty() {
+        return Err(pay_core::Error::Config(format!(
+            "--credential {key}=@: no file path after `@`."
+        )));
+    }
+    let value = std::fs::read_to_string(path).map_err(|err| {
+        pay_core::Error::Config(format!(
+            "Could not read --credential {key} from `{path}`: {err}"
+        ))
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(pay_core::Error::Config(format!(
+            "--credential {key}: `{path}` is empty."
+        )));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
 /// `openfort` + `secret_key` → `OPENFORT_SECRET_KEY`.
 fn env_key(provider_id: &str, field: &str) -> String {
     format!("{provider_id}_{field}")
@@ -228,7 +271,7 @@ fn require_tty(missing: &str) -> pay_core::Result<()> {
     }
     Err(pay_core::Error::Config(format!(
         "No terminal to prompt for `{missing}`.\n\
-         Pass it non-interactively instead: --credential {missing}=<value> (repeatable) \
+         Pass it non-interactively instead: --credential {missing}=@<file> (repeatable) \
          and --wallet-id, or the matching {{PROVIDER}}_{{FIELD}} environment variables."
     )))
 }
@@ -894,6 +937,66 @@ pub fn generate_keypair() -> (Vec<u8>, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_flag_reads_the_value_from_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        std::fs::write(&path, "  sk_live_abc\n").unwrap();
+        let inputs = RemoteInputs::resolve(
+            &[format!("secret_key=@{}", path.display())],
+            Some(" acc_1 ".to_string()),
+        )
+        .unwrap();
+        assert_eq!(inputs.credentials["secret_key"], "sk_live_abc");
+        assert_eq!(inputs.wallet_id.as_deref(), Some("acc_1"));
+    }
+
+    #[test]
+    fn credential_flag_refuses_a_value_on_the_command_line_without_echoing_it() {
+        let Err(pay_core::Error::Config(msg)) =
+            RemoteInputs::resolve(&["secret_key=sk_live_topsecret".to_string()], None)
+        else {
+            panic!("argv values must be refused");
+        };
+        assert!(!msg.contains("topsecret"), "{msg}");
+        assert!(
+            msg.contains("--credential secret_key=@/path/to/file"),
+            "{msg}"
+        );
+        assert!(msg.contains("{PROVIDER}_SECRET_KEY"), "{msg}");
+
+        let Err(pay_core::Error::Config(msg)) =
+            RemoteInputs::resolve(&["sk_live_topsecret".to_string()], None)
+        else {
+            panic!("a flag without `=` must be refused");
+        };
+        assert!(!msg.contains("topsecret"), "{msg}");
+    }
+
+    #[test]
+    fn credential_flag_reports_missing_and_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let Err(pay_core::Error::Config(msg)) =
+            RemoteInputs::resolve(&[format!("secret_key=@{}", missing.display())], None)
+        else {
+            panic!("a missing file is an error");
+        };
+        assert!(
+            msg.contains("Could not read --credential secret_key"),
+            "{msg}"
+        );
+
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        let Err(pay_core::Error::Config(msg)) =
+            RemoteInputs::resolve(&[format!("secret_key=@{}", empty.display())], None)
+        else {
+            panic!("an empty file is an error");
+        };
+        assert!(msg.ends_with("is empty."), "{msg}");
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

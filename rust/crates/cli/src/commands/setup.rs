@@ -40,10 +40,11 @@ pub struct SetupCommand {
     #[arg(long, value_name = "CODE")]
     pub redeem: Option<String>,
 
-    /// Remote-backend credential as `key=value`, repeatable (e.g.
-    /// `--credential secret_key=sk_live_…`). Each field also reads
+    /// Remote-backend credential read from a file, as `key=@path`,
+    /// repeatable (e.g. `--credential secret_key=@/run/secrets/openfort`).
+    /// Values are never taken from the command line. Each field also reads
     /// `{PROVIDER}_{FIELD}` from the environment.
-    #[arg(long = "credential", value_name = "KEY=VALUE")]
+    #[arg(long = "credential", value_name = "KEY=@FILE")]
     pub credentials: Vec<String>,
 
     /// Remote-backend wallet id (env: `{PROVIDER}_WALLET_ID`). Defaults to
