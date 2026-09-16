@@ -325,6 +325,13 @@ fn explain_connect_failure(
     name: &str,
     original: Error,
 ) -> Error {
+    // The explanation below reasons about stored API credentials. A backend
+    // with none (a hardware wallet) already says what is wrong: the device
+    // is unplugged, locked, or busy.
+    if !provider.requires_credentials() {
+        return original;
+    }
+
     let id = provider.id();
     let display_name = provider.display_name();
     let reconnect = format!("pay account new {name} --backend {id} --force");
@@ -483,8 +490,14 @@ mod tests {
     }
 
     impl RemoteProvider for FakeProvider {
+        /// A credentialed provider, so connect failures get the stored
+        /// credentials explanation.
         fn credential_fields(&self) -> &'static [CredentialField] {
-            &[]
+            &[CredentialField {
+                key: "api_key",
+                label: "Fake API key",
+                secret: true,
+            }]
         }
         fn credentials_hint(&self) -> &'static str {
             "hint"
@@ -548,6 +561,69 @@ mod tests {
     fn empty_project_points_at_wallet_creation() {
         let msg = explain(Ok(vec![]), "acc_live");
         assert!(msg.contains("Create one first."), "{msg}");
+    }
+
+    /// A provider with nothing stored (a hardware wallet) has no
+    /// credentials to reason about: its own error is the explanation.
+    #[test]
+    fn credential_less_provider_keeps_its_own_error() {
+        struct DeviceOnly;
+        impl SigningBackend for DeviceOnly {
+            fn id(&self) -> &'static str {
+                "device"
+            }
+            fn display_name(&self) -> &'static str {
+                "Device"
+            }
+            fn description(&self) -> &'static str {
+                "test double"
+            }
+            fn custody(&self) -> crate::backend::Custody {
+                crate::backend::Custody::Hardware
+            }
+            fn is_exportable(&self) -> bool {
+                false
+            }
+            fn signs_raw_messages(&self) -> bool {
+                false
+            }
+            fn approval(&self) -> crate::backend::Approval {
+                crate::backend::Approval::DeviceConfirmation
+            }
+            fn is_available(&self) -> bool {
+                true
+            }
+            fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+                None
+            }
+        }
+        impl RemoteProvider for DeviceOnly {
+            fn credential_fields(&self) -> &'static [CredentialField] {
+                &[]
+            }
+            fn credentials_hint(&self) -> &'static str {
+                "plug it in"
+            }
+            fn no_wallets_hint(&self) -> &'static str {
+                "no device"
+            }
+            fn discover(&self, _: &Credentials) -> Result<Vec<RemoteWallet>> {
+                panic!("discovery must not run without credentials to check")
+            }
+            fn connect(&self, _: &Credentials, _: &str) -> Result<Box<dyn TransactionSigner>> {
+                unreachable!()
+            }
+        }
+
+        let msg = explain_connect_failure(
+            &DeviceOnly,
+            &Credentials::new(),
+            "m/44'/501'/0'",
+            "demo",
+            Error::Config("Could not connect to the device".to_string()),
+        )
+        .to_string();
+        assert_eq!(msg, "Configuration error: Could not connect to the device");
     }
 
     /// When the wallet *is* there, the provider's own error is the real
