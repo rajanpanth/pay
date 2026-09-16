@@ -92,16 +92,7 @@ impl ResolvedSigner {
     /// `sign_message` signature this backend cannot produce. `what` names
     /// the thing being signed ("an x402 sign-in challenge").
     pub fn require_raw_message_signing(&self, what: &str) -> Result<()> {
-        if self.signs_raw_messages() {
-            return Ok(());
-        }
-        Err(Error::Config(format!(
-            "{} cannot sign {what}: it needs a raw message signature, and a {} only signs \
-             transactions. Pay with a charge or a client-signed session instead, or use a \
-             software or remote wallet for this service.",
-            self.backend.display_name(),
-            self.backend.display_name()
-        )))
+        self.backend.require_raw_message_signing(what)
     }
 
     fn as_dyn(&self) -> &dyn TransactionSigner {
@@ -252,38 +243,8 @@ pub fn load_signer_for_network_with_intent_and_override(
     auth_override: AuthOverride,
 ) -> Result<(ResolvedSigner, Option<ResolvedEphemeral>)> {
     let file = store.load()?;
-    if let Some(name) = account_override {
-        if let Some(account) = file.named_account_for_network(network, name).cloned() {
-            let signer = load_signer_from_account_with_intent_and_override(
-                &account,
-                name,
-                network,
-                intent,
-                auth_override,
-            )?;
-            return Ok((signer, None));
-        }
-        if let Some(account) = network_agnostic_fallback(&file, network, name).cloned() {
-            let signer = load_signer_from_account_with_intent_and_override(
-                &account,
-                name,
-                network,
-                intent,
-                auth_override,
-            )?;
-            return Ok((signer, None));
-        }
-        if is_lazy_ephemeral_network(network) {
-            let resolved = load_or_create_ephemeral_for_network_as(network, name, store)?;
-            let signer = signer_for_ephemeral_account(&resolved.account)?;
-            return Ok((signer, Some(resolved)));
-        }
-        return Err(Error::Config(format!(
-            "No account named `{name}` configured for network `{network}`."
-        )));
-    }
-    match resolve_account_for_network(network, &file) {
-        AccountChoice::Resolved { name, account } => {
+    match select_account(&file, network, account_override)? {
+        AccountSelection::Configured { name, account } => {
             let signer = load_signer_from_account_with_intent_and_override(
                 &account,
                 &name,
@@ -293,18 +254,87 @@ pub fn load_signer_for_network_with_intent_and_override(
             )?;
             Ok((signer, None))
         }
-        AccountChoice::Missing => {
-            if is_lazy_ephemeral_network(network) {
-                let resolved = load_or_create_ephemeral_for_network(network, store)?;
-                let signer = signer_for_ephemeral_account(&resolved.account)?;
-                Ok((signer, Some(resolved)))
-            } else {
-                Err(Error::Config(format!(
-                    "No account configured for network `{network}`.\n\n\
-                     Run `pay setup` to create an account."
-                )))
-            }
+        AccountSelection::LazyEphemeral { name: Some(name) } => {
+            let resolved = load_or_create_ephemeral_for_network_as(network, &name, store)?;
+            let signer = signer_for_ephemeral_account(&resolved.account)?;
+            Ok((signer, Some(resolved)))
         }
+        AccountSelection::LazyEphemeral { name: None } => {
+            let resolved = load_or_create_ephemeral_for_network(network, store)?;
+            let signer = signer_for_ephemeral_account(&resolved.account)?;
+            Ok((signer, Some(resolved)))
+        }
+    }
+}
+
+/// Which account a payment on `network` will use, before anything is
+/// loaded or prompted for.
+enum AccountSelection {
+    /// An entry in `accounts.yml`.
+    Configured { name: String, account: Box<Account> },
+    /// Nothing configured on an ephemeral network: a throwaway wallet is
+    /// created at payment time, under `name` when one was requested.
+    LazyEphemeral { name: Option<String> },
+}
+
+/// Resolve the account for `network` the way every loader does: the named
+/// account if `account_override` is given (falling back to a same-named
+/// remote account on `mainnet`), else the network's default, else a lazy
+/// ephemeral wallet on networks that allow one.
+fn select_account(
+    file: &AccountsFile,
+    network: &str,
+    account_override: Option<&str>,
+) -> Result<AccountSelection> {
+    if let Some(name) = account_override {
+        if let Some(account) = file
+            .named_account_for_network(network, name)
+            .or_else(|| network_agnostic_fallback(file, network, name))
+        {
+            return Ok(AccountSelection::Configured {
+                name: name.to_string(),
+                account: Box::new(account.clone()),
+            });
+        }
+        if is_lazy_ephemeral_network(network) {
+            return Ok(AccountSelection::LazyEphemeral {
+                name: Some(name.to_string()),
+            });
+        }
+        return Err(Error::Config(format!(
+            "No account named `{name}` configured for network `{network}`."
+        )));
+    }
+    match resolve_account_for_network(network, file) {
+        AccountChoice::Resolved { name, account } => {
+            Ok(AccountSelection::Configured { name, account })
+        }
+        AccountChoice::Missing if is_lazy_ephemeral_network(network) => {
+            Ok(AccountSelection::LazyEphemeral { name: None })
+        }
+        AccountChoice::Missing => Err(Error::Config(format!(
+            "No account configured for network `{network}`.\n\n\
+             Run `pay setup` to create an account."
+        ))),
+    }
+}
+
+/// The backend that will sign a payment on `network`, read from
+/// `accounts.yml` alone: no secret is touched and nothing prompts. `None`
+/// when no account is configured yet and a throwaway wallet will be
+/// created at payment time (those are software keys that sign anything).
+///
+/// Lets a caller pick a payment offer the account can actually sign before
+/// committing to it; see [`crate::runner::RunOutcome::for_account`].
+pub fn backend_for_network(
+    network: &str,
+    store: &dyn AccountsStore,
+    account_override: Option<&str>,
+) -> Result<Option<&'static dyn SigningBackend>> {
+    let file = store.load()?;
+    match select_account(&file, network, account_override)? {
+        AccountSelection::Configured { account, .. } => account.descriptor().map(Some),
+        AccountSelection::LazyEphemeral { .. } => Ok(None),
     }
 }
 
@@ -863,6 +893,65 @@ mod tests {
         };
         assert!(msg.contains("missing its `account` field"), "{msg}");
         assert_eq!(store.save_count(), 0, "no ephemeral must be created");
+    }
+
+    #[test]
+    fn backend_for_network_reads_the_descriptor_without_loading_the_signer() {
+        let mut file = AccountsFile::default();
+        file.upsert(MAINNET_NETWORK, "openfort", remote_account(None));
+        let store = MemoryAccountsStore::with_file(file);
+
+        // The account has no wallet id, so loading it would fail; reading
+        // the backend must not care.
+        let backend = backend_for_network(MAINNET_NETWORK, &store, Some("openfort"))
+            .unwrap()
+            .expect("a configured account has a backend");
+        assert_eq!(backend.id(), "openfort");
+
+        // Explicitly named remote accounts follow the same mainnet fallback
+        // as the loader on other networks.
+        let backend = backend_for_network("localnet", &store, Some("openfort"))
+            .unwrap()
+            .expect("remote accounts serve every network");
+        assert_eq!(backend.id(), "openfort");
+        assert_eq!(store.save_count(), 0);
+    }
+
+    #[test]
+    fn backend_for_network_is_none_when_a_throwaway_wallet_would_be_created() {
+        let store = MemoryAccountsStore::new();
+        assert!(
+            backend_for_network("localnet", &store, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            backend_for_network("localnet", &store, Some("scratch"))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store.save_count(),
+            0,
+            "resolution must not create the wallet"
+        );
+    }
+
+    #[test]
+    fn backend_for_network_reports_missing_accounts_like_the_loader() {
+        let store = MemoryAccountsStore::new();
+        let Err(Error::Config(msg)) = backend_for_network(MAINNET_NETWORK, &store, None) else {
+            panic!("mainnet never creates a wallet on its own");
+        };
+        assert!(
+            msg.contains("No account configured for network `mainnet`"),
+            "{msg}"
+        );
+        let Err(Error::Config(msg)) = backend_for_network(MAINNET_NETWORK, &store, Some("nope"))
+        else {
+            panic!("an unknown name is an error");
+        };
+        assert!(msg.contains("No account named `nope`"), "{msg}");
     }
 
     #[test]

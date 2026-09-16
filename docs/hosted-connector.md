@@ -69,9 +69,19 @@ connector custody question above.
   signer implements keychain 2.x `TransactionSigner`.
 - `remote::ledger` provider behind the `ledger` feature; V0 cap and
   raw-message guards in place. See `docs/keychain.md`.
-- Not yet done: a run against a physical device, enabling the feature in the
-  Homebrew and npm release builds (Linux needs `libudev-dev`), and the
-  envelope-aware `signature_type` at the spec level (Track C6).
+- Verified on a physical device (2026-09-16): `pay account new --backend
+  ledger` reads the address from the device; a v0 MPP charge to
+  debugger.pay.sh and a 0.045 USDC Gemini image generation on mainnet were
+  both confirmed on the Ledger screen. The Gemini gateway advertises an
+  operator-signed session first, which a Ledger cannot sign; the client now
+  carries the flat charge as a fallback and `RunOutcome::for_account` picks
+  it (see `docs/keychain.md`).
+- Not yet done: enabling the feature in the Homebrew and npm release builds
+  (Linux needs `libudev-dev`), the envelope-aware `signature_type` at the
+  spec level (Track C6), and two keychain-side rough edges seen on the
+  device run: `solana-remote-wallet` prints "Waiting for your approval on
+  Ledger …" to stdout, which lands in front of the response body, and its
+  Trezor-bridge probe logs connection-refused noise on every connect.
 
 ## Goals
 

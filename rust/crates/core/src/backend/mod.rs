@@ -140,6 +140,21 @@ pub trait SigningBackend: Send + Sync {
     fn deprecated(&self) -> Option<&'static str> {
         None
     }
+
+    /// Refuse, with an explanation, when a payment path needs a raw
+    /// `sign_message` signature this backend cannot produce. `what` names
+    /// the thing being signed ("an x402 sign-in challenge").
+    fn require_raw_message_signing(&self, what: &str) -> Result<()> {
+        if self.signs_raw_messages() {
+            return Ok(());
+        }
+        Err(Error::Config(format!(
+            "{name} cannot sign {what}: it needs a raw message signature, and a {name} only \
+             signs transactions. Pay with a charge or a client-signed session instead, or use \
+             a software or remote wallet for this service.",
+            name = self.display_name(),
+        )))
+    }
 }
 
 /// Which approval gate to place in front of a local secret store.
@@ -306,10 +321,101 @@ pub(crate) fn unavailable_on_platform(backend: &dyn SigningBackend) -> Error {
     ))
 }
 
+/// Signing-backend doubles for tests across the crate.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// A hardware-style backend: signs transactions only, never raw messages.
+    pub(crate) struct TransactionsOnly;
+
+    impl SigningBackend for TransactionsOnly {
+        fn id(&self) -> &'static str {
+            "transactions-only"
+        }
+        fn display_name(&self) -> &'static str {
+            "Test hardware wallet"
+        }
+        fn description(&self) -> &'static str {
+            "test double"
+        }
+        fn custody(&self) -> Custody {
+            Custody::Hardware
+        }
+        fn is_exportable(&self) -> bool {
+            false
+        }
+        fn signs_raw_messages(&self) -> bool {
+            false
+        }
+        fn approval(&self) -> Approval {
+            Approval::DeviceConfirmation
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+            Some(pay_kit::core::tx::TxVersion::V0)
+        }
+    }
+
+    /// A software-style backend that signs anything.
+    pub(crate) struct SignsAnything;
+
+    impl SigningBackend for SignsAnything {
+        fn id(&self) -> &'static str {
+            "signs-anything"
+        }
+        fn display_name(&self) -> &'static str {
+            "Test software wallet"
+        }
+        fn description(&self) -> &'static str {
+            "test double"
+        }
+        fn custody(&self) -> Custody {
+            Custody::Local
+        }
+        fn is_exportable(&self) -> bool {
+            true
+        }
+        fn signs_raw_messages(&self) -> bool {
+            true
+        }
+        fn approval(&self) -> Approval {
+            Approval::None
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn raw_message_guard_names_the_backend_and_the_signature() {
+        assert!(
+            testing::SignsAnything
+                .require_raw_message_signing("a proof")
+                .is_ok()
+        );
+        let Err(Error::Config(msg)) =
+            testing::TransactionsOnly.require_raw_message_signing("a subscription proof")
+        else {
+            panic!("a transactions-only backend must refuse raw messages");
+        };
+        assert!(
+            msg.starts_with("Test hardware wallet cannot sign a subscription proof"),
+            "{msg}"
+        );
+        assert!(msg.contains("only signs transactions"), "{msg}");
+    }
 
     #[test]
     fn ids_and_flags_are_unique() {

@@ -90,11 +90,21 @@ Two consequences flow from the attributes rather than from special cases:
 - `max_tx_version() == Some(V0)` is threaded into every kit builder (charge,
   x402 exact and upto, channel open), so the kit negotiates v0 with servers
   that advertise v1.
-- `signs_raw_messages() == false` makes `ResolvedSigner::require_raw_message_signing`
+- `signs_raw_messages() == false` makes `SigningBackend::require_raw_message_signing`
   refuse, with the reason, in the paths that sign a raw message: SIWMPP
   authenticate, subscription proofs, operator-signed session proofs,
   x402 sign-in, and batch-settlement vouchers. Charges, x402 exact and upto,
   and client-signed sessions work unchanged.
+- The choice of offer follows the same attribute. A 402 often advertises
+  an operator-signed session next to a flat charge (the Gemini gateway
+  does); the classifier prefers the session and carries the charge as its
+  `fallback`. Before paying, the CLI and MCP call
+  `RunOutcome::for_account`, which reads the paying account's backend from
+  `accounts.yml` without prompting and swaps in the fallback when the
+  backend cannot sign the session proof (`session::check_signer`) or an
+  x402 sign-in. With no other offer the refusal becomes a `PaymentRejected`
+  that names the backend. Verified end to end: a Ledger paid a 0.045 USDC
+  Gemini image charge on mainnet after skipping the session.
 
 The feature is opt-in because `hidapi` links IOKit on macOS, hid on Windows
 and libudev on Linux. Linux builds need `libudev-dev` and a udev rule for the

@@ -700,18 +700,7 @@ pub fn build_siwx_auth_header_with_override(
     resource_url: Option<&str>,
     auth_override: crate::signer::AuthOverride,
 ) -> Result<BuiltPayment> {
-    let preferred_chain_id = network_override.and_then(siwx_chain_id_for_network);
-    let chain = pay_kit::x402::siwx::select_siwx_chain(
-        &challenge.extension,
-        &SiwxChainSelectionOptions {
-            preferred_chain_id,
-            supported_chain_ids: vec![],
-        },
-    )
-    .map_err(|e| Error::Mpp(format!("Failed to select x402 sign-in challenge: {e}")))?;
-    let network = network_override
-        .map(str::to_string)
-        .unwrap_or_else(|| normalize_network(&chain.chain_id));
+    let (chain, network) = sign_in_chain(challenge, network_override)?;
     let desc = crate::client::prompt::payment_description(None, &[resource_url]);
     let reason = format!("authorize sign-in for {desc}");
     let intent = crate::keystore::AuthIntent::from_reason(&reason);
@@ -768,6 +757,27 @@ fn build_siwx_header(
 ///
 /// x402 challenges use CAIP-2 chain IDs like `solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp`
 /// (Solana mainnet). The pay account system uses `mainnet`, `devnet`, `localnet`.
+/// The chain a sign-in challenge is answered on and its pay network slug:
+/// the forced network when given, else the Solana chain the challenge offers.
+pub(crate) fn sign_in_chain(
+    challenge: &SiwxAuthChallenge,
+    network_override: Option<&str>,
+) -> Result<(pay_kit::x402::siwx::SupportedChain, String)> {
+    let preferred_chain_id = network_override.and_then(siwx_chain_id_for_network);
+    let chain = pay_kit::x402::siwx::select_siwx_chain(
+        &challenge.extension,
+        &SiwxChainSelectionOptions {
+            preferred_chain_id,
+            supported_chain_ids: vec![],
+        },
+    )
+    .map_err(|e| Error::Mpp(format!("Failed to select x402 sign-in challenge: {e}")))?;
+    let network = network_override
+        .map(str::to_string)
+        .unwrap_or_else(|| normalize_network(&chain.chain_id));
+    Ok((chain, network))
+}
+
 fn normalize_network(raw: &str) -> String {
     match raw {
         // Solana CAIP-2 genesis hashes
