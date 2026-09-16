@@ -93,17 +93,37 @@ fn cloud_url_from(url: Option<&str>, local: Option<&str>) -> String {
 /// custody account; it is registered exactly like `pay account new
 /// --backend <provider>` would: credentials in the platform secret store,
 /// the account in `accounts.yml`, after the provider confirms the address.
-/// Anything else is reported as is.
+/// Anything else is a failed setup: nothing is saved and the user is told
+/// to run it again.
 pub fn run_setup_onboarding(account: &str, force: bool) -> pay_core::Result<()> {
     let result = run_loopback_onboarding(&OnboardRequest {
         cloud_url: default_cloud_url(),
         account: account.to_string(),
     })?;
+    ensure_ready(&result)?;
+    register_provisioned_account(account, &result, force)
+}
+
+/// Only a `ready` exchange carries a wallet to register.
+fn ensure_ready(result: &OnboardResult) -> pay_core::Result<()> {
     if result.is_ready() {
-        return register_provisioned_account(account, &result, force);
+        return Ok(());
     }
-    print_result(&result);
-    Ok(())
+    let status = if result.status.is_empty() {
+        "unknown"
+    } else {
+        result.status.as_str()
+    };
+    let detail = result
+        .message
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .map(|m| format!(" {m}"))
+        .unwrap_or_default();
+    Err(pay_core::Error::Config(format!(
+        "pay-cloud did not hand over a wallet (status: {status}).{detail} \
+         Nothing was saved; run `pay setup` again."
+    )))
 }
 
 /// Store a `ready` exchange result as a remote account named `account`.
@@ -612,6 +632,32 @@ pub fn exchange_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_only_registers_a_ready_result() {
+        let ready = OnboardResult {
+            status: "ready".to_string(),
+            ..OnboardResult::default()
+        };
+        assert!(ensure_ready(&ready).is_ok());
+
+        let pending = OnboardResult {
+            status: "pending".to_string(),
+            message: Some("Wallet provisioning is not available yet.".to_string()),
+            ..OnboardResult::default()
+        };
+        let Err(pay_core::Error::Config(msg)) = ensure_ready(&pending) else {
+            panic!("pending is not a linked terminal");
+        };
+        assert!(msg.contains("status: pending"), "{msg}");
+        assert!(msg.contains("not available yet"), "{msg}");
+        assert!(msg.contains("Nothing was saved"), "{msg}");
+
+        let Err(pay_core::Error::Config(msg)) = ensure_ready(&OnboardResult::default()) else {
+            panic!("an empty status is not ready");
+        };
+        assert!(msg.contains("status: unknown"), "{msg}");
+    }
 
     #[test]
     fn unreachable_cloud_fails_before_opening_anything() {
