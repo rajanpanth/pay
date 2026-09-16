@@ -58,6 +58,9 @@ impl SigningBackend for AppleKeychain {
     fn approval(&self) -> Approval {
         Approval::PlatformPrompt
     }
+    fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+        None
+    }
     fn is_available(&self) -> bool {
         cfg!(target_os = "macos")
     }
@@ -120,6 +123,9 @@ impl SigningBackend for GnomeKeyring {
     }
     fn approval(&self) -> Approval {
         Approval::PlatformPrompt
+    }
+    fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+        None
     }
     fn is_available(&self) -> bool {
         #[cfg(target_os = "linux")]
@@ -190,6 +196,9 @@ impl SigningBackend for WindowsHello {
     }
     fn approval(&self) -> Approval {
         Approval::PlatformPrompt
+    }
+    fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+        None
     }
     fn is_available(&self) -> bool {
         // The credential store always exists on Windows; setup requires the
@@ -269,6 +278,9 @@ impl SigningBackend for OnePassword {
     fn approval(&self) -> Approval {
         Approval::ExternalTool
     }
+    fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+        None
+    }
     fn is_available(&self) -> bool {
         Keystore::onepassword_available()
     }
@@ -322,6 +334,9 @@ impl SigningBackend for File {
     }
     fn approval(&self) -> Approval {
         Approval::PlatformPrompt
+    }
+    fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+        None
     }
     fn is_available(&self) -> bool {
         true
@@ -382,6 +397,9 @@ impl SigningBackend for Ephemeral {
     }
     fn approval(&self) -> Approval {
         Approval::None
+    }
+    fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+        None
     }
     fn is_available(&self) -> bool {
         true

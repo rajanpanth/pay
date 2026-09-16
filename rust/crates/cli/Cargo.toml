@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [features]
 default = []
+# `pay setup --backend ledger`; see pay-core's feature of the same name.
+ledger = ["pay-core/ledger"]
 gcp_kms = ["pay-kit/gcp_kms"]
 vendored-openssl = ["pay-core/vendored-openssl"]
 redis-session-store = ["pay-core/redis-session-store", "pay-kit/redis-store"]

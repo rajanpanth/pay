@@ -128,6 +128,12 @@ pub trait SigningBackend: Send + Sync {
     /// missing.
     fn is_available(&self) -> bool;
 
+    /// Highest transaction version the backend can sign, when that is below
+    /// what servers may advertise. `None` means any version. The Ledger
+    /// Solana app signs version 0 but not yet version 1; software and
+    /// remote signers sign whatever bytes they are given.
+    fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion>;
+
     /// Why this backend must not be offered for new accounts, when it is
     /// deprecated. Existing accounts keep loading so nobody is locked out;
     /// setup, import, and the picker refuse it. `None` for a live backend.
@@ -384,10 +390,11 @@ mod tests {
     }
 
     #[test]
-    fn software_backends_sign_raw_messages() {
+    fn software_backends_sign_raw_messages_at_any_version() {
         for b in backends() {
             if b.custody() != Custody::Hardware {
                 assert!(b.signs_raw_messages(), "{}", b.id());
+                assert_eq!(b.max_tx_version(), None, "{}", b.id());
             }
         }
     }

@@ -82,6 +82,28 @@ impl ResolvedSigner {
         self.backend.signs_raw_messages()
     }
 
+    /// Highest transaction version this signer can produce, to pass as the
+    /// builders' `max_tx_version`. See [`SigningBackend::max_tx_version`].
+    pub fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+        self.backend.max_tx_version()
+    }
+
+    /// Refuse, with an explanation, when a payment path needs a raw
+    /// `sign_message` signature this backend cannot produce. `what` names
+    /// the thing being signed ("an x402 sign-in challenge").
+    pub fn require_raw_message_signing(&self, what: &str) -> Result<()> {
+        if self.signs_raw_messages() {
+            return Ok(());
+        }
+        Err(Error::Config(format!(
+            "{} cannot sign {what}: it needs a raw message signature, and a {} only signs \
+             transactions. Pay with a charge or a client-signed session instead, or use a \
+             software or remote wallet for this service.",
+            self.backend.display_name(),
+            self.backend.display_name()
+        )))
+    }
+
     fn as_dyn(&self) -> &dyn TransactionSigner {
         match &self.inner {
             SignerImpl::Memory(signer) => signer.as_ref(),

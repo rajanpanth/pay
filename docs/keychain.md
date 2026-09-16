@@ -35,6 +35,7 @@ never grows a variant for a new remote provider: `keystore: remote` plus a
 | `signs_raw_messages()` | `sign_message` verifies over the raw bytes | yes | yes | no (envelope) |
 | `approval()` | How a signature is approved | platform prompt, or `op` for 1Password | provider policy behind the platform prompt | device confirmation |
 | `is_available()` | Usable on this machine now | OS match, service reachable | always | device attached |
+| `max_tx_version()` | Highest transaction version the signer can produce | any | any | V0 (the Solana app does not sign v1 yet) |
 
 All five are required methods. A new backend states what it can do; it does
 not inherit a default that may be wrong for it. Custody does not imply the
@@ -75,15 +76,29 @@ Credentials are stored as a blob in the platform store behind the same gate as
 a keypair; `accounts.yml` gets `keystore: remote, provider: <id>, account:
 <wallet id>, pubkey`.
 
-## Adding a hardware wallet
+## Hardware wallets: Ledger
 
-Implement `SigningBackend` with `Custody::Hardware`, `is_exportable() ==
-false`, and `signs_raw_messages() == false`, and register it where its
-connection logic lives. Payment paths that need a raw message signature
-(SIWMPP authenticate, subscription bearer proofs, operator-signed session
-proofs, x402 batch vouchers) must check `ResolvedSigner::signs_raw_messages`
-and either pick another scheme or fail with a clear message; transaction
-signing works unchanged.
+`remote::ledger` (cargo feature `ledger` on pay-core and the CLI) wraps
+solana-keychain's `LedgerSigner`. It is a `RemoteProvider` with no credential
+fields: nothing is stored in the secret store, `accounts.yml` holds the
+derivation path as the wallet id plus the cached address, and the device is
+the approval. `pay setup --backend ledger` reads the first two standard
+derivation paths and lets the user pick.
+
+Two consequences flow from the attributes rather than from special cases:
+
+- `max_tx_version() == Some(V0)` is threaded into every kit builder (charge,
+  x402 exact and upto, channel open), so the kit negotiates v0 with servers
+  that advertise v1.
+- `signs_raw_messages() == false` makes `ResolvedSigner::require_raw_message_signing`
+  refuse, with the reason, in the paths that sign a raw message: SIWMPP
+  authenticate, subscription proofs, operator-signed session proofs,
+  x402 sign-in, and batch-settlement vouchers. Charges, x402 exact and upto,
+  and client-signed sessions work unchanged.
+
+The feature is opt-in because `hidapi` links IOKit on macOS, hid on Windows
+and libudev on Linux. Linux builds need `libudev-dev` and a udev rule for the
+device.
 
 ## Tests
 

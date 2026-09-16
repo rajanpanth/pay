@@ -62,6 +62,17 @@ JWT shape from a server. All three are verified only against a mock.
 Next: run the flow against a real Openfort project, then decide the
 connector custody question above.
 
+### Ledger status (2026-09-15)
+
+- pay is on pay-kit `4cde44fb` (head of pay-kit PR #323) with solana-keychain
+  `6461a18`, via a cherry-pick of pay PR #462 onto `feat/pay-cloud`. Every
+  signer implements keychain 2.x `TransactionSigner`.
+- `remote::ledger` provider behind the `ledger` feature; V0 cap and
+  raw-message guards in place. See `docs/keychain.md`.
+- Not yet done: a run against a physical device, enabling the feature in the
+  Homebrew and npm release builds (Linux needs `libudev-dev`), and the
+  envelope-aware `signature_type` at the spec level (Track C6).
+
 ## Goals
 
 1. **Hosted connector.** A user adds `https://mcp.pay.sh` to Grok Bot, Claude,

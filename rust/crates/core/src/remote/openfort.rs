@@ -72,6 +72,9 @@ impl SigningBackend for Openfort {
     fn is_available(&self) -> bool {
         true
     }
+    fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+        None
+    }
 }
 
 impl RemoteProvider for Openfort {

@@ -236,7 +236,12 @@ pub fn build_payment_with_override(
     let (payment_header_name, payment_header_value) = match challenge.x402_version {
         X402_VERSION_V1 => {
             let header = rt
-                .block_on(build_payment_header_v1(&signer, &rpc, requirements, None))
+                .block_on(build_payment_header_v1(
+                    &signer,
+                    &rpc,
+                    requirements,
+                    signer.max_tx_version(),
+                ))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V1_PAYMENT_HEADER, header)
         }
@@ -248,7 +253,7 @@ pub fn build_payment_with_override(
                     &rpc,
                     requirements,
                     extensions,
-                    None,
+                    signer.max_tx_version(),
                 ))
                 .map_err(|e| Error::Mpp(format!("Failed to build x402 payment: {e}")))?;
             (X402_V2_PAYMENT_HEADER, header)
@@ -256,6 +261,9 @@ pub fn build_payment_with_override(
     };
 
     let mut headers = vec![(payment_header_name, payment_header_value)];
+    if challenge.siwx.is_some() {
+        signer.require_raw_message_signing("an x402 sign-in challenge")?;
+    }
     if let Some((header_name, header_value)) = build_siwx_header(challenge, &signer, &network, &rt)?
     {
         headers.push((header_name, header_value));
@@ -484,7 +492,7 @@ pub fn build_upto_payment_with_override(
             requirements,
             expires_at,
             nonce,
-            None,
+            signer.max_tx_version(),
         ))
         .map_err(|e| Error::Mpp(format!("Failed to build x402 upto payment: {e}")))?;
 
@@ -572,6 +580,9 @@ pub fn build_batch_payment(
         resource_url,
         auth_override,
     )?;
+    // Vouchers are raw message signatures by the payer key; a hardware wallet
+    // cannot produce them. Charges and client-signed sessions still work.
+    signer.require_raw_message_signing("a batch-settlement voucher")?;
 
     // The advertised token program is checked against the mint's real owner:
     // every associated token address in the `open` derives from it, so trusting
@@ -712,6 +723,8 @@ pub fn build_siwx_auth_header_with_override(
             &intent,
             auth_override,
         )?;
+    // Sign-in is a raw message signature over the SIWX payload.
+    signer.require_raw_message_signing("an x402 sign-in challenge")?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

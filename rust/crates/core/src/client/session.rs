@@ -376,6 +376,8 @@ pub fn open_payment_channel_session_header_with_override(
     let open_options = PaymentChannelOpenOptions {
         deposit: Some(deposit),
         salt: Some(salt),
+        // A Ledger signs v0 only; the kit negotiates against the challenge.
+        max_tx_version: signer.max_tx_version(),
         ..PaymentChannelOpenOptions::default()
     };
 
@@ -392,6 +394,10 @@ pub fn open_payment_channel_session_header_with_override(
     .map_err(|e| Error::Mpp(format!("derive_payment_channel_open: {e}")))?;
 
     let authentication = if voucher_signer == SessionVoucherSigner::Operator {
+        // The proof is a raw message signature by the payer key; a hardware
+        // wallet cannot produce one. Client-signed sessions use an ephemeral
+        // voucher key and are unaffected.
+        signer.require_raw_message_signing("an operator-signed session proof")?;
         let mut proof = SessionAuthentication {
             kind: SessionAuthenticationType::Proof,
             challenge_id: challenge.id.clone(),

@@ -75,6 +75,11 @@ impl DestroyCommand {
             .unwrap_or_else(|| "unknown".to_string());
         let keystore_kind = entry.backend.clone();
         let op_account = entry.account.clone();
+        let stores_credentials = entry
+            .provider
+            .as_deref()
+            .and_then(pay_core::remote::provider)
+            .is_none_or(|p| p.requires_credentials());
         // Whether the backend can hand the keypair back at all; remote
         // custody cannot, so there is nothing to offer for export.
         let exportable = entry.descriptor().is_ok_and(|b| b.is_exportable());
@@ -131,7 +136,13 @@ impl DestroyCommand {
         }
 
         // Delete from keystore backend
-        if keystore_kind == KeystoreKind::Remote {
+        if keystore_kind == KeystoreKind::Remote && !stores_credentials {
+            // Hardware wallet: nothing was stored locally beyond accounts.yml.
+            eprintln!(
+                "{}",
+                "  Nothing to remove from the secret store; the key stays on the device.".dimmed()
+            );
+        } else if keystore_kind == KeystoreKind::Remote {
             // Remove the API credential blob from the platform secret
             // store. The wallet itself stays intact at the provider.
             let intent = pay_core::keystore::AuthIntent::delete_account(&self.account);

@@ -28,6 +28,8 @@
 //! for a dozen custody providers, so an implementation is usually a thin
 //! wrapper over one of those.
 
+#[cfg(feature = "ledger")]
+pub mod ledger;
 pub mod openfort;
 
 use std::collections::BTreeMap;
@@ -41,7 +43,11 @@ use crate::signer::{AuthOverride, ResolvedSigner};
 use crate::{Error, Result};
 
 /// The registered remote backends, by [`RemoteProvider::id`].
-static PROVIDERS: &[&dyn RemoteProvider] = &[&openfort::Openfort];
+static PROVIDERS: &[&dyn RemoteProvider] = &[
+    &openfort::Openfort,
+    #[cfg(feature = "ledger")]
+    &ledger::Ledger,
+];
 
 /// Look up a backend by id (`openfort`), or `None` if unregistered.
 pub fn provider(id: &str) -> Option<&'static dyn RemoteProvider> {
@@ -92,8 +98,17 @@ pub type Credentials = BTreeMap<String, String>;
 /// [`SigningBackend::is_exportable`], …) come from the supertrait; this
 /// trait adds only what connecting to a remote wallet needs.
 pub trait RemoteProvider: SigningBackend {
-    /// The credentials to collect, in prompt order.
+    /// The credentials to collect, in prompt order. Empty for backends where
+    /// the device is the credential (hardware wallets).
     fn credential_fields(&self) -> &'static [CredentialField];
+
+    /// Whether anything is stored in the platform secret store for an
+    /// account on this backend. False when [`credential_fields`](Self::credential_fields)
+    /// is empty: setup prompts for nothing, resolution loads nothing, and
+    /// destroy deletes nothing.
+    fn requires_credentials(&self) -> bool {
+        !self.credential_fields().is_empty()
+    }
 
     /// One line telling the user where to obtain the credentials.
     fn credentials_hint(&self) -> &'static str;
@@ -264,9 +279,14 @@ pub fn load_remote_signer(
         ))
     })?;
 
-    let gated = account.auth_required_for_network(network);
-    let account_intent = intent.with_account_context(name);
-    let credentials = load_credentials(name, provider.id(), gated, auth_override, &account_intent)?;
+    let credentials = if provider.requires_credentials() {
+        let gated = account.auth_required_for_network(network);
+        let account_intent = intent.with_account_context(name);
+        load_credentials(name, provider.id(), gated, auth_override, &account_intent)?
+    } else {
+        // Hardware wallets: nothing stored locally, the device approves.
+        Credentials::new()
+    };
 
     let signer = provider
         .connect(&credentials, &wallet_id)
@@ -383,8 +403,13 @@ mod tests {
         assert_eq!(ids.len(), unique.len(), "provider ids must be unique");
 
         for p in PROVIDERS {
-            assert!(!p.credential_fields().is_empty(), "{}", p.id());
             assert!(!p.display_name().is_empty(), "{}", p.id());
+            assert_eq!(
+                p.requires_credentials(),
+                !p.credential_fields().is_empty(),
+                "{}: requires_credentials must follow the declared fields",
+                p.id()
+            );
         }
     }
 
@@ -451,6 +476,9 @@ mod tests {
         }
         fn is_available(&self) -> bool {
             true
+        }
+        fn max_tx_version(&self) -> Option<pay_kit::core::tx::TxVersion> {
+            None
         }
     }
 

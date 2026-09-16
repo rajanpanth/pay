@@ -293,7 +293,21 @@ fn create_remote_account(
 ) -> pay_core::Result<(String, &'static str)> {
     let display = provider.display_name();
 
-    if pay_core::remote::credentials_exist(name) && !force {
+    // Hardware wallets keep nothing in the secret store: "already
+    // connected" means an accounts.yml entry exists.
+    let already_connected = if provider.requires_credentials() {
+        pay_core::remote::credentials_exist(name)
+    } else {
+        pay_core::accounts::AccountsFile::load()
+            .ok()
+            .and_then(|f| {
+                f.named_account_for_network(pay_core::accounts::MAINNET_NETWORK, name)
+                    .map(|a| a.provider.as_deref() == Some(provider.id()))
+            })
+            .unwrap_or(false)
+    };
+
+    if already_connected && !force {
         let pubkey = pay_core::accounts::AccountsFile::load()
             .ok()
             .and_then(|f| {
@@ -324,7 +338,7 @@ fn create_remote_account(
         .iter()
         .any(|f| inputs.credential(provider, f).is_none())
         && std::io::IsTerminal::is_terminal(&std::io::stderr());
-    if will_prompt {
+    if will_prompt || !provider.requires_credentials() {
         eprintln!();
         eprintln!("  {}", provider.credentials_hint());
     }
@@ -369,9 +383,11 @@ fn create_remote_account(
     eprintln!("  {}", format!("Verifying with {display}…").dimmed());
     let pubkey = pay_core::remote::fetch_wallet_address(provider, &credentials, &wallet_id)?;
 
-    let ks = platform_credential_keystore()?;
-    let intent = pay_core::keystore::AuthIntent::create_account(name);
-    pay_core::remote::store_credentials(&ks, name, &credentials, &intent)?;
+    if provider.requires_credentials() {
+        let ks = platform_credential_keystore()?;
+        let intent = pay_core::keystore::AuthIntent::create_account(name);
+        pay_core::remote::store_credentials(&ks, name, &credentials, &intent)?;
+    }
 
     save_account_remote(name, provider.id(), &pubkey, &wallet_id)?;
 
@@ -701,6 +717,14 @@ pub fn pick_backend() -> pay_core::Result<String> {
             detail: crate::commands::cloud_onboard::CLOUD_BACKEND_DETAIL.to_string(),
         });
     }
+
+    // Hardware wallets need no secret store at all, so they are offered
+    // whenever this build includes them, plugged in or not.
+    options.extend(
+        pay_core::remote::providers()
+            .filter(|p| p.custody() == pay_core::backend::Custody::Hardware)
+            .map(|p| opt(p)),
+    );
 
     if options.is_empty() {
         #[cfg(target_os = "linux")]
