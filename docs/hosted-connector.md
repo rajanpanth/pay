@@ -76,12 +76,20 @@ connector custody question above.
   operator-signed session first, which a Ledger cannot sign; the client now
   carries the flat charge as a fallback and `RunOutcome::for_account` picks
   it (see `docs/keychain.md`).
-- Not yet done: enabling the feature in the Homebrew and npm release builds
-  (Linux needs `libudev-dev`), the envelope-aware `signature_type` at the
-  spec level (Track C6), and two keychain-side rough edges seen on the
-  device run: `solana-remote-wallet` prints "Waiting for your approval on
-  Ledger …" to stdout, which lands in front of the response body, and its
-  Trezor-bridge probe logs connection-refused noise on every connect.
+- Release builds (`release-cli.yml`) compile with `--features ledger` on
+  every target, with `libudev-dev` installed natively and through a cross
+  `pre-build` hook; CI lints and tests the feature on Linux and checks it
+  on Windows.
+- Two rough edges seen on the device run live in `solana-remote-wallet`
+  (Agave). Its Trezor-bridge probe logs a refused connection on every
+  connect: pay's default log filter now turns that crate off, since its
+  failures reach the user as pay errors anyway. It also prints "Waiting for
+  your approval on Ledger …" to stdout, which lands in front of a piped
+  response body: fixed upstream by switching those prompts to stderr
+  (Agave PR pending); pay picks it up with the next solana-remote-wallet
+  release.
+- Not yet done: the envelope-aware `signature_type` at the spec level
+  (Track C6).
 
 ## Goals
 

@@ -509,10 +509,13 @@ fn init_logging(
     verbose: bool,
     otlp_sidecar: Option<&str>,
 ) -> Option<observability::OtelGuard> {
+    // `solana_remote_wallet` probes for Trezor Bridge on every Ledger
+    // connect and logs the refused connection as an error; its failures
+    // reach the user as pay errors instead.
     let default = if verbose || otlp_sidecar.is_some() {
-        "pay=info,warn"
+        "pay=info,warn,solana_remote_wallet=off"
     } else {
-        "warn"
+        "warn,solana_remote_wallet=off"
     };
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default));
 
