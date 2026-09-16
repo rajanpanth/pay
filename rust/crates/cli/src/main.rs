@@ -221,11 +221,18 @@ fn main() {
             None
         };
         if let Some(network) = enforced_network {
-            let exists = accounts
+            // Same rule as pay-core's signer resolution: a remote or
+            // hardware account registered on mainnet signs raw bytes and
+            // carries no chain state, so it serves every network.
+            let on_network = accounts
                 .accounts
                 .get(network)
                 .is_some_and(|net| net.contains_key(name.as_str()));
-            if !exists {
+            let remote_on_mainnet = network != pay_core::accounts::MAINNET_NETWORK
+                && accounts
+                    .named_account_for_network(pay_core::accounts::MAINNET_NETWORK, name)
+                    .is_some_and(|a| a.backend == pay_core::accounts::BackendKind::Remote);
+            if !on_network && !remote_on_mainnet {
                 eprintln!("Error: account '{name}' not found in {network}.");
                 std::process::exit(1);
             }
