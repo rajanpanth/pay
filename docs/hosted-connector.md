@@ -5,7 +5,7 @@ Owner: pay core team.
 
 ## Milestone 1 status (2026-09-15)
 
-Done on `feat/pay-cloud` (main plus PR #423):
+Done on `feat/pay-cloud` (PR #464, rebased on main after PR #423 merged on 2026-09-16):
 
 - Keychain cleanup: `pay_core::backend` registry and `SigningBackend`
   capability trait; `RemoteProvider` is a supertrait so Circle is a file
@@ -64,7 +64,7 @@ connector custody question above.
 
 ### Ledger status (2026-09-15)
 
-- pay is on pay-kit `4cde44fb` (head of pay-kit PR #323) with solana-keychain
+- pay is on pay-kit `0626cd7c` (pay-kit main, PR #323 merged) with solana-keychain
   `6461a18`, via a cherry-pick of pay PR #462 onto `feat/pay-cloud`. Every
   signer implements keychain 2.x `TransactionSigner`.
 - `remote::ledger` provider behind the `ledger` feature; V0 cap and
