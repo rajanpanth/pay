@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
+import { FundTerminal } from "../components/cloud/FundTerminal";
 import { TerminalLink } from "../components/cloud/TerminalLink";
 import { TerminalProgress, type ProgressLine } from "../components/cloud/TerminalProgress";
 import { WelcomeCard } from "../components/cloud/WelcomeCard";
+import {
+  isFundPath,
+  parseFundParams,
+  type FundStartResponse,
+  type FundStatusResponse,
+} from "./lib/fund";
 import {
   buildProviderStartRequest,
   hasLinkParams,
@@ -21,6 +28,14 @@ async function postJson<T>(path: string, body: unknown): Promise<T> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
+  return unwrap<T>(res);
+}
+
+async function getJson<T>(path: string): Promise<T> {
+  return unwrap<T>(await fetch(path, { headers: { accept: "application/json" } }));
+}
+
+async function unwrap<T>(res: Response): Promise<T> {
   const json = (await res.json().catch(() => ({}))) as ApiError & T;
   if (!res.ok) {
     throw new Error(json.message ?? `Request failed (${res.status})`);
@@ -35,11 +50,24 @@ export function App() {
     () => providerCallbackFromPath(window.location.pathname),
     [],
   );
-  const terminal = linked || callbackProvider !== null;
+  const funding = useMemo(() => isFundPath(window.location.pathname), []);
+  const terminal = linked || callbackProvider !== null || funding;
 
   useEffect(() => {
     document.documentElement.dataset.cloudTheme = terminal ? "terminal" : "light";
   }, [terminal]);
+
+  if (funding) {
+    return (
+      <main className="cloud-page cloud-page--terminal">
+        <FundTerminal
+          params={parseFundParams(window.location.search)}
+          start={(body) => postJson<FundStartResponse>("/api/fund/start", body)}
+          status={(id) => getJson<FundStatusResponse>(`/api/fund/${encodeURIComponent(id)}`)}
+        />
+      </main>
+    );
+  }
 
   if (callbackProvider) {
     return (

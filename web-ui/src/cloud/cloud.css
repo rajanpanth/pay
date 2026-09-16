@@ -386,6 +386,80 @@ html[data-cloud-theme="terminal"] #root {
   font-size: 13px;
 }
 
+/* Funding page: amount presets, fee table, embedded card form. */
+.cloud-term-amounts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.cloud-term-amount {
+  height: 44px;
+  min-width: 96px;
+  padding: 0 20px;
+  border: 1px solid var(--term-border);
+  border-radius: 0;
+  background: var(--term-surface-raised);
+  color: var(--term-fg);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+.cloud-term-amount:hover:enabled {
+  border-color: var(--term-green);
+}
+.cloud-term-amount--active,
+.cloud-term-amount--active:hover:enabled {
+  background: var(--term-fg);
+  border-color: var(--term-fg);
+  color: #000000;
+}
+.cloud-term-amount:focus-visible {
+  outline: 2px solid var(--term-green);
+  outline-offset: 2px;
+}
+.cloud-term-table {
+  width: 100%;
+  max-width: 480px;
+  border-collapse: collapse;
+}
+.cloud-term-table td {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--term-border);
+}
+.cloud-term-table td:last-child {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.cloud-term-table-muted td {
+  color: var(--term-fg-subtle);
+}
+.cloud-term-table-total td {
+  font-weight: 700;
+  border-bottom: none;
+}
+.cloud-term-link {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--term-green);
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.cloud-term-warn {
+  color: var(--term-yellow);
+}
+.cloud-term-frame {
+  display: block;
+  width: 100%;
+  max-width: 560px;
+  border: 1px solid var(--term-border);
+  background: #000000;
+}
+
 @media (max-width: 600px) {
   .cloud-page--terminal {
     padding: 20px 16px;
