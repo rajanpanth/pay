@@ -95,7 +95,9 @@ fn cloud_url_from(url: Option<&str>, local: Option<&str>) -> String {
 /// the account in `accounts.yml`, after the provider confirms the address.
 /// Anything else is a failed setup: nothing is saved and the user is told
 /// to run it again.
-pub fn run_setup_onboarding(account: &str, force: bool) -> pay_core::Result<()> {
+///
+/// Returns the account's address so setup can go on to fund it.
+pub fn run_setup_onboarding(account: &str, force: bool) -> pay_core::Result<String> {
     let result = run_loopback_onboarding(&OnboardRequest {
         cloud_url: default_cloud_url(),
         account: account.to_string(),
@@ -127,11 +129,12 @@ fn ensure_ready(result: &OnboardResult) -> pay_core::Result<()> {
 }
 
 /// Store a `ready` exchange result as a remote account named `account`.
+/// Returns the verified address.
 pub fn register_provisioned_account(
     account: &str,
     result: &OnboardResult,
     force: bool,
-) -> pay_core::Result<()> {
+) -> pay_core::Result<String> {
     let provider = pay_core::remote::provider(&result.provider).ok_or_else(|| {
         pay_core::Error::Config(format!(
             "pay-cloud returned a wallet for `{}`, which this build of pay does not support \
@@ -196,12 +199,8 @@ pub fn register_provisioned_account(
     if let Some(project) = result.project_id.as_deref().filter(|p| !p.is_empty()) {
         body.push_str(&format!("\nProject: {project}"));
     }
-    body.push_str(&format!(
-        "\n\nFund it before making paid requests:\n$ {}",
-        crate::commands::topup::topup_retry_command(account)
-    ));
     components::print_notice(components::NoticeLevel::Info, "Remote wallet ready", &body);
-    Ok(())
+    Ok(pubkey)
 }
 
 fn print_result(result: &OnboardResult) {
@@ -301,7 +300,7 @@ pub fn run_loopback_onboarding(req: &OnboardRequest) -> pay_core::Result<Onboard
         .build()
         .map_err(|e| pay_core::Error::Config(format!("onboarding runtime: {e}")))?;
     let code = rt.block_on(async {
-        let listener = bind_callback_listener(&pkce.state).await?;
+        let listener = bind_callback_listener(&pkce.state, Expect::Code).await?;
         let url = build_browser_url(&BrowserUrlParams {
             cloud_url: &cloud_url,
             callback: &listener.callback_url(),
@@ -431,43 +430,78 @@ fn open_browser(url: &str) {
 
 // ── Callback listener ─────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct CallbackQuery {
     #[serde(default)]
     pub code: Option<String>,
     #[serde(default)]
     pub state: Option<String>,
+    #[serde(default)]
+    pub payment_id: Option<String>,
+    #[serde(default)]
+    pub signature: Option<String>,
+}
+
+/// What a `/callback` hit must carry to complete the flow that opened the
+/// browser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Expect {
+    /// An authorization code from pay-cloud's onboarding exchange.
+    Code,
+    /// A Coinflow payment id from the funding page.
+    Payment,
+}
+
+/// What the browser delivered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Accepted {
+    Code(String),
+    Payment {
+        payment_id: String,
+        /// On-chain signature, when pay-cloud already knew it.
+        signature: Option<String>,
+    },
 }
 
 /// Decide whether a `/callback` hit completes the flow. Pure so the state
 /// check is unit-testable without a socket.
 pub fn accept_callback(
-    code: Option<&str>,
-    state: Option<&str>,
+    expect: Expect,
+    q: &CallbackQuery,
     expected_state: &str,
-) -> Result<String, &'static str> {
-    match (code, state) {
-        (_, None) => Err("missing state"),
-        (_, Some(s)) if s != expected_state => Err("state mismatch"),
-        (None | Some(""), _) => Err("missing code"),
-        (Some(c), _) => Ok(c.to_string()),
+) -> Result<Accepted, &'static str> {
+    match q.state.as_deref() {
+        None => return Err("missing state"),
+        Some(s) if s != expected_state => return Err("state mismatch"),
+        Some(_) => {}
+    }
+    let present = |v: &Option<String>| v.as_deref().filter(|s| !s.is_empty()).map(str::to_string);
+    match expect {
+        Expect::Code => present(&q.code).map(Accepted::Code).ok_or("missing code"),
+        Expect::Payment => present(&q.payment_id)
+            .map(|payment_id| Accepted::Payment {
+                payment_id,
+                signature: present(&q.signature),
+            })
+            .ok_or("missing payment_id"),
     }
 }
 
 #[derive(Clone)]
 struct CallbackState {
+    expect: Expect,
     expected_state: Arc<str>,
-    code_tx: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    result_tx: Arc<Mutex<Option<oneshot::Sender<Accepted>>>>,
 }
 
 async fn callback_handler(
     State(st): State<CallbackState>,
     Query(q): Query<CallbackQuery>,
 ) -> Response {
-    match accept_callback(q.code.as_deref(), q.state.as_deref(), &st.expected_state) {
-        Ok(code) => {
-            if let Some(tx) = st.code_tx.lock().unwrap().take() {
-                let _ = tx.send(code);
+    match accept_callback(st.expect, &q, &st.expected_state) {
+        Ok(accepted) => {
+            if let Some(tx) = st.result_tx.lock().unwrap().take() {
+                let _ = tx.send(accepted);
             }
             (StatusCode::OK, Html(success_page())).into_response()
         }
@@ -504,27 +538,31 @@ fn error_page(reason: &str) -> String {
 /// A bound `/callback` listener on `127.0.0.1:<ephemeral>`.
 pub struct CallbackListener {
     pub addr: SocketAddr,
-    code_rx: oneshot::Receiver<String>,
+    result_rx: oneshot::Receiver<Accepted>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
 }
 
 /// Bind the listener and start serving. Must be called inside a tokio
-/// runtime; the server task lives until [`CallbackListener::wait_for_code`]
+/// runtime; the server task lives until [`CallbackListener::wait_for`]
 /// returns.
-pub async fn bind_callback_listener(expected_state: &str) -> pay_core::Result<CallbackListener> {
+pub async fn bind_callback_listener(
+    expected_state: &str,
+    expect: Expect,
+) -> pay_core::Result<CallbackListener> {
     let listener = tokio::net::TcpListener::bind((LOOPBACK_IP, 0))
         .await
-        .map_err(|e| pay_core::Error::Config(format!("onboarding callback bind: {e}")))?;
+        .map_err(|e| pay_core::Error::Config(format!("loopback callback bind: {e}")))?;
     let addr = listener
         .local_addr()
-        .map_err(|e| pay_core::Error::Config(format!("onboarding callback local_addr: {e}")))?;
+        .map_err(|e| pay_core::Error::Config(format!("loopback callback local_addr: {e}")))?;
 
-    let (code_tx, code_rx) = oneshot::channel();
+    let (result_tx, result_rx) = oneshot::channel();
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let state = CallbackState {
+        expect,
         expected_state: Arc::from(expected_state),
-        code_tx: Arc::new(Mutex::new(Some(code_tx))),
+        result_tx: Arc::new(Mutex::new(Some(result_tx))),
     };
     let app = Router::new()
         .route("/callback", get(callback_handler))
@@ -540,7 +578,7 @@ pub async fn bind_callback_listener(expected_state: &str) -> pay_core::Result<Ca
 
     Ok(CallbackListener {
         addr,
-        code_rx,
+        result_rx,
         shutdown_tx: Some(shutdown_tx),
         server,
     })
@@ -551,30 +589,165 @@ impl CallbackListener {
         format!("http://{}/callback", self.addr)
     }
 
-    /// Wait for the browser to deliver the code, then shut the server down
+    /// Wait for the browser to come back, then shut the server down
     /// (letting the success page flush first).
-    pub async fn wait_for_code(self, timeout: Duration) -> pay_core::Result<String> {
+    pub async fn wait_for(self, timeout: Duration) -> pay_core::Result<Accepted> {
         let CallbackListener {
-            code_rx,
+            result_rx,
             mut shutdown_tx,
             server,
             ..
         } = self;
-        let outcome = tokio::time::timeout(timeout, code_rx).await;
+        let outcome = tokio::time::timeout(timeout, result_rx).await;
         if let Some(tx) = shutdown_tx.take() {
             let _ = tx.send(());
         }
         let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
         match outcome {
-            Ok(Ok(code)) => Ok(code),
+            Ok(Ok(accepted)) => Ok(accepted),
             Ok(Err(_)) => Err(pay_core::Error::Config(
-                "onboarding callback listener closed before a code arrived".to_string(),
+                "loopback callback listener closed before the browser came back".to_string(),
             )),
             Err(_) => Err(pay_core::Error::Config(
-                "Timed out waiting for the browser to finish linking. Run the command again."
-                    .to_string(),
+                "Timed out waiting for the browser to finish. Run the command again.".to_string(),
             )),
         }
+    }
+
+    /// [`wait_for`](Self::wait_for) for an onboarding listener.
+    pub async fn wait_for_code(self, timeout: Duration) -> pay_core::Result<String> {
+        match self.wait_for(timeout).await? {
+            Accepted::Code(code) => Ok(code),
+            Accepted::Payment { .. } => Err(pay_core::Error::Config(
+                "loopback callback delivered a payment where a code was expected".to_string(),
+            )),
+        }
+    }
+}
+
+// ── Funding page ──────────────────────────────────────────────────────────
+
+/// How long `pay topup` waits for the card purchase; entering a card and
+/// clearing 3-D Secure can take a while.
+pub const FUNDING_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Query for `{cloud}/fund`, the card-purchase page.
+pub struct FundUrlParams<'a> {
+    pub cloud_url: &'a str,
+    pub address: &'a str,
+    /// Loopback URL the page returns to; `None` when nobody is waiting.
+    pub callback: Option<&'a str>,
+    pub state: Option<&'a str>,
+    pub account: &'a str,
+    pub cli: &'a str,
+}
+
+pub fn build_fund_url(p: &FundUrlParams<'_>) -> String {
+    let mut url = reqwest::Url::parse(&format!("{}/fund", p.cloud_url.trim_end_matches('/')))
+        .expect("cloud url should parse");
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("address", p.address);
+        if let Some(callback) = p.callback {
+            q.append_pair("callback", callback);
+        }
+        if let Some(state) = p.state {
+            q.append_pair("state", state);
+        }
+        q.append_pair("account", p.account);
+        q.append_pair("cli", p.cli);
+    }
+    url.into()
+}
+
+/// The funding page came back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FundingOutcome {
+    pub payment_id: String,
+    pub signature: Option<String>,
+}
+
+/// A funding page that was opened: the URL to reopen it, and the browser's
+/// eventual answer. The listener lives on its own thread with its own
+/// runtime so a synchronous UI can poll [`try_recv`](Self::try_recv).
+pub struct FundingSession {
+    pub url: String,
+    outcome_rx: std::sync::mpsc::Receiver<pay_core::Result<FundingOutcome>>,
+}
+
+impl FundingSession {
+    /// Bind the loopback listener, build the page URL and open the browser.
+    /// Returns once the URL is known; the wait continues in the background.
+    pub fn open(cloud_url: &str, address: &str, account: &str) -> pay_core::Result<Self> {
+        let cloud_url = cloud_url.trim_end_matches('/').to_string();
+        check_cloud_reachable(&cloud_url)?;
+        let state = random_token();
+        let (url_tx, url_rx) = std::sync::mpsc::channel::<pay_core::Result<String>>();
+        let (outcome_tx, outcome_rx) = std::sync::mpsc::channel();
+        let (address, account) = (address.to_string(), account.to_string());
+        std::thread::Builder::new()
+            .name("pay-fund-callback".into())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = url_tx.send(Err(pay_core::Error::Config(format!(
+                            "funding runtime: {e}"
+                        ))));
+                        return;
+                    }
+                };
+                let outcome =
+                    rt.block_on(async {
+                        let listener = match bind_callback_listener(&state, Expect::Payment).await {
+                            Ok(listener) => listener,
+                            Err(e) => {
+                                let _ = url_tx.send(Err(e));
+                                return None;
+                            }
+                        };
+                        let url = build_fund_url(&FundUrlParams {
+                            cloud_url: &cloud_url,
+                            address: &address,
+                            callback: Some(&listener.callback_url()),
+                            state: Some(&state),
+                            account: &account,
+                            cli: env!("CARGO_PKG_VERSION"),
+                        });
+                        let _ = url_tx.send(Ok(url));
+                        Some(listener.wait_for(FUNDING_TIMEOUT).await.map(
+                            |accepted| match accepted {
+                                Accepted::Payment {
+                                    payment_id,
+                                    signature,
+                                } => FundingOutcome {
+                                    payment_id,
+                                    signature,
+                                },
+                                Accepted::Code(_) => {
+                                    unreachable!("listener bound with Expect::Payment")
+                                }
+                            },
+                        ))
+                    });
+                if let Some(outcome) = outcome {
+                    let _ = outcome_tx.send(outcome);
+                }
+            })
+            .map_err(|e| pay_core::Error::Config(format!("funding listener thread: {e}")))?;
+        let url = url_rx.recv_timeout(Duration::from_secs(5)).map_err(|_| {
+            pay_core::Error::Config("funding listener did not start in time".to_string())
+        })??;
+        open_browser(&url);
+        Ok(Self { url, outcome_rx })
+    }
+
+    /// The browser's answer, if it has come back yet.
+    pub fn try_recv(&self) -> Option<pay_core::Result<FundingOutcome>> {
+        self.outcome_rx.try_recv().ok()
     }
 }
 
@@ -753,30 +926,113 @@ mod tests {
 
     #[test]
     fn accept_callback_checks_state_and_code() {
+        let q = |code: Option<&str>, state: Option<&str>| CallbackQuery {
+            code: code.map(str::to_string),
+            state: state.map(str::to_string),
+            ..CallbackQuery::default()
+        };
         assert_eq!(
-            accept_callback(Some("abc"), Some("s"), "s").as_deref(),
-            Ok("abc")
+            accept_callback(Expect::Code, &q(Some("abc"), Some("s")), "s"),
+            Ok(Accepted::Code("abc".to_string()))
         );
         assert_eq!(
-            accept_callback(Some("abc"), Some("other"), "s"),
+            accept_callback(Expect::Code, &q(Some("abc"), Some("other")), "s"),
             Err("state mismatch")
         );
         assert_eq!(
-            accept_callback(Some("abc"), None, "s"),
+            accept_callback(Expect::Code, &q(Some("abc"), None), "s"),
             Err("missing state")
         );
-        assert_eq!(accept_callback(None, Some("s"), "s"), Err("missing code"));
         assert_eq!(
-            accept_callback(Some(""), Some("s"), "s"),
+            accept_callback(Expect::Code, &q(None, Some("s")), "s"),
             Err("missing code")
         );
+        assert_eq!(
+            accept_callback(Expect::Code, &q(Some(""), Some("s")), "s"),
+            Err("missing code")
+        );
+    }
+
+    #[test]
+    fn accept_callback_reads_a_payment_when_funding() {
+        let q = |payment_id: Option<&str>, signature: Option<&str>| CallbackQuery {
+            state: Some("s".to_string()),
+            payment_id: payment_id.map(str::to_string),
+            signature: signature.map(str::to_string),
+            ..CallbackQuery::default()
+        };
+        assert_eq!(
+            accept_callback(Expect::Payment, &q(Some("pay_1"), Some("5ig")), "s"),
+            Ok(Accepted::Payment {
+                payment_id: "pay_1".to_string(),
+                signature: Some("5ig".to_string()),
+            })
+        );
+        assert_eq!(
+            accept_callback(Expect::Payment, &q(Some("pay_1"), Some("")), "s"),
+            Ok(Accepted::Payment {
+                payment_id: "pay_1".to_string(),
+                signature: None,
+            })
+        );
+        assert_eq!(
+            accept_callback(Expect::Payment, &q(None, None), "s"),
+            Err("missing payment_id")
+        );
+        // A code is not a payment, and vice versa.
+        let with_code = CallbackQuery {
+            code: Some("abc".to_string()),
+            state: Some("s".to_string()),
+            ..CallbackQuery::default()
+        };
+        assert_eq!(
+            accept_callback(Expect::Payment, &with_code, "s"),
+            Err("missing payment_id")
+        );
+    }
+
+    #[test]
+    fn fund_url_carries_the_address_and_the_return_path() {
+        let url = build_fund_url(&FundUrlParams {
+            cloud_url: "http://127.0.0.1:8402/",
+            address: "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z",
+            callback: Some("http://127.0.0.1:53211/callback"),
+            state: Some("st4te"),
+            account: "ledger-test",
+            cli: "0.29.0",
+        });
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(
+            parsed.origin().ascii_serialization(),
+            "http://127.0.0.1:8402"
+        );
+        assert_eq!(parsed.path(), "/fund");
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(q["address"], "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z");
+        assert_eq!(q["callback"], "http://127.0.0.1:53211/callback");
+        assert_eq!(q["state"], "st4te");
+        assert_eq!(q["account"], "ledger-test");
+        assert_eq!(q["cli"], "0.29.0");
+
+        let bare = build_fund_url(&FundUrlParams {
+            cloud_url: "https://cloud.pay.sh",
+            address: "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z",
+            callback: None,
+            state: None,
+            account: "default",
+            cli: "0.29.0",
+        });
+        assert!(!bare.contains("callback="));
+        assert!(!bare.contains("state="));
     }
 
     #[test]
     fn callback_listener_end_to_end() {
         let rt = runtime();
         rt.block_on(async {
-            let mut listener = bind_callback_listener("expected-state").await.unwrap();
+            let mut listener = bind_callback_listener("expected-state", Expect::Code)
+                .await
+                .unwrap();
             assert_eq!(listener.addr.ip(), LOOPBACK_IP);
             let base = listener.callback_url();
             let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -790,7 +1046,7 @@ mod tests {
             assert_eq!(res.status(), reqwest::StatusCode::BAD_REQUEST);
             assert!(res.text().await.unwrap().contains("state mismatch"));
             assert!(
-                tokio::time::timeout(Duration::from_millis(100), &mut listener.code_rx)
+                tokio::time::timeout(Duration::from_millis(100), &mut listener.result_rx)
                     .await
                     .is_err(),
                 "wrong state must not resolve the code"
@@ -817,7 +1073,7 @@ mod tests {
     fn callback_listener_times_out() {
         let rt = runtime();
         rt.block_on(async {
-            let listener = bind_callback_listener("s").await.unwrap();
+            let listener = bind_callback_listener("s", Expect::Code).await.unwrap();
             let err = listener
                 .wait_for_code(Duration::from_millis(50))
                 .await

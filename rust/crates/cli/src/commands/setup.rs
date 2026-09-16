@@ -121,11 +121,18 @@ impl SetupCommand {
         // does not leave MCP/agent configuration partially installed.
         let backend = super::account::new::resolve_backend(self.backend.as_deref())?;
 
-        // Browser-linked remote wallet: the page owns sign-in, custody
-        // choice and funding, so none of the local keypair steps below
-        // apply. Nothing is installed until provisioning returns an account.
+        // Browser-linked remote wallet: the page owns sign-in and custody
+        // choice, so none of the local keypair steps below apply. Nothing
+        // is installed until provisioning returns an account; funding then
+        // runs the same way as for every other backend.
         if backend == super::cloud_onboard::CLOUD_BACKEND_FLAG {
-            return super::cloud_onboard::run_setup_onboarding(&account_name, self.force);
+            let pubkey = super::cloud_onboard::run_setup_onboarding(&account_name, self.force)?;
+            return fund_new_account(
+                &pubkey,
+                &account_name,
+                super::cloud_onboard::CLOUD_BACKEND_NAME,
+                false,
+            );
         }
 
         // Offer to install the agent skill if npx is available.
@@ -143,30 +150,18 @@ impl SetupCommand {
         )?;
         super::buzz_setup::maybe_configure();
 
-        let config = pay_core::Config::load().unwrap_or_default();
-        let rpc_url = config
-            .rpc_url
-            .clone()
-            .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
-
         // Headless setup path: when there's no biometric backend available
         // on this platform (VM / CI / server), we already fell back to
         // NoAuth in `create_account`, and the interactive top-up TUI has
         // nothing useful to render. Skip it and print the aborted-style
         // notice instead — the user can fund the account later via
         // `pay topup` once they have a TTY.
-        let skip_tui = !has_biometric_backend();
-        let completion = if skip_tui {
-            None
-        } else {
-            crate::tui::run_topup_flow(&pubkey, &rpc_url, &account_name)?
-        };
-        if let Some(completion) = completion {
-            print_setup_success(backend_name, &completion, &rpc_url);
-        } else {
-            print_setup_aborted(&account_name, backend_name);
-        }
-        Ok(())
+        fund_new_account(
+            &pubkey,
+            &account_name,
+            backend_name,
+            !has_biometric_backend(),
+        )
     }
 
     fn run_redeem(&self, account_name: &str, code: &str) -> pay_core::Result<()> {
@@ -229,6 +224,32 @@ impl SetupCommand {
 /// that pay can drive. Mirrors the check used in
 /// [`crate::commands::account::new::build_keystore`] so the TUI is skipped
 /// on the same hosts where biometric account creation is unavailable.
+/// The funding step every backend shares once an account exists: the
+/// top-up TUI, then the success or aborted notice.
+fn fund_new_account(
+    pubkey: &str,
+    account_name: &str,
+    backend_name: &str,
+    skip_tui: bool,
+) -> pay_core::Result<()> {
+    let config = pay_core::Config::load().unwrap_or_default();
+    let rpc_url = config
+        .rpc_url
+        .clone()
+        .unwrap_or_else(pay_core::balance::mainnet_rpc_url);
+    let completion = if skip_tui {
+        None
+    } else {
+        crate::tui::run_topup_flow(pubkey, &rpc_url, account_name)?
+    };
+    if let Some(completion) = completion {
+        print_setup_success(backend_name, &completion, &rpc_url);
+    } else {
+        print_setup_aborted(account_name, backend_name);
+    }
+    Ok(())
+}
+
 fn has_biometric_backend() -> bool {
     #[cfg(target_os = "macos")]
     {
