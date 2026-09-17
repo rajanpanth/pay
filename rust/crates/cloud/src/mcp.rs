@@ -182,19 +182,35 @@ pub fn router(auth: Auth, context: Arc<dyn pay_mcp::PayContext>) -> Router {
 }
 
 /// Refuse anything without a live token; tag the rest with its tenant.
+///
+/// `Authorization: Bearer <token>` is the standard; a bare `<token>` is
+/// accepted too, because some host dialogs offer a single "authorization"
+/// box and send it verbatim.
 async fn require_bearer(State(auth): State<Auth>, mut req: Request, next: Next) -> Response {
-    let bearer = req
+    let raw = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim);
-    match bearer.and_then(|b| auth.authenticate(b)) {
+    let token = raw.map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim());
+    match token.and_then(|t| auth.authenticate(t)) {
         Some(tenant) => {
             req.extensions_mut().insert(tenant);
             next.run(req).await
         }
-        None => unauthorized(&auth.cfg),
+        None => {
+            // The scheme, never the value: enough to tell "no header" from
+            // "wrong shape" from "unknown token" when a host cannot connect.
+            let shape = match raw {
+                None => "absent".to_string(),
+                Some(v) => match v.split_once(' ') {
+                    Some((scheme, _)) => format!("scheme={scheme}"),
+                    None => format!("bare, {} chars", v.len()),
+                },
+            };
+            tracing::info!(authorization = %shape, "mcp request refused");
+            unauthorized(&auth.cfg)
+        }
     }
 }
 
@@ -349,6 +365,22 @@ pub(crate) mod tests {
             let json: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(json["error"], "unauthorized");
         }
+    }
+
+    #[tokio::test]
+    async fn a_bare_token_without_the_bearer_scheme_is_accepted() {
+        let app = app();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .header(header::HOST, "cloud.test")
+            .header(header::AUTHORIZATION, "tok-alpha")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .body(Body::from(INIT))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]
