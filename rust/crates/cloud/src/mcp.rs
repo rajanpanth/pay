@@ -113,6 +113,10 @@ impl Config {
         self.tokens.len()
     }
 
+    pub fn tokens(&self) -> &[String] {
+        &self.tokens
+    }
+
     /// RFC 9728 pointer sent on every 401.
     pub fn resource_metadata_url(&self) -> String {
         format!("{}/.well-known/oauth-protected-resource", self.public_url)
@@ -195,9 +199,13 @@ async fn require_bearer(State(auth): State<Auth>, mut req: Request, next: Next) 
 }
 
 fn unauthorized(cfg: &Config) -> Response {
+    // The full RFC 6750 shape: some hosts read the scope from here rather
+    // than from the metadata, and stall without it.
     let challenge = format!(
-        "Bearer resource_metadata=\"{}\", error=\"invalid_token\"",
-        cfg.resource_metadata_url()
+        "Bearer error=\"invalid_token\", error_description=\"A bearer token for pay is required\", \
+         resource_metadata=\"{}\", scope=\"{}\"",
+        cfg.resource_metadata_url(),
+        crate::oauth::SCOPE
     );
     let body = serde_json::json!({
         "error": "unauthorized",
@@ -328,11 +336,16 @@ pub(crate) mod tests {
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
             let challenge = headers[header::WWW_AUTHENTICATE].to_str().unwrap();
             assert!(
-                challenge.starts_with(
-                    "Bearer resource_metadata=\"https://cloud.test/.well-known/oauth-protected-resource\""
+                challenge.starts_with("Bearer error=\"invalid_token\""),
+                "{challenge}"
+            );
+            assert!(
+                challenge.contains(
+                    "resource_metadata=\"https://cloud.test/.well-known/oauth-protected-resource\""
                 ),
                 "{challenge}"
             );
+            assert!(challenge.contains("scope=\"mcp\""), "{challenge}");
             let json: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(json["error"], "unauthorized");
         }

@@ -7,6 +7,7 @@
 #   rust/crates/cloud/dev/run.sh                 # mock Openfort, http://127.0.0.1:8402
 #   rust/crates/cloud/dev/run.sh --real-openfort # use dashboard.openfort.io
 #   rust/crates/cloud/dev/run.sh --public-url https://xyz.trycloudflare.com
+#   rust/crates/cloud/dev/run.sh --static-token <token>   # header auth + a mock wallet for it
 #
 # Reads the repo-root .env (Coinflow sandbox settings) when present.
 # Ctrl-C stops everything.
@@ -18,6 +19,7 @@ MOCK_PORT=8499
 PUBLIC_URL=""
 REAL_OPENFORT=0
 SKIP_BUILD=0
+STATIC_TOKEN=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -25,6 +27,7 @@ while [ $# -gt 0 ]; do
     --public-url) PUBLIC_URL="$2"; shift 2 ;;
     --real-openfort) REAL_OPENFORT=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
+    --static-token) STATIC_TOKEN="$2"; shift 2 ;;
     -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
@@ -65,6 +68,11 @@ fi
 
 export PAY_CLOUD_MCP=1
 export RUST_LOG="${RUST_LOG:-info,pay_cloud=debug}"
+if [ -n "$STATIC_TOKEN" ]; then
+  # A header-authenticated host; with the mock, the token gets a wallet too.
+  export PAY_CLOUD_MCP_TOKENS="$STATIC_TOKEN"
+  [ "$REAL_OPENFORT" = 0 ] && export PAY_CLOUD_DEV_MOCK_TENANTS=1
+fi
 
 step "Starting pay-cloud on http://127.0.0.1:$PORT (public URL $PUBLIC_URL)"
 "$ROOT/rust/target/debug/pay-cloud" --port "$PORT" --public-url "$PUBLIC_URL" &
@@ -78,7 +86,7 @@ cat <<EOF
   pay-cloud is up.  $PUBLIC_URL
 ────────────────────────────────────────────────────────────────────────
 
-  MCP connector (what Grok would use), with Claude Code as the host:
+$( [ -n "$STATIC_TOKEN" ] && printf '  Header-authenticated host (Grok custom connector, "headers" field):\n    Authorization: Bearer %s\n\n' "$STATIC_TOKEN" )  MCP connector (what Grok would use), with Claude Code as the host:
     claude mcp add --transport http paycloud $PUBLIC_URL/mcp
     then in Claude Code:  /mcp  → paycloud → Authenticate
     The browser lands on the consent page, creates a wallet$( [ "$REAL_OPENFORT" = 0 ] && printf ' (mock Openfort)' ), and returns.

@@ -71,7 +71,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 allowed_hosts = ?cfg.allowed_hosts,
                 "MCP connector enabled at /mcp with its OAuth server"
             );
-            state.with_mcp(cfg)
+            let state = state.with_mcp(cfg.clone());
+            dev_mock_tenants(&state, &cfg).await?;
+            state
         }
         None => {
             info!(
@@ -81,10 +83,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state
         }
     };
-    let app = pay_cloud::router(state).layer(TraceLayer::new_for_http());
+    // One line per request at INFO: a host's failed handshake is
+    // diagnosed from these, so they must not hide behind a debug filter.
+    let trace = TraceLayer::new_for_http()
+        .make_span_with(tower_http::trace::DefaultMakeSpan::new().level(tracing::Level::INFO))
+        .on_request(tower_http::trace::DefaultOnRequest::new().level(tracing::Level::INFO))
+        .on_response(
+            tower_http::trace::DefaultOnResponse::new()
+                .level(tracing::Level::INFO)
+                .latency_unit(tower_http::LatencyUnit::Millis),
+        );
+    let app = pay_cloud::router(state).layer(trace);
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    Ok(())
+}
+
+/// `PAY_CLOUD_DEV_MOCK_TENANTS=1`: give every static token a wallet from
+/// the first driver using a mock grant, so a host connected with a header
+/// can use every tool. Only meaningful against the mock Openfort; a real
+/// provider refuses the grant, which is the point.
+#[cfg(feature = "mcp")]
+async fn dev_mock_tenants(
+    state: &AppState,
+    cfg: &pay_cloud::mcp::Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let enabled = std::env::var("PAY_CLOUD_DEV_MOCK_TENANTS")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true"));
+    if !enabled || cfg.tokens().is_empty() {
+        return Ok(());
+    }
+    let Some(driver_id) = state.driver_ids().first().copied() else {
+        return Err("PAY_CLOUD_DEV_MOCK_TENANTS needs a wallet driver".into());
+    };
+    let driver = state.driver(driver_id).expect("listed driver exists");
+    let grant = pay_cloud::drivers::ConsentGrant {
+        api_key: "sk_test_mock".to_string(),
+        publishable_key: Some("pk_test_mock".to_string()),
+        project_id: Some("pro_mock".to_string()),
+        project: Some("Mock project".to_string()),
+    };
+    for token in cfg.tokens() {
+        let wallet = driver
+            .provision(&grant)
+            .await
+            .map_err(|e| format!("dev tenant provisioning failed: {e}"))?;
+        let subject = pay_cloud::mcp::token_fingerprint(token);
+        info!(%subject, address = %wallet.address, "DEV ONLY: static token bound to a mock wallet");
+        state
+            .tenants()
+            .bind(pay_cloud::tenants::TenantRecord::from_wallet(
+                &subject, &wallet,
+            ));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "mcp"))]
+#[allow(dead_code)]
+async fn dev_mock_tenants(_state: &AppState, _cfg: &()) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 

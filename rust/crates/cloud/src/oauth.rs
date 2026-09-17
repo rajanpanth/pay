@@ -546,6 +546,9 @@ pub struct RegistrationRequest {
 /// `POST /oauth/register`
 pub async fn register(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
     let store = oauth_of(&state)?;
+    // Registration bodies carry no secrets, and what a host sends is the
+    // first thing to read when its handshake stalls.
+    tracing::info!(body = %String::from_utf8_lossy(&body), "oauth registration request");
     let req: RegistrationRequest = serde_json::from_slice(&body).map_err(|e| {
         ApiError::bad_request("invalid_client_metadata", format!("Invalid JSON: {e}"))
     })?;
