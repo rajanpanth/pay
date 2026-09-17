@@ -28,9 +28,11 @@ pub const ENABLE_ENV: &str = "PAY_CLOUD_MCP";
 /// Optional comma-separated static bearer tokens.
 pub const TOKENS_ENV: &str = "PAY_CLOUD_MCP_TOKENS";
 pub const ALLOWED_HOSTS_ENV: &str = "PAY_CLOUD_MCP_ALLOWED_HOSTS";
-/// DEV ONLY: a static token whose tenant serves requests that carry no
-/// `Authorization` at all. For hosts that can neither send a header nor
-/// finish OAuth; never set it on a public deployment.
+/// DEV ONLY: a static token whose tenant serves every request that does
+/// not carry a valid token of its own. With it set the endpoint never
+/// answers 401, so a host sees a plain unauthenticated MCP server and
+/// never enters an OAuth state it cannot finish. Never set it on a public
+/// deployment.
 pub const ANONYMOUS_TOKEN_ENV: &str = "PAY_CLOUD_DEV_ANONYMOUS_TOKEN";
 pub const PATH: &str = "/mcp";
 
@@ -223,19 +225,16 @@ async fn require_bearer(State(auth): State<Auth>, mut req: Request, next: Next) 
         .and_then(|v| v.to_str().ok())
         .map(str::trim);
     let token = raw.map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim());
-    let tenant = match token {
-        Some(t) => auth.authenticate(t),
-        None => {
-            let anonymous = auth.cfg.anonymous_tenant().cloned();
-            if anonymous.is_some() {
-                // Names only: whether a header-less host carries anything a
-                // production login could hang a user identity on.
-                let names: Vec<&str> = req.headers().keys().map(|k| k.as_str()).collect();
-                tracing::info!(headers = ?names, "anonymous mcp request");
-            }
-            anonymous
+    let tenant = token.and_then(|t| auth.authenticate(t)).or_else(|| {
+        let anonymous = auth.cfg.anonymous_tenant().cloned();
+        if anonymous.is_some() {
+            // Names only: whether a header-less host carries anything a
+            // production login could hang a user identity on.
+            let names: Vec<&str> = req.headers().keys().map(|k| k.as_str()).collect();
+            tracing::info!(headers = ?names, "anonymous mcp request");
         }
-    };
+        anonymous
+    });
     match tenant {
         Some(tenant) => {
             req.extensions_mut().insert(tenant);
@@ -424,9 +423,11 @@ pub(crate) mod tests {
         let (status, headers, _) = mcp_post(&app, None, None, INIT).await;
         assert_eq!(status, StatusCode::OK);
         assert!(headers.contains_key("mcp-session-id"));
-        // A wrong token is still wrong; anonymity is not a fallback for it.
+        // In this mode the endpoint never says 401: a stray or stale token
+        // is served as the anonymous tenant too, so a host never starts an
+        // OAuth flow it cannot finish.
         let (status, _, _) = mcp_post(&app, Some("nope"), None, INIT).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]

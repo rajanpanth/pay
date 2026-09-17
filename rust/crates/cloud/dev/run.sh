@@ -9,6 +9,7 @@
 #   rust/crates/cloud/dev/run.sh --public-url https://xyz.trycloudflare.com
 #   rust/crates/cloud/dev/run.sh --static-token <token>   # header auth + a mock wallet for it
 #   rust/crates/cloud/dev/run.sh --anonymous              # DEV ONLY: no-auth hosts act as that wallet
+#   rust/crates/cloud/dev/run.sh --tunnel --anonymous     # Grok demo: quick tunnel + no-auth mock wallet
 #
 # Reads the repo-root .env (Coinflow sandbox settings) when present.
 # Ctrl-C stops everything.
@@ -22,6 +23,7 @@ REAL_OPENFORT=0
 SKIP_BUILD=0
 STATIC_TOKEN=""
 ANONYMOUS=0
+TUNNEL=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -31,14 +33,36 @@ while [ $# -gt 0 ]; do
     --skip-build) SKIP_BUILD=1; shift ;;
     --static-token) STATIC_TOKEN="$2"; shift 2 ;;
     --anonymous) ANONYMOUS=1; shift ;;
+    --tunnel) TUNNEL=1; shift ;;
     -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
 
-PUBLIC_URL="${PUBLIC_URL:-http://127.0.0.1:$PORT}"
-
 step() { printf '\n\033[1m› %s\033[0m\n' "$*"; }
+
+PIDS=()
+cleanup() { for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done; }
+trap cleanup EXIT INT TERM
+
+if [ "$TUNNEL" = 1 ]; then
+  # A Cloudflare quick tunnel: public HTTPS with no account, a new hostname
+  # each start, and it can vanish without notice, so the runner owns it and
+  # pins pay-cloud to whatever hostname it got.
+  command -v cloudflared >/dev/null || { echo "cloudflared not found: brew install cloudflared" >&2; exit 1; }
+  step "Starting a Cloudflare quick tunnel to 127.0.0.1:$PORT"
+  TUNNEL_LOG="$(mktemp -t pay-cloud-tunnel)"
+  cloudflared tunnel --url "http://127.0.0.1:$PORT" > "$TUNNEL_LOG" 2>&1 &
+  PIDS+=($!)
+  for _ in $(seq 1 40); do
+    PUBLIC_URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" | head -1)"
+    [ -n "$PUBLIC_URL" ] && break
+    sleep 1
+  done
+  [ -n "$PUBLIC_URL" ] || { echo "the tunnel did not report a hostname (see $TUNNEL_LOG)" >&2; exit 1; }
+fi
+
+PUBLIC_URL="${PUBLIC_URL:-http://127.0.0.1:$PORT}"
 
 if [ "$SKIP_BUILD" = 0 ]; then
   step "Building the web bundles"
@@ -54,10 +78,6 @@ if [ -f "$ROOT/.env" ]; then
   set -a; . "$ROOT/.env"; set +a
   step "Loaded $ROOT/.env (Coinflow: ${COINFLOW_ENV:-unset})"
 fi
-
-PIDS=()
-cleanup() { for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null || true; done; }
-trap cleanup EXIT INT TERM
 
 if [ "$REAL_OPENFORT" = 0 ]; then
   step "Starting mock Openfort on http://127.0.0.1:$MOCK_PORT"
@@ -112,11 +132,7 @@ $( [ -n "$STATIC_TOKEN" ] && printf '  Header-authenticated host (Grok custom co
   Pages:  $PUBLIC_URL/onboard   $PUBLIC_URL/fund?address=<pubkey>   $PUBLIC_URL/authorize
   OAuth:  $PUBLIC_URL/.well-known/oauth-authorization-server
 
-  For Grok itself you need a public HTTPS URL, for example:
-    brew install cloudflared && cloudflared tunnel --url http://127.0.0.1:$PORT
-    then rerun this script with --public-url https://<name>.trycloudflare.com
-    and add https://<name>.trycloudflare.com/mcp as a custom connector.
-
+$( [ "$TUNNEL" = 1 ] && printf '  Grok custom connector URL:  %s/mcp\n  (quick tunnels get a new hostname each start; re-add the connector after a restart)\n' "$PUBLIC_URL" || printf '  For Grok itself you need a public HTTPS URL: rerun with --tunnel (needs cloudflared),\n  or pass --public-url https://<your-host> behind your own proxy.\n' )
   Ctrl-C stops everything.
 EOF
 
