@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Form, Path, Query, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -655,12 +655,19 @@ pub struct PendingView {
     pub client_name: String,
     pub redirect_host: String,
     pub scope: String,
+    /// Whether this browser already has a wallet to approve with. When
+    /// not, the page offers `providers` to create one.
+    pub has_wallet: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallet_address: Option<String>,
+    pub providers: Vec<&'static str>,
 }
 
 /// `GET /api/oauth/authorize/{request}`
 pub async fn pending_view(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<PendingView>, ApiError> {
     let store = oauth_of(&state)?;
     let request = store.pending(&id).ok_or_else(unknown_request)?;
@@ -671,13 +678,30 @@ pub async fn pending_view(
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_default();
+    let wallet = crate::tenants::cookie::subject(&headers).and_then(|s| state.tenants().get(&s));
     Ok(Json(PendingView {
         client_name: client
             .client_name
             .unwrap_or_else(|| "An MCP client".to_string()),
         redirect_host,
         scope: request.scope,
+        has_wallet: wallet.is_some(),
+        wallet_address: wallet.map(|w| w.pubkey.clone()),
+        providers: state.driver_ids(),
     }))
+}
+
+/// The client's redirect URI with the code and the echoed state.
+pub fn code_redirect(request: &PendingAuthorization, code: &str) -> String {
+    let mut url = Url::parse(&request.redirect_uri).expect("validated redirect uri");
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("code", code);
+        if let Some(state) = request.state.as_deref() {
+            q.append_pair("state", state);
+        }
+    }
+    url.into()
 }
 
 fn unknown_request() -> ApiError {
@@ -693,27 +717,29 @@ pub struct DecisionResponse {
     pub redirect: String,
 }
 
-/// `POST /api/oauth/authorize/{request}/approve`: mint a code for a fresh
-/// subject and send the browser back to the client.
+/// `POST /api/oauth/authorize/{request}/approve`: approve for the wallet
+/// this browser already owns and send it back to the client. A browser
+/// without a wallet creates one through `/api/onboard/start` instead,
+/// which approves on completion.
 pub async fn approve(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Json<DecisionResponse>, ApiError> {
     let store = oauth_of(&state)?;
-    // Until the tenant store exists every approval is its own subject.
-    let subject = format!("sub_{}", random_token());
+    let subject = crate::tenants::cookie::subject(&headers)
+        .filter(|s| state.tenants().get(s).is_some())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "no_wallet",
+                "This browser has no pay wallet yet. Create one first.",
+            )
+        })?;
     let (request, code) = store.approve(&id, &subject).ok_or_else(unknown_request)?;
-    let mut url = Url::parse(&request.redirect_uri).expect("validated redirect uri");
-    {
-        let mut q = url.query_pairs_mut();
-        q.append_pair("code", &code);
-        if let Some(state) = request.state.as_deref() {
-            q.append_pair("state", state);
-        }
-    }
     tracing::info!(client_id = %request.client_id, %subject, "oauth authorization approved");
     Ok(Json(DecisionResponse {
-        redirect: url.into(),
+        redirect: code_redirect(&request, &code),
     }))
 }
 
@@ -1028,10 +1054,15 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
+    const FAKE_WALLET: &str = "Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS";
+
     fn app() -> Router {
         crate::router(
-            AppState::with_drivers("https://cloud.test", Vec::new())
-                .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![])),
+            AppState::with_drivers(
+                "https://cloud.test",
+                vec![Box::new(crate::tests::FakeDriver)],
+            )
+            .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![])),
         )
     }
 
@@ -1069,16 +1100,92 @@ mod tests {
     }
 
     async fn get(app: &Router, path: &str) -> Reply {
-        send(
+        get_as(app, path, None).await
+    }
+
+    /// GET carrying the browser's subject cookie.
+    async fn get_as(app: &Router, path: &str, cookie: Option<&str>) -> Reply {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header(header::HOST, "cloud.test");
+        if let Some(cookie) = cookie {
+            req = req.header(header::COOKIE, cookie);
+        }
+        send(app, req.body(Body::empty()).unwrap()).await
+    }
+
+    async fn post_json_as(app: &Router, path: &str, body: Value, cookie: Option<&str>) -> Reply {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(header::HOST, "cloud.test")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(cookie) = cookie {
+            req = req.header(header::COOKIE, cookie);
+        }
+        send(app, req.body(Body::from(body.to_string())).unwrap()).await
+    }
+
+    /// `pay_subject=…` from a `Set-Cookie`, ready to send back.
+    fn cookie_of(reply: &Reply) -> String {
+        let set = reply.headers[header::SET_COOKIE].to_str().unwrap();
+        set.split(';').next().unwrap().to_string()
+    }
+
+    /// The MCP `topup` tool for this bearer: its text names the wallet.
+    async fn topup_text(app: &Router, access: &str) -> String {
+        let init = send(
             app,
             Request::builder()
-                .method(Method::GET)
-                .uri(path)
+                .method(Method::POST)
+                .uri("/mcp")
                 .header(header::HOST, "cloud.test")
-                .body(Body::empty())
+                .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(crate::mcp::tests::INIT))
                 .unwrap(),
         )
-        .await
+        .await;
+        assert_eq!(init.status, StatusCode::OK, "{}", init.body);
+        let sid = init.headers["mcp-session-id"].to_str().unwrap().to_string();
+        for (body, expected) in [(crate::mcp::tests::INITIALIZED, StatusCode::ACCEPTED)] {
+            let r = send(
+                app,
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::HOST, "cloud.test")
+                    .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(r.status, expected, "{}", r.body);
+        }
+        let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"topup","arguments":{"method":"mobile_wallet","amount_usdc":5}}}"#;
+        let r = send(
+            app,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/mcp")
+                .header(header::HOST, "cloud.test")
+                .header(header::AUTHORIZATION, format!("Bearer {access}"))
+                .header("mcp-session-id", &sid)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ACCEPT, "application/json, text/event-stream")
+                .body(Body::from(call))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+        let result = &crate::mcp::tests::sse_json(&r.body)[0]["result"];
+        assert_ne!(result["isError"], true, "{}", r.body);
+        result["content"][0]["text"].as_str().unwrap().to_string()
     }
 
     async fn post_json(app: &Router, path: &str, body: Value) -> Reply {
@@ -1222,21 +1329,53 @@ mod tests {
         assert_eq!(consent.path(), "/authorize");
         let request_id = reply.query("request").unwrap();
 
-        // The consent page learns who is asking.
+        // The consent page learns who is asking, and that this browser has
+        // no wallet yet.
         let view = get(&app, &format!("/api/oauth/authorize/{request_id}")).await;
         assert_eq!(view.status, StatusCode::OK, "{}", view.body);
         assert_eq!(view.json()["client_name"], "Grok");
         assert_eq!(view.json()["redirect_host"], "grok.com");
+        assert_eq!(view.json()["has_wallet"], false);
+        assert_eq!(view.json()["providers"], json!(["fake"]));
 
-        // Approve: back to Grok with a code and the state.
-        let approved = post_json(
+        // Without a wallet, Approve is refused.
+        let refused = post_json(
             &app,
             &format!("/api/oauth/authorize/{request_id}/approve"),
             json!({}),
         )
         .await;
-        assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
-        let back = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+        assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.body);
+        assert_eq!(refused.json()["error"], "no_wallet");
+
+        // Create one: the provider hop is started from the consent page.
+        let started = post_json(
+            &app,
+            "/api/onboard/start",
+            json!({ "provider": "fake", "authorization_request": request_id }),
+        )
+        .await;
+        assert_eq!(started.status, StatusCode::OK, "{}", started.body);
+        let consent_url = started.json()["consent"].as_str().unwrap().to_string();
+        assert!(
+            consent_url.contains(&format!("state={request_id}")),
+            "{consent_url}"
+        );
+
+        // The provider comes back; completing binds the wallet to a new
+        // subject, approves the request, and remembers the browser.
+        let completed = post_json(
+            &app,
+            "/api/onboard/fake/complete",
+            json!({ "fragment": format!("#api_key=sk_ok&state={request_id}") }),
+        )
+        .await;
+        assert_eq!(completed.status, StatusCode::OK, "{}", completed.body);
+        assert_eq!(completed.json()["origin"], "connector");
+        assert_eq!(completed.json()["address"], FAKE_WALLET);
+        let cookie = cookie_of(&completed);
+        assert!(cookie.starts_with("pay_subject=sub_"), "{cookie}");
+        let back = Url::parse(completed.json()["redirect"].as_str().unwrap()).unwrap();
         assert_eq!(back.origin().ascii_serialization(), "https://grok.com");
         assert_eq!(back.path(), "/connectors/oauth/callback");
         let params: std::collections::HashMap<_, _> = back.query_pairs().into_owned().collect();
@@ -1263,22 +1402,46 @@ mod tests {
         let access = json["access_token"].as_str().unwrap().to_string();
         let refresh = json["refresh_token"].as_str().unwrap().to_string();
 
-        // The access token opens an MCP session.
-        let session = send(
+        // The access token opens an MCP session whose tools act for the
+        // wallet just created.
+        let text = topup_text(&app, &access).await;
+        assert!(text.contains(FAKE_WALLET), "{text}");
+
+        // The same browser connecting another client keeps its wallet.
+        let again = get_as(&app, &authorize_path(&client_id, &[]), Some(&cookie)).await;
+        let again_id = again.query("request").unwrap();
+        let view = get_as(
             &app,
-            Request::builder()
-                .method(Method::POST)
-                .uri("/mcp")
-                .header(header::HOST, "cloud.test")
-                .header(header::AUTHORIZATION, format!("Bearer {access}"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCEPT, "application/json, text/event-stream")
-                .body(Body::from(crate::mcp::tests::INIT))
-                .unwrap(),
+            &format!("/api/oauth/authorize/{again_id}"),
+            Some(&cookie),
         )
         .await;
-        assert_eq!(session.status, StatusCode::OK, "{}", session.body);
-        assert!(session.headers.contains_key("mcp-session-id"));
+        assert_eq!(view.json()["has_wallet"], true, "{}", view.body);
+        assert_eq!(view.json()["wallet_address"], FAKE_WALLET);
+        let approved = post_json_as(
+            &app,
+            &format!("/api/oauth/authorize/{again_id}/approve"),
+            json!({}),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
+        let back = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+        let params: std::collections::HashMap<_, _> = back.query_pairs().into_owned().collect();
+        let second = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", &client_id),
+                ("code", &params["code"]),
+                ("code_verifier", VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+        let second_access = second.json()["access_token"].as_str().unwrap().to_string();
+        assert!(topup_text(&app, &second_access).await.contains(FAKE_WALLET));
 
         // Refresh rotates; revoke ends it.
         let rotated = post_form(

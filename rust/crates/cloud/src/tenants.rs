@@ -20,6 +20,16 @@ use rmcp::service::{RequestContext, RoleServer};
 
 use crate::mcp::Tenant;
 
+/// What a fresh connector wallet may spend until its owner changes it:
+/// a dollar a call, ten a day. Enough for a demo, small enough to lose.
+pub const DEFAULT_POLICY: SpendPolicy = SpendPolicy {
+    per_call_ceiling: Some(10_000),
+    daily_cap: Some(100_000),
+};
+
+/// Account name a connector wallet carries in prompts and receipts.
+pub const CONNECTOR_ACCOUNT: &str = "connector";
+
 /// One tenant's wallet and rules.
 #[derive(Clone)]
 pub struct TenantRecord {
@@ -39,6 +49,19 @@ pub struct TenantRecord {
 }
 
 impl TenantRecord {
+    /// A tenant for a wallet the onboarding driver just provisioned.
+    pub fn from_wallet(subject: &str, wallet: &crate::drivers::ProvisionedWallet) -> Self {
+        Self {
+            subject: subject.to_string(),
+            account_name: CONNECTOR_ACCOUNT.to_string(),
+            provider: wallet.provider.to_string(),
+            wallet_id: wallet.wallet_id.clone(),
+            pubkey: wallet.address.clone(),
+            credentials: wallet.credentials.clone(),
+            policy: DEFAULT_POLICY,
+        }
+    }
+
     /// The `accounts.yml` entry this tenant would have on a laptop: a remote
     /// account gated by policy (`auth_required` on, so the override applies).
     fn account(&self) -> Account {
@@ -143,6 +166,40 @@ impl AccountsStore for TenantAccounts {
     }
 }
 
+/// The browser's memory of who it is: a subject cookie set when a wallet
+/// is provisioned, read when the same browser connects another client, so
+/// one person keeps one wallet across hosts.
+pub mod cookie {
+    use axum::http::{HeaderMap, HeaderValue, header};
+
+    pub const NAME: &str = "pay_subject";
+    const ONE_YEAR: u64 = 365 * 24 * 60 * 60;
+
+    /// The subject the request's cookie names, if any.
+    pub fn subject(headers: &HeaderMap) -> Option<String> {
+        headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|line| line.split(';'))
+            .filter_map(|pair| pair.trim().split_once('='))
+            .find(|(k, _)| *k == NAME)
+            .map(|(_, v)| v.trim().to_string())
+            .filter(|v| !v.is_empty() && v.len() <= 128)
+    }
+
+    /// `Set-Cookie` for `subject`. `Secure` when the site is served over
+    /// https; a local http server would otherwise never see it back.
+    pub fn set(subject: &str, secure: bool) -> HeaderValue {
+        let mut cookie =
+            format!("{NAME}={subject}; Path=/; Max-Age={ONE_YEAR}; HttpOnly; SameSite=Lax");
+        if secure {
+            cookie.push_str("; Secure");
+        }
+        HeaderValue::from_str(&cookie).expect("cookie is ascii")
+    }
+}
+
 /// pay-mcp context for the hosted connector.
 pub struct CloudContext {
     registry: Arc<TenantRegistry>,
@@ -241,6 +298,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(creds["secret_key"], "sk_test_1");
+    }
+
+    #[test]
+    fn subject_cookie_round_trips() {
+        use axum::http::{HeaderMap, header};
+        let value = cookie::set("sub_abc", true);
+        let text = value.to_str().unwrap();
+        assert!(
+            text.starts_with(
+                "pay_subject=sub_abc; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax; Secure"
+            ),
+            "{text}"
+        );
+        assert!(!cookie::set("s", false).to_str().unwrap().contains("Secure"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            "theme=dark; pay_subject=sub_abc; other=1".parse().unwrap(),
+        );
+        assert_eq!(cookie::subject(&headers).as_deref(), Some("sub_abc"));
+        let mut none = HeaderMap::new();
+        none.insert(header::COOKIE, "theme=dark".parse().unwrap());
+        assert_eq!(cookie::subject(&none), None);
+        assert_eq!(cookie::subject(&HeaderMap::new()), None);
     }
 
     #[test]

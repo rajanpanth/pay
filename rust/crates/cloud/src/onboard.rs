@@ -53,6 +53,11 @@ pub struct OnboardSession {
     /// A completion holds the session while its driver provisions; see
     /// [`AppState::claim_provisioning`].
     pub provisioning: bool,
+    /// Connector origin: the pending OAuth authorization this wallet is
+    /// for. The wallet then binds a tenant and approves that request
+    /// instead of going back to a CLI; `callback` and `code_challenge` are
+    /// empty.
+    pub authorization: Option<String>,
     pub created_at: Instant,
 }
 
@@ -74,6 +79,24 @@ impl OnboardSession {
             provider,
             wallet: None,
             provisioning: false,
+            authorization: None,
+            created_at: Instant::now(),
+        }
+    }
+
+    /// A session started from the OAuth consent page. The provider echoes
+    /// the authorization request id as `state`.
+    pub fn for_connector(authorization: &str, provider: &str) -> Self {
+        Self {
+            code: random_token(),
+            email: None,
+            state: authorization.to_string(),
+            callback: String::new(),
+            code_challenge: String::new(),
+            provider: Some(provider.to_string()),
+            wallet: None,
+            provisioning: false,
+            authorization: Some(authorization.to_string()),
             created_at: Instant::now(),
         }
     }
@@ -103,9 +126,17 @@ pub struct StartRequest {
     /// provider's consent URL instead of a redirect.
     #[serde(default)]
     pub provider: Option<String>,
-    pub callback: String,
-    pub state: String,
-    pub code_challenge: String,
+    /// CLI origin: the loopback callback, CSRF state and PKCE challenge.
+    #[serde(default)]
+    pub callback: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub code_challenge: Option<String>,
+    /// Connector origin: the pending OAuth authorization to satisfy with
+    /// the provisioned wallet. Requires `provider`.
+    #[serde(default)]
+    pub authorization_request: Option<String>,
     #[serde(default)]
     pub account: Option<String>,
     #[serde(default)]
@@ -135,6 +166,9 @@ pub struct CompleteRequest {
 
 #[derive(Debug, Serialize)]
 pub struct CompleteResponse {
+    /// `cli` when the browser goes back to a terminal, `connector` when it
+    /// goes back to an MCP host.
+    pub origin: &'static str,
     pub redirect: String,
     pub provider: String,
     pub address: String,
@@ -392,9 +426,24 @@ pub async fn start(
     body: Bytes,
 ) -> Result<Json<StartResponse>, ApiError> {
     let req: StartRequest = parse_json(&body)?;
-    validate_callback(&req.callback)?;
-    validate_state(&req.state)?;
-    validate_code_challenge(&req.code_challenge)?;
+    if let Some(authorization) = req.authorization_request.as_deref() {
+        return start_for_connector(&state, &req, authorization);
+    }
+    let missing = |field: &str| {
+        ApiError::bad_request(
+            "invalid_request",
+            format!("`{field}` is required to link a terminal."),
+        )
+    };
+    let callback = req.callback.clone().ok_or_else(|| missing("callback"))?;
+    let state_param = req.state.clone().ok_or_else(|| missing("state"))?;
+    let code_challenge = req
+        .code_challenge
+        .clone()
+        .ok_or_else(|| missing("code_challenge"))?;
+    validate_callback(&callback)?;
+    validate_state(&state_param)?;
+    validate_code_challenge(&code_challenge)?;
     if let Some(email) = req.email.as_deref() {
         validate_email(email)?;
     }
@@ -420,9 +469,9 @@ pub async fn start(
             })?;
             let session = OnboardSession::new(
                 req.email.clone(),
-                req.state.clone(),
-                req.callback.clone(),
-                req.code_challenge.clone(),
+                state_param.clone(),
+                callback.clone(),
+                code_challenge.clone(),
                 Some(driver.id().to_string()),
             );
             let redirect_uri = state.consent_redirect_uri(driver.id());
@@ -443,9 +492,9 @@ pub async fn start(
             })?;
             let session = OnboardSession::new(
                 Some(email),
-                req.state.clone(),
-                req.callback.clone(),
-                req.code_challenge.clone(),
+                state_param.clone(),
+                callback.clone(),
+                code_challenge.clone(),
                 None,
             );
             let redirect = session.redirect_url();
@@ -462,6 +511,62 @@ pub async fn start(
     }
 }
 
+/// Connector origin of `POST /api/onboard/start`: the consent page asks
+/// for a wallet before it can approve `authorization`.
+fn start_for_connector(
+    state: &AppState,
+    req: &StartRequest,
+    authorization: &str,
+) -> Result<Json<StartResponse>, ApiError> {
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = (state, req, authorization);
+        Err(ApiError::bad_request(
+            "connector_disabled",
+            "This server has no MCP connector.",
+        ))
+    }
+    #[cfg(feature = "mcp")]
+    {
+        let oauth = state.oauth().ok_or_else(|| {
+            ApiError::bad_request("connector_disabled", "This server has no MCP connector.")
+        })?;
+        if oauth.pending(authorization).is_none() {
+            return Err(ApiError::bad_request(
+                "unknown_request",
+                "This sign-in request is unknown or has expired. Start again from your MCP client.",
+            ));
+        }
+        let provider_id = req.provider.as_deref().ok_or_else(|| {
+            ApiError::bad_request(
+                "invalid_request",
+                "`provider` is required to create a wallet.",
+            )
+        })?;
+        let driver = state.driver(provider_id).ok_or_else(|| {
+            ApiError::bad_request(
+                "unknown_provider",
+                format!("No wallet provider `{provider_id}` is available."),
+            )
+        })?;
+        let session = OnboardSession::for_connector(authorization, driver.id());
+        let consent = driver.consent_url(&state.consent_redirect_uri(driver.id()), &session.state);
+        tracing::info!(
+            provider = driver.id(),
+            authorization,
+            "connector onboarding started"
+        );
+        state
+            .insert_session(session)
+            .map_err(|_| ApiError::busy())?;
+        Ok(Json(StartResponse {
+            redirect: None,
+            consent: Some(consent),
+            provider: Some(driver.id().to_string()),
+        }))
+    }
+}
+
 /// `POST /api/onboard/{provider}/complete`
 ///
 /// The consent page redirected the browser back with the grant in the URL
@@ -472,7 +577,7 @@ pub async fn complete(
     State(state): State<AppState>,
     Path(provider_id): Path<String>,
     body: Bytes,
-) -> Result<Json<CompleteResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let req: CompleteRequest = parse_json(&body)?;
     let driver = state.driver(&provider_id).ok_or_else(|| {
         ApiError::bad_request(
@@ -496,17 +601,78 @@ pub async fn complete(
             return Err(ApiError::from_driver(err));
         }
     };
-    let redirect = session.redirect_url();
     let address = wallet.address.clone();
     tracing::info!(provider = driver.id(), address = %address, "wallet provisioned");
+
+    if let Some(authorization) = session.authorization.as_deref() {
+        return complete_for_connector(&state, &echoed_state, authorization, driver.id(), wallet);
+    }
+
+    let redirect = session.redirect_url();
     if !state.attach_wallet(&echoed_state, wallet) {
         return Err(ApiError::invalid_grant());
     }
     Ok(Json(CompleteResponse {
+        origin: "cli",
         redirect,
         provider: driver.id().to_string(),
         address,
-    }))
+    })
+    .into_response())
+}
+
+/// Connector origin of a completion: the wallet becomes a tenant for a new
+/// subject, the pending authorization is approved for that subject, and
+/// the browser learns its subject so the next client reuses the wallet.
+fn complete_for_connector(
+    state: &AppState,
+    echoed_state: &str,
+    authorization: &str,
+    provider_id: &str,
+    wallet: ProvisionedWallet,
+) -> Result<Response, ApiError> {
+    #[cfg(not(feature = "mcp"))]
+    {
+        let _ = (state, echoed_state, authorization, provider_id, wallet);
+        Err(ApiError::bad_request(
+            "connector_disabled",
+            "This server has no MCP connector.",
+        ))
+    }
+    #[cfg(feature = "mcp")]
+    {
+        use crate::tenants::{TenantRecord, cookie};
+        let oauth = state.oauth().ok_or_else(|| {
+            ApiError::bad_request("connector_disabled", "This server has no MCP connector.")
+        })?;
+        let address = wallet.address.clone();
+        let subject = format!("sub_{}", random_token());
+        let record = TenantRecord::from_wallet(&subject, &wallet);
+        if !state.attach_wallet(echoed_state, wallet) {
+            return Err(ApiError::invalid_grant());
+        }
+        let (request, code) = oauth.approve(authorization, &subject).ok_or_else(|| {
+            ApiError::bad_request(
+                "unknown_request",
+                "The sign-in request expired while the wallet was being created. Start again from your MCP client.",
+            )
+        })?;
+        state.tenants().bind(record);
+        tracing::info!(%subject, client_id = %request.client_id, address = %address, "connector tenant bound");
+        let redirect = crate::oauth::code_redirect(&request, &code);
+        let mut response = Json(CompleteResponse {
+            origin: "connector",
+            redirect,
+            provider: provider_id.to_string(),
+            address,
+        })
+        .into_response();
+        response.headers_mut().insert(
+            axum::http::header::SET_COOKIE,
+            cookie::set(&subject, state.public_url().starts_with("https://")),
+        );
+        Ok(response)
+    }
 }
 
 /// `POST /v1/onboard/exchange`
@@ -663,6 +829,7 @@ mod tests {
             provider: None,
             wallet: None,
             provisioning: false,
+            authorization: None,
             created_at,
         }
     }

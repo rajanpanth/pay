@@ -1,5 +1,10 @@
 import { useEffect, useState } from "react";
-import { describeScope, type Decision, type PendingView } from "../../cloud/lib/authorize";
+import {
+  describeScope,
+  providerName,
+  type Decision,
+  type PendingView,
+} from "../../cloud/lib/authorize";
 import { PayWordmark } from "./PayWordmark";
 
 interface Props {
@@ -8,13 +13,17 @@ interface Props {
   load: (requestId: string) => Promise<PendingView>;
   approve: (requestId: string) => Promise<Decision>;
   deny: (requestId: string) => Promise<Decision>;
+  /** Create a wallet with a provider; resolves to the provider's consent URL. */
+  createWallet: (requestId: string, provider: string) => Promise<string>;
 }
+
+type Choice = "approve" | "deny" | `create:${string}`;
 
 type Phase =
   | { kind: "loading" }
   | { kind: "ready"; view: PendingView }
-  | { kind: "deciding"; view: PendingView; choice: "approve" | "deny" }
-  | { kind: "redirecting"; choice: "approve" | "deny" }
+  | { kind: "deciding"; view: PendingView; choice: Choice }
+  | { kind: "redirecting"; choice: Choice }
   | { kind: "error"; message: string };
 
 /**
@@ -22,7 +31,7 @@ type Phase =
  * Approve sends the browser back to the host with a code; Deny sends it
  * back with an error. Nothing else happens on this page.
  */
-export function AuthorizeTerminal({ requestId, load, approve, deny }: Props) {
+export function AuthorizeTerminal({ requestId, load, approve, deny, createWallet }: Props) {
   const [phase, setPhase] = useState<Phase>(
     requestId
       ? { kind: "loading" }
@@ -46,13 +55,16 @@ export function AuthorizeTerminal({ requestId, load, approve, deny }: Props) {
     };
   }, [requestId, load]);
 
-  async function decide(view: PendingView, choice: "approve" | "deny") {
+  async function decide(view: PendingView, choice: Choice) {
     if (!requestId) return;
     setPhase({ kind: "deciding", view, choice });
     try {
-      const decision = await (choice === "approve" ? approve(requestId) : deny(requestId));
+      let next: string;
+      if (choice === "approve") next = (await approve(requestId)).redirect;
+      else if (choice === "deny") next = (await deny(requestId)).redirect;
+      else next = await createWallet(requestId, choice.slice("create:".length));
       setPhase({ kind: "redirecting", choice });
-      window.location.assign(decision.redirect);
+      window.location.assign(next);
     } catch (err) {
       setPhase({
         kind: "error",
@@ -87,20 +99,48 @@ export function AuthorizeTerminal({ requestId, load, approve, deny }: Props) {
               It will be able to {describeScope(phase.view.scope)}. Every paid call is checked
               against your limits, and you can revoke this access at any time.
             </div>
+            {phase.view.has_wallet ? (
+              <div className="cloud-term-line cloud-term-line--muted">
+                Paying from your pay wallet {phase.view.wallet_address}.
+              </div>
+            ) : (
+              <div className="cloud-term-line">
+                <span className="cloud-term-prompt">›</span> You need a pay wallet first. Sign
+                in with a provider to create one; it is yours, pay keeps no keys.
+              </div>
+            )}
             {phase.view.redirect_host && (
               <div className="cloud-term-line cloud-term-line--muted">
                 After you decide, you return to {phase.view.redirect_host}.
               </div>
             )}
             <div className="cloud-term-actions">
-              <button
-                type="button"
-                className="cloud-term-button"
-                disabled={phase.kind === "deciding"}
-                onClick={() => decide(phase.view, "approve")}
-              >
-                {phase.kind === "deciding" && phase.choice === "approve" ? "Approving…" : "Approve"}
-              </button>
+              {phase.view.has_wallet ? (
+                <button
+                  type="button"
+                  className="cloud-term-button"
+                  disabled={phase.kind === "deciding"}
+                  onClick={() => decide(phase.view, "approve")}
+                >
+                  {phase.kind === "deciding" && phase.choice === "approve"
+                    ? "Approving…"
+                    : "Approve"}
+                </button>
+              ) : (
+                phase.view.providers.map((provider) => (
+                  <button
+                    key={provider}
+                    type="button"
+                    className="cloud-term-button"
+                    disabled={phase.kind === "deciding"}
+                    onClick={() => decide(phase.view, `create:${provider}`)}
+                  >
+                    {phase.kind === "deciding" && phase.choice === `create:${provider}`
+                      ? `Opening ${providerName(provider)}…`
+                      : `Create wallet with ${providerName(provider)}`}
+                  </button>
+                ))
+              )}
               <button
                 type="button"
                 className="cloud-term-button cloud-term-button--ghost"
@@ -115,8 +155,11 @@ export function AuthorizeTerminal({ requestId, load, approve, deny }: Props) {
 
         {phase.kind === "redirecting" && (
           <div className="cloud-term-line cloud-term-line--muted">
-            {phase.choice === "approve" ? "✔ Approved." : "✖ Denied."} Returning to your MCP
-            client…
+            {phase.choice === "approve"
+              ? "✔ Approved. Returning to your MCP client…"
+              : phase.choice === "deny"
+                ? "✖ Denied. Returning to your MCP client…"
+                : "… Opening your wallet provider"}
           </div>
         )}
 

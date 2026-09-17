@@ -29,9 +29,21 @@ Done on `feat/pay-cloud`:
   from the intent's exact amount (`AuthIntent::amount_minor_units`), then
   the client's elicitation when it has one. A subject with no wallet is
   told to finish setup.
-- Not yet: **A5** binding a subject to a provisioned wallet at consent time
-  and persisting tenants (Postgres, credentials encrypted at rest), Redis
-  sessions, deployment.
+- **A5, first half.** Consent binds a wallet. A browser with no wallet is
+  offered the compiled-in providers on the consent page; the Openfort hop
+  runs through the same driver as the CLI onboarding, with the OAuth
+  request id as its `state`. Completing it provisions the wallet, binds a
+  new subject to it in the `TenantRegistry` (credentials in memory, the
+  default policy of $1 a call and $10 a day), approves the pending request
+  for that subject, and sets a `pay_subject` cookie so the same browser
+  reuses its wallet when it connects another client. Tested end to end:
+  Grok registration, consent, wallet creation, code, token, an MCP `topup`
+  naming the new wallet, then a second connection from the same browser
+  approving straight away against the same wallet.
+- Not yet: persisting tenants and OAuth state (Postgres, credentials
+  encrypted at rest with a KEK from Secret Manager), a `/connect` page for
+  limits and revocation, Redis MCP sessions, funding from inside the
+  consent flow (today `topup` hands the user the `/fund` URL), deployment.
 
 ## Milestone 1 status (2026-09-15)
 

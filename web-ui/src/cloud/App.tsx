@@ -5,6 +5,7 @@ import { TerminalLink } from "../components/cloud/TerminalLink";
 import { TerminalProgress, type ProgressLine } from "../components/cloud/TerminalProgress";
 import { WelcomeCard } from "../components/cloud/WelcomeCard";
 import {
+  buildConnectorStartRequest,
   isAuthorizePath,
   parseAuthorizeRequest,
   type Decision,
@@ -74,6 +75,14 @@ export function App() {
           load={(id) => getJson<PendingView>(api(id))}
           approve={(id) => postJson<Decision>(`${api(id)}/approve`, {})}
           deny={(id) => postJson<Decision>(`${api(id)}/deny`, {})}
+          createWallet={async (id, provider) => {
+            const res = await postJson<{ consent?: string }>(
+              "/api/onboard/start",
+              buildConnectorStartRequest(id, provider),
+            );
+            if (!res.consent) throw new Error("The server did not return a sign-in link.");
+            return res.consent;
+          }}
         />
       </main>
     );
@@ -171,7 +180,7 @@ function ProviderCallback({ provider }: { provider: string }) {
         if (!fragment || fragment.length < 2) {
           throw new Error("The provider did not return a sign-in result. Run pay setup again.");
         }
-        const res = await postJson<{ redirect: string; address: string }>(
+        const res = await postJson<{ redirect: string; address: string; origin?: string }>(
           `/api/onboard/${provider}/complete`,
           { fragment },
         );
@@ -179,7 +188,13 @@ function ProviderCallback({ provider }: { provider: string }) {
         setLines([
           { text: `Signed in with ${provider}`, state: "done" },
           { text: `Wallet created: ${res.address}`, state: "done" },
-          { text: "Returning to your terminal", state: "active" },
+          {
+            text:
+              res.origin === "connector"
+                ? "Returning to your MCP client"
+                : "Returning to your terminal",
+            state: "active",
+          },
         ]);
         window.location.assign(res.redirect);
       } catch (err) {
@@ -190,7 +205,7 @@ function ProviderCallback({ provider }: { provider: string }) {
             text: err instanceof Error ? err.message : "Something went wrong.",
             state: "error",
           },
-          { text: "Return to your terminal and run pay setup again.", state: "error" },
+          { text: "Go back to where you started and try again.", state: "error" },
         ]);
       }
     })();

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { describeScope, isAuthorizePath, parseAuthorizeRequest } from "./authorize";
+import {
+  buildConnectorStartRequest,
+  describeScope,
+  isAuthorizePath,
+  parseAuthorizeRequest,
+  providerName,
+} from "./authorize";
 
 describe("authorize helpers", () => {
   it("matches only the consent page path", () => {
@@ -20,5 +26,16 @@ describe("authorize helpers", () => {
   it("describes the mcp scope in plain words", () => {
     expect(describeScope("mcp")).toContain("pay for API calls");
     expect(describeScope("mcp other")).toContain("other scope");
+  });
+
+  it("builds the wallet-creation request for the consent page", () => {
+    expect(buildConnectorStartRequest("req_1", "openfort")).toEqual({
+      provider: "openfort",
+      authorization_request: "req_1",
+    });
+    expect(() => buildConnectorStartRequest("", "openfort")).toThrow();
+    expect(() => buildConnectorStartRequest("req_1", "")).toThrow();
+    expect(providerName("openfort")).toBe("Openfort");
+    expect(providerName("acme")).toBe("acme");
   });
 });

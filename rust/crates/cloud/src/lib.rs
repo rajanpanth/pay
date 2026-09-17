@@ -382,7 +382,7 @@ async fn serve_static(req: Request) -> Response<Body> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::to_bytes;
     use axum::http::{Method, header};
@@ -397,7 +397,7 @@ mod tests {
 
     /// A driver that hands back a fixed wallet, or fails when the api key is
     /// `sk_fail`.
-    struct FakeDriver;
+    pub(crate) struct FakeDriver;
 
     #[async_trait::async_trait]
     impl drivers::WalletDriver for FakeDriver {

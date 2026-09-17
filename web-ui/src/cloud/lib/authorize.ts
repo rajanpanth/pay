@@ -12,6 +12,31 @@ export interface PendingView {
   client_name: string;
   redirect_host: string;
   scope: string;
+  /** This browser already owns a wallet; Approve can be used directly. */
+  has_wallet: boolean;
+  wallet_address?: string;
+  /** Wallet providers that can create one (`openfort`). */
+  providers: string[];
+}
+
+/** Body of `POST /api/onboard/start` from the consent page. */
+export interface ConnectorStartRequest {
+  provider: string;
+  authorization_request: string;
+}
+
+/** Human names for provider ids. */
+export function providerName(id: string): string {
+  return id === "openfort" ? "Openfort" : id;
+}
+
+export function buildConnectorStartRequest(
+  requestId: string,
+  provider: string,
+): ConnectorStartRequest {
+  if (!requestId) throw new Error("missing authorization request");
+  if (!provider) throw new Error("missing provider");
+  return { provider, authorization_request: requestId };
 }
 
 /** What Approve and Deny return. */
