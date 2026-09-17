@@ -380,6 +380,16 @@ html[data-cloud-theme="terminal"] #root {
   outline: 2px solid var(--term-green);
   outline-offset: 2px;
 }
+.cloud-term-button--ghost,
+.cloud-term-button--ghost:hover:enabled {
+  background: transparent;
+  color: var(--term-fg);
+  border-color: var(--term-border);
+}
+.cloud-term-button--ghost:hover:enabled {
+  border-color: var(--term-red);
+  color: var(--term-red);
+}
 
 .cloud-term-hint {
   color: var(--term-fg-subtle);

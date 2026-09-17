@@ -1,8 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
+import { AuthorizeTerminal } from "../components/cloud/AuthorizeTerminal";
 import { FundTerminal } from "../components/cloud/FundTerminal";
 import { TerminalLink } from "../components/cloud/TerminalLink";
 import { TerminalProgress, type ProgressLine } from "../components/cloud/TerminalProgress";
 import { WelcomeCard } from "../components/cloud/WelcomeCard";
+import {
+  isAuthorizePath,
+  parseAuthorizeRequest,
+  type Decision,
+  type PendingView,
+} from "./lib/authorize";
 import {
   isFundPath,
   parseFundParams,
@@ -51,11 +58,26 @@ export function App() {
     [],
   );
   const funding = useMemo(() => isFundPath(window.location.pathname), []);
-  const terminal = linked || callbackProvider !== null || funding;
+  const authorizing = useMemo(() => isAuthorizePath(window.location.pathname), []);
+  const terminal = linked || callbackProvider !== null || funding || authorizing;
 
   useEffect(() => {
     document.documentElement.dataset.cloudTheme = terminal ? "terminal" : "light";
   }, [terminal]);
+
+  if (authorizing) {
+    const api = (id: string) => `/api/oauth/authorize/${encodeURIComponent(id)}`;
+    return (
+      <main className="cloud-page cloud-page--terminal">
+        <AuthorizeTerminal
+          requestId={parseAuthorizeRequest(window.location.search)}
+          load={(id) => getJson<PendingView>(api(id))}
+          approve={(id) => postJson<Decision>(`${api(id)}/approve`, {})}
+          deny={(id) => postJson<Decision>(`${api(id)}/deny`, {})}
+        />
+      </main>
+    );
+  }
 
   if (funding) {
     return (

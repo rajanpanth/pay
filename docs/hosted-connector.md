@@ -3,6 +3,27 @@
 Status: revision 2, milestone 1 in progress on branch `feat/pay-cloud`.
 Owner: pay core team.
 
+## Milestone 2 status (2026-09-16): the Grok connector
+
+Done on `feat/pay-cloud`:
+
+- **A3** `/mcp` in pay-cloud: rmcp streamable HTTP, a `PayMcp` per session,
+  `Host` validation from the public URL, bearer middleware. Enabled by
+  `PAY_CLOUD_MCP=1`; `PAY_CLOUD_MCP_TOKENS` adds static tokens for hosts
+  that only take a header. Every refusal is a 401 with the RFC 9728
+  `WWW-Authenticate resource_metadata` pointer.
+- **A4** OAuth 2.1 authorization server in pay-cloud: both well-known
+  documents, DCR accepting Grok's exact registration (public client,
+  `https://grok.com/connectors/oauth/callback`), `/oauth/authorize` with
+  mandatory S256 PKCE and RFC 8707 `resource`, a terminal-themed consent page
+  at `/authorize`, `/oauth/token` for code and refresh (rotated) grants,
+  `/oauth/revoke`. Opaque tokens stored hashed, 1 h access, 30 d refresh,
+  in memory and bounded. Tested end to end into an MCP session; a live
+  curl run against a local server did the same.
+- Not yet: **A2** tenant context in pay-mcp (tools still use the process
+  account), **A5** tenant store and per-tenant Openfort credentials (an
+  approval mints an opaque subject today), Redis sessions, deployment.
+
 ## Milestone 1 status (2026-09-15)
 
 Done on `feat/pay-cloud` (PR #464, rebased on main after PR #423 merged on 2026-09-16):

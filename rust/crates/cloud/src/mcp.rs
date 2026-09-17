@@ -3,10 +3,10 @@
 //! This is the hosted connector's front door. An MCP host (Grok, Claude,
 //! ChatGPT, Cursor) is pointed at `https://cloud.pay.sh/mcp` and gets the
 //! same tools `pay mcp` serves on stdio, with the request authenticated per
-//! call. Until the OAuth authorization server lands, tokens are static
-//! values from `PAY_CLOUD_MCP_TOKENS`; the 401 already carries the
-//! `WWW-Authenticate` pointer the OAuth flow will use, so hosts see the
-//! final shape from day one.
+//! call: an OAuth access token from [`crate::oauth`], or one of the static
+//! tokens in `PAY_CLOUD_MCP_TOKENS` for hosts that only take a header. A
+//! refusal is a 401 with the RFC 9728 `WWW-Authenticate` pointer that
+//! starts the OAuth discovery.
 //!
 //! Every accepted request carries a [`Tenant`] in its extensions. Tools do
 //! not read it yet (they still use the process-local account); the tenant
@@ -23,6 +23,9 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use sha2::{Digest, Sha256};
 
+/// `1` mounts the connector and its OAuth server.
+pub const ENABLE_ENV: &str = "PAY_CLOUD_MCP";
+/// Optional comma-separated static bearer tokens.
 pub const TOKENS_ENV: &str = "PAY_CLOUD_MCP_TOKENS";
 pub const ALLOWED_HOSTS_ENV: &str = "PAY_CLOUD_MCP_ALLOWED_HOSTS";
 pub const PATH: &str = "/mcp";
@@ -70,16 +73,26 @@ impl Config {
         }
     }
 
-    /// `None` when `PAY_CLOUD_MCP_TOKENS` is unset: the endpoint is not
-    /// mounted. Tokens are comma-separated; `PAY_CLOUD_MCP_ALLOWED_HOSTS`
-    /// (comma-separated) replaces the hosts derived from the public URL.
+    /// `None` unless `PAY_CLOUD_MCP` is on: the endpoint is not mounted.
+    /// `PAY_CLOUD_MCP_TOKENS` adds comma-separated static tokens;
+    /// `PAY_CLOUD_MCP_ALLOWED_HOSTS` (comma-separated) replaces the hosts
+    /// derived from the public URL.
     pub fn from_env(public_url: &str) -> Option<Self> {
-        let raw = std::env::var(TOKENS_ENV).ok()?;
-        let tokens: Vec<String> = raw
-            .split(',')
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect();
+        let enabled = std::env::var(ENABLE_ENV)
+            .ok()
+            .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"));
+        if !enabled {
+            return None;
+        }
+        let tokens: Vec<String> = std::env::var(TOKENS_ENV)
+            .ok()
+            .map(|raw| {
+                raw.split(',')
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut cfg = Self::new(public_url, tokens);
         if let Ok(hosts) = std::env::var(ALLOWED_HOSTS_ENV) {
             let hosts: Vec<String> = hosts
@@ -103,14 +116,31 @@ impl Config {
         format!("{}/.well-known/oauth-protected-resource", self.public_url)
     }
 
-    /// The tenant a bearer token stands for, if it is one of ours.
-    fn authenticate(&self, bearer: &str) -> Option<Tenant> {
+    /// The tenant a static bearer token stands for, if it is one of ours.
+    fn authenticate_static(&self, bearer: &str) -> Option<Tenant> {
         self.tokens
             .iter()
             .find(|t| constant_time_eq(t.as_bytes(), bearer.as_bytes()))
             .map(|t| Tenant {
                 id: token_fingerprint(t),
             })
+    }
+}
+
+/// What the bearer middleware checks against: static tokens, and OAuth
+/// access tokens when the authorization server is mounted.
+#[derive(Clone)]
+pub struct Auth {
+    pub cfg: Arc<Config>,
+    pub oauth: Option<Arc<crate::oauth::Store>>,
+}
+
+impl Auth {
+    fn authenticate(&self, bearer: &str) -> Option<Tenant> {
+        self.oauth
+            .as_ref()
+            .and_then(|store| store.authenticate(bearer))
+            .or_else(|| self.cfg.authenticate_static(bearer))
     }
 }
 
@@ -129,30 +159,30 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 /// Routes for the connector: `/mcp` and everything under it.
-pub fn router(cfg: Arc<Config>) -> Router {
+pub fn router(auth: Auth) -> Router {
     let transport =
-        StreamableHttpServerConfig::default().with_allowed_hosts(cfg.allowed_hosts.clone());
+        StreamableHttpServerConfig::default().with_allowed_hosts(auth.cfg.allowed_hosts.clone());
     let service: StreamableHttpService<pay_mcp::PayMcp, LocalSessionManager> =
         StreamableHttpService::new(|| Ok(pay_mcp::PayMcp::new()), Default::default(), transport);
     Router::new()
         .nest_service(PATH, service)
-        .layer(middleware::from_fn_with_state(cfg, require_bearer))
+        .layer(middleware::from_fn_with_state(auth, require_bearer))
 }
 
-/// Refuse anything without one of our tokens; tag the rest with its tenant.
-async fn require_bearer(State(cfg): State<Arc<Config>>, mut req: Request, next: Next) -> Response {
+/// Refuse anything without a live token; tag the rest with its tenant.
+async fn require_bearer(State(auth): State<Auth>, mut req: Request, next: Next) -> Response {
     let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim);
-    match bearer.and_then(|b| cfg.authenticate(b)) {
+    match bearer.and_then(|b| auth.authenticate(b)) {
         Some(tenant) => {
             req.extensions_mut().insert(tenant);
             next.run(req).await
         }
-        None => unauthorized(&cfg),
+        None => unauthorized(&auth.cfg),
     }
 }
 
@@ -174,22 +204,25 @@ fn unauthorized(cfg: &Config) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::Method;
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
+    pub(crate) const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
     const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
     const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
 
     fn app() -> Router {
-        router(Arc::new(Config::new(
-            "https://cloud.test",
-            vec!["tok-alpha".to_string(), "tok-beta".to_string()],
-        )))
+        router(Auth {
+            cfg: Arc::new(Config::new(
+                "https://cloud.test",
+                vec!["tok-alpha".to_string(), "tok-beta".to_string()],
+            )),
+            oauth: None,
+        })
     }
 
     async fn mcp_post(
@@ -253,13 +286,13 @@ mod tests {
     #[test]
     fn tokens_map_to_stable_opaque_tenants() {
         let cfg = Config::new("https://cloud.test", vec!["tok-alpha".into()]);
-        let tenant = cfg.authenticate("tok-alpha").unwrap();
+        let tenant = cfg.authenticate_static("tok-alpha").unwrap();
         assert!(tenant.id.starts_with("tok_"));
         assert_eq!(tenant.id.len(), 20);
         assert!(!tenant.id.contains("alpha"));
-        assert_eq!(cfg.authenticate("tok-alpha"), Some(tenant));
-        assert!(cfg.authenticate("tok-alph").is_none());
-        assert!(cfg.authenticate("").is_none());
+        assert_eq!(cfg.authenticate_static("tok-alpha"), Some(tenant));
+        assert!(cfg.authenticate_static("tok-alph").is_none());
+        assert!(cfg.authenticate_static("").is_none());
     }
 
     #[tokio::test]

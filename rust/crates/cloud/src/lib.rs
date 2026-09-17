@@ -35,6 +35,8 @@ pub use onboard::{OnboardSession, SESSION_TTL};
 pub mod funding;
 #[cfg(feature = "mcp")]
 pub mod mcp;
+#[cfg(feature = "mcp")]
+pub mod oauth;
 
 static ASSETS: Dir<'_> = include_dir!("$OUT_DIR/cloud-dist");
 
@@ -71,9 +73,12 @@ pub struct AppState {
     /// Card purchases through Coinflow; `None` until configured.
     #[cfg(feature = "coinflow")]
     funding: Option<Arc<funding::Funding>>,
-    /// The hosted MCP connector; `None` until tokens are configured.
+    /// The hosted MCP connector; `None` until enabled.
     #[cfg(feature = "mcp")]
     mcp: Option<Arc<mcp::Config>>,
+    /// The connector's OAuth authorization server; mounted with the connector.
+    #[cfg(feature = "mcp")]
+    oauth: Option<Arc<oauth::Store>>,
 }
 
 impl AppState {
@@ -98,14 +103,22 @@ impl AppState {
             funding: None,
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "mcp")]
+            oauth: None,
         }
     }
 
-    /// Serve the MCP connector at `/mcp` with this configuration.
+    /// Serve the MCP connector at `/mcp` and its OAuth server.
     #[cfg(feature = "mcp")]
     pub fn with_mcp(mut self, cfg: mcp::Config) -> Self {
+        self.oauth = Some(Arc::new(oauth::Store::new(&cfg.public_url)));
         self.mcp = Some(Arc::new(cfg));
         self
+    }
+
+    #[cfg(feature = "mcp")]
+    pub fn oauth(&self) -> Option<&oauth::Store> {
+        self.oauth.as_deref()
     }
 
     /// Enable card purchases with this Coinflow merchant.
@@ -246,18 +259,42 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(serve_index))
         .route("/onboard", get(serve_index))
         .route("/onboard/{*rest}", get(serve_index))
-        .route("/fund", get(serve_index));
+        .route("/fund", get(serve_index))
+        .route("/authorize", get(serve_index));
+    #[cfg(feature = "mcp")]
+    let router = router
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(oauth::metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth::protected_resource),
+        )
+        .route("/oauth/register", post(oauth::register))
+        .route("/oauth/authorize", get(oauth::authorize))
+        .route("/oauth/token", post(oauth::token))
+        .route("/oauth/revoke", post(oauth::revoke))
+        .route("/api/oauth/authorize/{request}", get(oauth::pending_view))
+        .route(
+            "/api/oauth/authorize/{request}/approve",
+            post(oauth::approve),
+        )
+        .route("/api/oauth/authorize/{request}/deny", post(oauth::deny));
     #[cfg(feature = "coinflow")]
     let router = router
         .route("/api/fund/start", post(funding::start))
         .route("/api/fund/webhook", post(funding::webhook))
         .route("/api/fund/{payment_id}", get(funding::status));
     #[cfg(feature = "mcp")]
-    let mcp = state.mcp.clone();
+    let mcp = state.mcp.clone().map(|cfg| mcp::Auth {
+        cfg,
+        oauth: state.oauth.clone(),
+    });
     let router = router.with_state(state);
     #[cfg(feature = "mcp")]
     let router = match mcp {
-        Some(cfg) => router.merge(mcp::router(cfg)),
+        Some(auth) => router.merge(mcp::router(auth)),
         None => router,
     };
     router.fallback(get(serve_static))

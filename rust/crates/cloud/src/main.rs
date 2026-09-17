@@ -67,16 +67,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = match pay_cloud::mcp::Config::from_env(&public_url) {
         Some(cfg) => {
             info!(
-                tokens = cfg.token_count(),
+                static_tokens = cfg.token_count(),
                 allowed_hosts = ?cfg.allowed_hosts,
-                "MCP connector enabled at /mcp"
+                "MCP connector enabled at /mcp with its OAuth server"
             );
             state.with_mcp(cfg)
         }
         None => {
             info!(
-                "MCP connector disabled: set {} to enable",
-                pay_cloud::mcp::TOKENS_ENV
+                "MCP connector disabled: set {}=1 to enable",
+                pay_cloud::mcp::ENABLE_ENV
             );
             state
         }
