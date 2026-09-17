@@ -24,6 +24,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{Response, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use include_dir::{Dir, include_dir};
 use mime_guess::from_path;
@@ -273,6 +274,9 @@ pub fn router(state: AppState) -> Router {
         .route("/onboard/{*rest}", get(serve_index))
         .route("/fund", get(serve_index))
         .route("/authorize", get(serve_index));
+    // Metadata at the root and at the RFC 9728 / RFC 8414 path-based
+    // locations for the `/mcp` resource; hosts try either. OpenID discovery
+    // too, since some clients start there.
     #[cfg(feature = "mcp")]
     let router = router
         .route(
@@ -280,7 +284,16 @@ pub fn router(state: AppState) -> Router {
             get(oauth::metadata),
         )
         .route(
+            "/.well-known/oauth-authorization-server/mcp",
+            get(oauth::metadata),
+        )
+        .route("/.well-known/openid-configuration", get(oauth::metadata))
+        .route(
             "/.well-known/oauth-protected-resource",
+            get(oauth::protected_resource),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
             get(oauth::protected_resource),
         )
         .route("/oauth/register", post(oauth::register))
@@ -315,7 +328,31 @@ pub fn router(state: AppState) -> Router {
         Some((auth, context)) => router.merge(mcp::router(auth, context)),
         None => router,
     };
-    router.fallback(get(serve_static))
+    // Hosts and their browsers call the OAuth endpoints cross-origin;
+    // sessions ride on `mcp-session-id`, which the browser must be allowed
+    // to read back.
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::header::AUTHORIZATION,
+            axum::http::header::ACCEPT,
+            axum::http::HeaderName::from_static("mcp-session-id"),
+            axum::http::HeaderName::from_static("mcp-protocol-version"),
+            axum::http::HeaderName::from_static("last-event-id"),
+        ])
+        .expose_headers([
+            axum::http::header::WWW_AUTHENTICATE,
+            axum::http::HeaderName::from_static("mcp-session-id"),
+        ])
+        .max_age(std::time::Duration::from_secs(600));
+    router.fallback(get(serve_static)).layer(cors)
 }
 
 async fn health() -> axum::Json<serde_json::Value> {
@@ -349,6 +386,21 @@ async fn serve_index() -> Response<Body> {
 /// Serve embedded static files with SPA fallback to `index.html`.
 async fn serve_static(req: Request) -> Response<Body> {
     let path = req.uri().path().trim_start_matches('/');
+
+    // Machine-facing prefixes never fall back to the page: a host probing
+    // a metadata URL must get 404, not HTML that fails to parse.
+    if [".well-known/", "api/", "oauth/", "v1/", "mcp"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(
+                json!({ "error": "not_found", "message": format!("No route for /{path}.") }),
+            ),
+        )
+            .into_response();
+    }
 
     let file = if path.is_empty() {
         ASSETS.get_file("index.html")

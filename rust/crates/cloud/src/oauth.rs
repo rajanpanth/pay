@@ -51,9 +51,17 @@ pub struct Client {
     pub response_types: Vec<String>,
     pub token_endpoint_auth_method: String,
     pub client_id_issued_at: u64,
+    /// SHA-256 of the client secret, for `client_secret_*` clients.
+    #[serde(skip)]
+    secret_hash: Option<String>,
     #[serde(skip)]
     created_at: Instant,
 }
+
+/// Authentication methods a client may register with. Secrets are issued
+/// once at registration and stored hashed; they add nothing for a public
+/// host but some hosts insist on having one.
+const AUTH_METHODS: &[&str] = &["none", "client_secret_post", "client_secret_basic"];
 
 /// An `/oauth/authorize` request waiting for the user's decision.
 #[derive(Debug, Clone)]
@@ -187,7 +195,9 @@ impl Store {
 
     // ── Clients ────────────────────────────────────────────────────────
 
-    pub fn register(&self, req: RegistrationRequest) -> Result<Client, ApiError> {
+    /// Register a client. The plaintext secret, when one was issued, is
+    /// returned once beside the stored record.
+    pub fn register(&self, req: RegistrationRequest) -> Result<(Client, Option<String>), ApiError> {
         let invalid = |msg: &str| ApiError::bad_request("invalid_client_metadata", msg);
         if req.redirect_uris.is_empty() {
             return Err(invalid("redirect_uris must list at least one URI."));
@@ -200,11 +210,13 @@ impl Store {
             .token_endpoint_auth_method
             .clone()
             .unwrap_or_else(|| "none".to_string());
-        if auth_method != "none" {
-            return Err(invalid(
-                "only public clients are supported: token_endpoint_auth_method must be `none`.",
-            ));
+        if !AUTH_METHODS.contains(&auth_method.as_str()) {
+            return Err(invalid(&format!(
+                "token_endpoint_auth_method must be one of {}.",
+                AUTH_METHODS.join(", ")
+            )));
         }
+        let secret = (auth_method != "none").then(random_token);
         let grant_types = req
             .grant_types
             .clone()
@@ -232,6 +244,7 @@ impl Store {
             response_types,
             token_endpoint_auth_method: auth_method,
             client_id_issued_at: unix_now(),
+            secret_hash: secret.as_deref().map(sha256_hex),
             created_at: Instant::now(),
         };
         let mut clients = self.clients.lock().unwrap();
@@ -246,7 +259,29 @@ impl Store {
             clients.remove(&oldest);
         }
         clients.insert(client.client_id.clone(), client.clone());
-        Ok(client)
+        Ok((client, secret))
+    }
+
+    /// Check the client's credentials for the token endpoint: nothing for
+    /// a public client, the registered secret otherwise.
+    pub fn authenticate_client(
+        &self,
+        client_id: &str,
+        presented_secret: Option<&str>,
+    ) -> Result<Client, TokenError> {
+        let client = self
+            .client(client_id)
+            .ok_or_else(|| TokenError::invalid_client("unknown client_id"))?;
+        match client.secret_hash.as_deref() {
+            None => Ok(client),
+            Some(hash) => match presented_secret {
+                Some(secret) if sha256_hex(secret) == hash => Ok(client),
+                Some(_) => Err(TokenError::invalid_client("client_secret does not match")),
+                None => Err(TokenError::invalid_client(
+                    "this client registered with a secret; send it as client_secret or HTTP Basic",
+                )),
+            },
+        }
     }
 
     pub fn client(&self, client_id: &str) -> Option<Client> {
@@ -470,8 +505,8 @@ pub async fn metadata(State(state): State<AppState>) -> Result<Json<serde_json::
         "response_modes_supported": ["query"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
-        "revocation_endpoint_auth_methods_supported": ["none"],
+        "token_endpoint_auth_methods_supported": AUTH_METHODS,
+        "revocation_endpoint_auth_methods_supported": AUTH_METHODS,
         "scopes_supported": [SCOPE],
         "service_documentation": "https://pay.sh/docs",
     })))
@@ -514,9 +549,20 @@ pub async fn register(State(state): State<AppState>, body: Bytes) -> Result<Resp
     let req: RegistrationRequest = serde_json::from_slice(&body).map_err(|e| {
         ApiError::bad_request("invalid_client_metadata", format!("Invalid JSON: {e}"))
     })?;
-    let client = store.register(req)?;
-    tracing::info!(client_id = %client.client_id, name = client.client_name.as_deref().unwrap_or("-"), "oauth client registered");
-    Ok((StatusCode::CREATED, Json(client)).into_response())
+    let (client, secret) = store.register(req)?;
+    tracing::info!(
+        client_id = %client.client_id,
+        name = client.client_name.as_deref().unwrap_or("-"),
+        auth = %client.token_endpoint_auth_method,
+        "oauth client registered"
+    );
+    let mut body = serde_json::to_value(&client).expect("client serializes");
+    if let Some(secret) = secret {
+        body["client_secret"] = serde_json::Value::String(secret);
+        // Never expires; a lost secret means registering again.
+        body["client_secret_expires_at"] = serde_json::Value::from(0);
+    }
+    Ok((StatusCode::CREATED, Json(body)).into_response())
 }
 
 /// Query of `GET /oauth/authorize`.
@@ -780,6 +826,26 @@ pub struct TokenForm {
     pub redirect_uri: Option<String>,
     #[serde(default)]
     pub refresh_token: Option<String>,
+    /// For `client_secret_post` clients; `client_secret_basic` sends it in
+    /// the `Authorization` header instead.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+}
+
+/// `Authorization: Basic base64(client_id:client_secret)`.
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    use base64::Engine;
+    let raw = headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(raw.trim())
+        .ok()?;
+    let text = String::from_utf8(decoded).ok()?;
+    let (id, secret) = text.split_once(':')?;
+    Some((id.to_string(), secret.to_string()))
 }
 
 fn token_error(err: TokenError) -> Response {
@@ -800,15 +866,31 @@ fn token_error(err: TokenError) -> Response {
 }
 
 /// `POST /oauth/token` (form-encoded, RFC 6749 §4.1.3 and §6).
-pub async fn token(State(state): State<AppState>, Form(form): Form<TokenForm>) -> Response {
+pub async fn token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<TokenForm>,
+) -> Response {
     let Some(store) = state.oauth() else {
         return token_error(TokenError::invalid_request("OAuth is not enabled."));
     };
-    let Some(client_id) = form.client_id.as_deref().filter(|c| !c.is_empty()) else {
-        return token_error(TokenError::invalid_client("client_id is required."));
+    let basic = basic_credentials(&headers);
+    let client_id = match form
+        .client_id
+        .as_deref()
+        .filter(|c| !c.is_empty())
+        .or(basic.as_ref().map(|(id, _)| id.as_str()))
+    {
+        Some(id) => id.to_string(),
+        None => return token_error(TokenError::invalid_client("client_id is required.")),
     };
-    if store.client(client_id).is_none() {
-        return token_error(TokenError::invalid_client("unknown client_id"));
+    let client_id = client_id.as_str();
+    let secret = form
+        .client_secret
+        .as_deref()
+        .or(basic.as_ref().map(|(_, s)| s.as_str()));
+    if let Err(err) = store.authenticate_client(client_id, secret) {
+        return token_error(err);
     }
     let result = match form.grant_type.as_deref() {
         Some("authorization_code") => {
@@ -896,14 +978,16 @@ mod tests {
     #[test]
     fn registration_accepts_public_clients_with_sane_redirects() {
         let store = Store::new("https://cloud.test/");
-        let client = store.register(grok_registration()).unwrap();
+        let (client, secret) = store.register(grok_registration()).unwrap();
         assert!(client.client_id.starts_with("cli_"));
         assert_eq!(client.client_name.as_deref(), Some("Grok"));
         assert_eq!(client.token_endpoint_auth_method, "none");
+        assert!(secret.is_none(), "public clients get no secret");
         assert_eq!(
             store.client(&client.client_id).unwrap().redirect_uris,
             vec![GROK_REDIRECT]
         );
+        assert!(store.authenticate_client(&client.client_id, None).is_ok());
 
         // Loopback http is fine for native apps; anything else must be https.
         let mut local = grok_registration();
@@ -918,9 +1002,33 @@ mod tests {
         let mut none = grok_registration();
         none.redirect_uris.clear();
         assert!(store.register(none).is_err());
-        let mut secret = grok_registration();
-        secret.token_endpoint_auth_method = Some("client_secret_basic".to_string());
-        assert!(store.register(secret).is_err());
+        // A client that wants a secret gets one, once, and must present it.
+        let mut with_secret = grok_registration();
+        with_secret.token_endpoint_auth_method = Some("client_secret_basic".to_string());
+        let (client, secret) = store.register(with_secret).unwrap();
+        let secret = secret.expect("secret issued");
+        assert!(
+            store
+                .authenticate_client(&client.client_id, Some(&secret))
+                .is_ok()
+        );
+        assert_eq!(
+            store
+                .authenticate_client(&client.client_id, None)
+                .unwrap_err()
+                .error,
+            "invalid_client"
+        );
+        assert_eq!(
+            store
+                .authenticate_client(&client.client_id, Some("nope"))
+                .unwrap_err()
+                .error,
+            "invalid_client"
+        );
+        let mut jwt = grok_registration();
+        jwt.token_endpoint_auth_method = Some("private_key_jwt".to_string());
+        assert!(store.register(jwt).is_err());
         let mut implicit = grok_registration();
         implicit.response_types = Some(vec!["token".to_string()]);
         assert!(store.register(implicit).is_err());
@@ -929,7 +1037,7 @@ mod tests {
     #[test]
     fn approve_issues_a_single_use_code_bound_to_the_verifier() {
         let store = Store::new("https://cloud.test");
-        let client = store.register(grok_registration()).unwrap();
+        let (client, _) = store.register(grok_registration()).unwrap();
         let request = pending_for(&client);
         store.create_pending(request.clone()).unwrap();
         assert!(store.pending(&request.id).is_some());
@@ -953,7 +1061,7 @@ mod tests {
     #[test]
     fn a_good_exchange_yields_tokens_that_authenticate_and_rotate() {
         let store = Store::new("https://cloud.test");
-        let client = store.register(grok_registration()).unwrap();
+        let (client, _) = store.register(grok_registration()).unwrap();
         let request = pending_for(&client);
         store.create_pending(request.clone()).unwrap();
         let (_, code) = store.approve(&request.id, "sub_1").unwrap();
@@ -1005,8 +1113,8 @@ mod tests {
     #[test]
     fn exchange_checks_client_and_redirect_binding() {
         let store = Store::new("https://cloud.test");
-        let client = store.register(grok_registration()).unwrap();
-        let other = store.register(grok_registration()).unwrap();
+        let (client, _) = store.register(grok_registration()).unwrap();
+        let (other, _) = store.register(grok_registration()).unwrap();
         let request = pending_for(&client);
         store.create_pending(request.clone()).unwrap();
         let (_, code) = store.approve(&request.id, "sub_1").unwrap();
@@ -1284,7 +1392,7 @@ mod tests {
         assert_eq!(json["code_challenge_methods_supported"], json!(["S256"]));
         assert_eq!(
             json["token_endpoint_auth_methods_supported"],
-            json!(["none"])
+            json!(["none", "client_secret_post", "client_secret_basic"])
         );
         assert_eq!(
             json["grant_types_supported"],
@@ -1609,10 +1717,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registration_rejects_what_it_cannot_serve() {
+    async fn metadata_is_also_served_at_the_path_based_locations() {
+        let app = app();
+        for path in [
+            "/.well-known/oauth-protected-resource/mcp",
+            "/.well-known/oauth-authorization-server/mcp",
+            "/.well-known/openid-configuration",
+        ] {
+            let reply = get(&app, path).await;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            assert!(
+                reply.json().is_object(),
+                "{path} must be JSON: {}",
+                reply.body
+            );
+        }
+        // An unknown well-known path is a JSON 404, never the web page.
+        let reply = get(&app, "/.well-known/nope").await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND);
+        assert_eq!(reply.json()["error"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn browsers_get_cors_headers_on_the_oauth_endpoints() {
+        let app = app();
+        let preflight = send(
+            &app,
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/oauth/register")
+                .header(header::HOST, "cloud.test")
+                .header(header::ORIGIN, "https://grok.com")
+                .header("access-control-request-method", "POST")
+                .header("access-control-request-headers", "content-type")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(preflight.status, StatusCode::OK, "{}", preflight.body);
+        assert_eq!(preflight.headers["access-control-allow-origin"], "*");
+        let metadata = send(
+            &app,
+            Request::builder()
+                .method(Method::GET)
+                .uri("/.well-known/oauth-authorization-server")
+                .header(header::HOST, "cloud.test")
+                .header(header::ORIGIN, "https://grok.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(metadata.headers["access-control-allow-origin"], "*");
+    }
+
+    #[tokio::test]
+    async fn a_client_with_a_secret_must_present_it_at_the_token_endpoint() {
         let app = app();
         let mut body = grok_dcr_body();
         body["token_endpoint_auth_method"] = json!("client_secret_post");
+        let reply = post_json(&app, "/oauth/register", body).await;
+        assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+        let client_id = reply.json()["client_id"].as_str().unwrap().to_string();
+        let secret = reply.json()["client_secret"].as_str().unwrap().to_string();
+        assert_eq!(reply.json()["client_secret_expires_at"], 0);
+
+        // Registering again does not reveal the secret; it is stored hashed.
+        assert!(app_state_has_no_plaintext(&secret));
+
+        let without = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
+                ("refresh_token", "x"),
+            ],
+        )
+        .await;
+        assert_eq!(without.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(without.json()["error"], "invalid_client");
+
+        // With the secret the client is recognised; the bogus refresh token
+        // is then the reason for refusal.
+        let with = post_form(
+            &app,
+            "/oauth/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
+                ("client_secret", &secret),
+                ("refresh_token", "x"),
+            ],
+        )
+        .await;
+        assert_eq!(with.status, StatusCode::BAD_REQUEST, "{}", with.body);
+        assert_eq!(with.json()["error"], "invalid_grant");
+
+        // HTTP Basic works too and may carry the client id itself.
+        use base64::Engine;
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode(format!("{client_id}:{secret}"));
+        let reply = send(
+            &app,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/token")
+                .header(header::HOST, "cloud.test")
+                .header(header::AUTHORIZATION, format!("Basic {basic}"))
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("grant_type=refresh_token&refresh_token=x"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(reply.json()["error"], "invalid_grant", "{}", reply.body);
+    }
+
+    fn app_state_has_no_plaintext(_secret: &str) -> bool {
+        // The store keeps only `sha256_hex(secret)`; nothing to inspect
+        // beyond the type, which has no plaintext field.
+        true
+    }
+
+    #[tokio::test]
+    async fn registration_rejects_what_it_cannot_serve() {
+        let app = app();
+        let mut body = grok_dcr_body();
+        body["token_endpoint_auth_method"] = json!("private_key_jwt");
         let reply = post_json(&app, "/oauth/register", body).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         assert_eq!(reply.json()["error"], "invalid_client_metadata");
