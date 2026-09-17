@@ -40,6 +40,28 @@ Done on `feat/pay-cloud`:
   Grok registration, consent, wallet creation, code, token, an MCP `topup`
   naming the new wallet, then a second connection from the same browser
   approving straight away against the same wallet.
+- **Grok, live (2026-09-17).** Through a Cloudflare quick tunnel, Grok's
+  custom connector connected and listed the pay tools. What it took, and
+  what it revealed about Grok's client:
+  - Grok probes `/mcp`, reads both well-known documents, registers as a
+    public PKCE client with redirect
+    `https://grok.com/connectors-oauth-exchange-code/`, receives the 201,
+    and then never opens the authorization endpoint. It shows "connector is
+    unavailable". Other spec-compliant servers report the same; the missing
+    step is on Grok's side or needs something undocumented in the 201.
+  - Grok sends no `Authorization` header from its connector dialog, so a
+    static token is not a way in either.
+  - The demo therefore runs `run.sh --anonymous`: requests with no header
+    act as one static token's tenant, bound to the mock wallet. Dev only,
+    logged as a warning, never for a deployment.
+  - Along the way the server gained what other hosts do need: path-based
+    metadata locations, CORS, `client_secret_*` registration, the full
+    RFC 6750 challenge with `scope`, and request logging at INFO.
+  - Open for production: how a Grok user gets an identity. Options are
+    xAI fixing the OAuth step (ask them, with the request log), or an
+    in-band login where a tool hands out a link and the returned session is
+    bound to a tenant, which needs Grok to keep a session across calls.
+    The header names Grok sends are being logged to find any handle.
 - Not yet: persisting tenants and OAuth state (Postgres, credentials
   encrypted at rest with a KEK from Secret Manager), a `/connect` page for
   limits and revocation, Redis MCP sessions, funding from inside the

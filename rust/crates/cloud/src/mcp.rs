@@ -225,7 +225,16 @@ async fn require_bearer(State(auth): State<Auth>, mut req: Request, next: Next) 
     let token = raw.map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim());
     let tenant = match token {
         Some(t) => auth.authenticate(t),
-        None => auth.cfg.anonymous_tenant().cloned(),
+        None => {
+            let anonymous = auth.cfg.anonymous_tenant().cloned();
+            if anonymous.is_some() {
+                // Names only: whether a header-less host carries anything a
+                // production login could hang a user identity on.
+                let names: Vec<&str> = req.headers().keys().map(|k| k.as_str()).collect();
+                tracing::info!(headers = ?names, "anonymous mcp request");
+            }
+            anonymous
+        }
     };
     match tenant {
         Some(tenant) => {
