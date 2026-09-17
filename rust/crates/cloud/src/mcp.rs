@@ -28,6 +28,10 @@ pub const ENABLE_ENV: &str = "PAY_CLOUD_MCP";
 /// Optional comma-separated static bearer tokens.
 pub const TOKENS_ENV: &str = "PAY_CLOUD_MCP_TOKENS";
 pub const ALLOWED_HOSTS_ENV: &str = "PAY_CLOUD_MCP_ALLOWED_HOSTS";
+/// DEV ONLY: a static token whose tenant serves requests that carry no
+/// `Authorization` at all. For hosts that can neither send a header nor
+/// finish OAuth; never set it on a public deployment.
+pub const ANONYMOUS_TOKEN_ENV: &str = "PAY_CLOUD_DEV_ANONYMOUS_TOKEN";
 pub const PATH: &str = "/mcp";
 
 /// Who a request acts for. Today the fingerprint of the static token that
@@ -47,6 +51,8 @@ pub struct Config {
     pub allowed_hosts: Vec<String>,
     /// Static bearer tokens. Empty means every request is refused.
     tokens: Vec<String>,
+    /// DEV ONLY: tenant for requests with no `Authorization` header.
+    anonymous: Option<Tenant>,
 }
 
 impl Config {
@@ -72,7 +78,24 @@ impl Config {
             public_url,
             allowed_hosts,
             tokens: tokens.into_iter().filter(|t| !t.is_empty()).collect(),
+            anonymous: None,
         }
+    }
+
+    /// DEV ONLY: serve unauthenticated requests as `token`'s tenant. The
+    /// token must also be a static token, so it has a wallet.
+    pub fn with_anonymous_token(mut self, token: &str) -> Self {
+        if !self.tokens.iter().any(|t| t == token) {
+            self.tokens.push(token.to_string());
+        }
+        self.anonymous = Some(Tenant {
+            id: token_fingerprint(token),
+        });
+        self
+    }
+
+    pub fn anonymous_tenant(&self) -> Option<&Tenant> {
+        self.anonymous.as_ref()
     }
 
     /// `None` unless `PAY_CLOUD_MCP` is on: the endpoint is not mounted.
@@ -96,6 +119,13 @@ impl Config {
             })
             .unwrap_or_default();
         let mut cfg = Self::new(public_url, tokens);
+        if let Some(token) = std::env::var(ANONYMOUS_TOKEN_ENV)
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+        {
+            cfg = cfg.with_anonymous_token(&token);
+        }
         if let Ok(hosts) = std::env::var(ALLOWED_HOSTS_ENV) {
             let hosts: Vec<String> = hosts
                 .split(',')
@@ -193,7 +223,11 @@ async fn require_bearer(State(auth): State<Auth>, mut req: Request, next: Next) 
         .and_then(|v| v.to_str().ok())
         .map(str::trim);
     let token = raw.map(|v| v.strip_prefix("Bearer ").unwrap_or(v).trim());
-    match token.and_then(|t| auth.authenticate(t)) {
+    let tenant = match token {
+        Some(t) => auth.authenticate(t),
+        None => auth.cfg.anonymous_tenant().cloned(),
+    };
+    match tenant {
         Some(tenant) => {
             req.extensions_mut().insert(tenant);
             next.run(req).await
@@ -365,6 +399,25 @@ pub(crate) mod tests {
             let json: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(json["error"], "unauthorized");
         }
+    }
+
+    #[tokio::test]
+    async fn the_dev_anonymous_token_serves_requests_with_no_header() {
+        let cfg = Config::new("https://cloud.test", vec![]).with_anonymous_token("tok-anon");
+        assert_eq!(cfg.token_count(), 1, "the anonymous token is also a bearer");
+        let app = router(
+            Auth {
+                cfg: Arc::new(cfg),
+                oauth: None,
+            },
+            Arc::new(crate::tenants::CloudContext::new(Arc::default())),
+        );
+        let (status, headers, _) = mcp_post(&app, None, None, INIT).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.contains_key("mcp-session-id"));
+        // A wrong token is still wrong; anonymity is not a fallback for it.
+        let (status, _, _) = mcp_post(&app, Some("nope"), None, INIT).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

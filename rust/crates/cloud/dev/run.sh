@@ -8,6 +8,7 @@
 #   rust/crates/cloud/dev/run.sh --real-openfort # use dashboard.openfort.io
 #   rust/crates/cloud/dev/run.sh --public-url https://xyz.trycloudflare.com
 #   rust/crates/cloud/dev/run.sh --static-token <token>   # header auth + a mock wallet for it
+#   rust/crates/cloud/dev/run.sh --anonymous              # DEV ONLY: no-auth hosts act as that wallet
 #
 # Reads the repo-root .env (Coinflow sandbox settings) when present.
 # Ctrl-C stops everything.
@@ -20,6 +21,7 @@ PUBLIC_URL=""
 REAL_OPENFORT=0
 SKIP_BUILD=0
 STATIC_TOKEN=""
+ANONYMOUS=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -28,6 +30,7 @@ while [ $# -gt 0 ]; do
     --real-openfort) REAL_OPENFORT=1; shift ;;
     --skip-build) SKIP_BUILD=1; shift ;;
     --static-token) STATIC_TOKEN="$2"; shift 2 ;;
+    --anonymous) ANONYMOUS=1; shift ;;
     -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
@@ -68,10 +71,18 @@ fi
 
 export PAY_CLOUD_MCP=1
 export RUST_LOG="${RUST_LOG:-info,pay_cloud=debug}"
+if [ "$ANONYMOUS" = 1 ] && [ -z "$STATIC_TOKEN" ]; then
+  STATIC_TOKEN="pay_dev_$(openssl rand -hex 16)"
+fi
 if [ -n "$STATIC_TOKEN" ]; then
   # A header-authenticated host; with the mock, the token gets a wallet too.
   export PAY_CLOUD_MCP_TOKENS="$STATIC_TOKEN"
   [ "$REAL_OPENFORT" = 0 ] && export PAY_CLOUD_DEV_MOCK_TENANTS=1
+fi
+if [ "$ANONYMOUS" = 1 ]; then
+  # DEV ONLY: hosts that send no header and cannot finish OAuth act as the
+  # static token's tenant. Anyone with the URL can use that mock wallet.
+  export PAY_CLOUD_DEV_ANONYMOUS_TOKEN="$STATIC_TOKEN"
 fi
 
 step "Starting pay-cloud on http://127.0.0.1:$PORT (public URL $PUBLIC_URL)"

@@ -71,6 +71,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 allowed_hosts = ?cfg.allowed_hosts,
                 "MCP connector enabled at /mcp with its OAuth server"
             );
+            if let Some(tenant) = cfg.anonymous_tenant() {
+                tracing::warn!(
+                    subject = %tenant.id,
+                    "DEV ONLY: requests with no Authorization act as this tenant; never deploy like this"
+                );
+            }
             let state = state.with_mcp(cfg.clone());
             dev_mock_tenants(&state, &cfg).await?;
             state
