@@ -40,6 +40,8 @@ pub const MAX_PAYMENTS: usize = 8192;
 /// Card rails offered on the page. Bank rails need a payer identity and
 /// take days; PayPal and Venmo are not configured on the merchant.
 pub const PAYMENT_METHODS: &[&str] = &["card", "applePay", "googlePay"];
+/// Short card-statement label used when the issuing bank supports dynamic descriptors.
+pub const STATEMENT_DESCRIPTOR: &str = "PAY.SH";
 
 pub const API_KEY_ENV: &str = "COINFLOW_API_KEY";
 pub const ENV_ENV: &str = "COINFLOW_ENV";
@@ -294,22 +296,23 @@ impl Coinflow {
     }
 }
 
-/// The checkout page's look, matched to the terminal theme of the page it
-/// sits in.
-fn terminal_theme() -> serde_json::Value {
+/// The checkout form's look, matched to the pay.sh receipt panel it sits in.
+fn checkout_theme() -> serde_json::Value {
     serde_json::json!({
-        "style": "sharp",
-        "font": "JetBrains Mono",
-        "background": "#000000",
-        "backgroundAccent": "#0a0a0a",
-        "backgroundAccent2": "#111111",
-        "cardBackground": "#0a0a0a",
-        "primary": "#ffffff",
-        "ctaColor": "#ffffff",
-        "textColor": "#ffffff",
-        "textColorAccent": "#9ca3af",
-        "textColorAction": "#000000",
-        "placeholderColor": "#6b7280",
+        "style": "rounded",
+        "font": "Inter",
+        "fontSize": "14px",
+        "fontWeight": "500",
+        "background": "#0c0c0f",
+        "backgroundAccent": "#18181b",
+        "backgroundAccent2": "#242428",
+        "cardBackground": "#18181b",
+        "primary": "#fafafa",
+        "ctaColor": "#fafafa",
+        "textColor": "#fafafa",
+        "textColorAccent": "#a1a1aa",
+        "textColorAction": "#09090b",
+        "placeholderColor": "#71717a",
         "showCardIcon": true,
     })
 }
@@ -564,9 +567,10 @@ pub async fn start(
         "blockchain": "solana",
         "settlementType": "USDC",
         "allowedPaymentMethods": PAYMENT_METHODS,
+        "statementDescriptor": STATEMENT_DESCRIPTOR,
         "webhookInfo": webhook_info,
         "expiresIn": { "minutes": LINK_TTL_MINUTES },
-        "theme": terminal_theme(),
+        "theme": checkout_theme(),
     });
     let settlement = if cfg.settle_to_customer {
         link_body["destination"] = serde_json::Value::String(req.address.clone());
@@ -1046,6 +1050,7 @@ mod tests {
         );
         assert_eq!(body["blockchain"], "solana");
         assert_eq!(body["settlementType"], "USDC");
+        assert_eq!(body["statementDescriptor"], STATEMENT_DESCRIPTOR);
         assert_eq!(
             body["allowedPaymentMethods"],
             json!(["card", "applePay", "googlePay"])
@@ -1056,6 +1061,12 @@ mod tests {
             "abcdefghijklmnopqrstuvwxyz012345"
         );
         assert_eq!(body["expiresIn"]["minutes"], LINK_TTL_MINUTES);
+        assert_eq!(body["theme"]["background"], "#0c0c0f");
+        assert_eq!(body["theme"]["cardBackground"], "#18181b");
+        assert_eq!(body["theme"]["style"], "rounded");
+        assert_eq!(body["theme"]["font"], "Inter");
+        assert_eq!(body["theme"]["fontSize"], "14px");
+        assert_eq!(body["theme"]["fontWeight"], "500");
         assert!(
             body.get("destination").is_none(),
             "merchant settlement carries no destination"

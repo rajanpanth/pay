@@ -186,7 +186,11 @@ impl ServerHandler for PayMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2025_06_18)
-            .with_server_info(rmcp::model::Implementation::from_build_env())
+            .with_server_info(
+                rmcp::model::Implementation::new("pay", env!("CARGO_PKG_VERSION"))
+                    .with_title("Pay")
+                    .with_website_url("https://pay.sh"),
+            )
             .with_instructions(pay_core::instructions::INSTRUCTIONS)
     }
 }
@@ -195,6 +199,14 @@ impl ServerHandler for PayMcp {
 mod tests {
     use super::*;
     use rmcp::ServerHandler;
+
+    #[test]
+    fn server_info_names_pay_not_the_sdk() {
+        let info = PayMcp::new().get_info();
+        assert_eq!(info.server_info.name, "pay");
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.server_info.title.as_deref(), Some("Pay"));
+    }
 
     #[test]
     fn server_info_has_instructions() {

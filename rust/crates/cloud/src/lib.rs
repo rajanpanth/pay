@@ -33,6 +33,8 @@ pub use onboard::{OnboardSession, SESSION_TTL};
 
 #[cfg(feature = "coinflow")]
 pub mod funding;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 
 static ASSETS: Dir<'_> = include_dir!("$OUT_DIR/cloud-dist");
 
@@ -69,6 +71,9 @@ pub struct AppState {
     /// Card purchases through Coinflow; `None` until configured.
     #[cfg(feature = "coinflow")]
     funding: Option<Arc<funding::Funding>>,
+    /// The hosted MCP connector; `None` until tokens are configured.
+    #[cfg(feature = "mcp")]
+    mcp: Option<Arc<mcp::Config>>,
 }
 
 impl AppState {
@@ -91,7 +96,16 @@ impl AppState {
             public_url: public_url.into().trim_end_matches('/').to_string(),
             #[cfg(feature = "coinflow")]
             funding: None,
+            #[cfg(feature = "mcp")]
+            mcp: None,
         }
+    }
+
+    /// Serve the MCP connector at `/mcp` with this configuration.
+    #[cfg(feature = "mcp")]
+    pub fn with_mcp(mut self, cfg: mcp::Config) -> Self {
+        self.mcp = Some(Arc::new(cfg));
+        self
     }
 
     /// Enable card purchases with this Coinflow merchant.
@@ -238,7 +252,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/fund/start", post(funding::start))
         .route("/api/fund/webhook", post(funding::webhook))
         .route("/api/fund/{payment_id}", get(funding::status));
-    router.fallback(get(serve_static)).with_state(state)
+    #[cfg(feature = "mcp")]
+    let mcp = state.mcp.clone();
+    let router = router.with_state(state);
+    #[cfg(feature = "mcp")]
+    let router = match mcp {
+        Some(cfg) => router.merge(mcp::router(cfg)),
+        None => router,
+    };
+    router.fallback(get(serve_static))
 }
 
 async fn health() -> axum::Json<serde_json::Value> {

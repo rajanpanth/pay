@@ -63,6 +63,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             state
         }
     };
+    #[cfg(feature = "mcp")]
+    let state = match pay_cloud::mcp::Config::from_env(&public_url) {
+        Some(cfg) => {
+            info!(
+                tokens = cfg.token_count(),
+                allowed_hosts = ?cfg.allowed_hosts,
+                "MCP connector enabled at /mcp"
+            );
+            state.with_mcp(cfg)
+        }
+        None => {
+            info!(
+                "MCP connector disabled: set {} to enable",
+                pay_cloud::mcp::TOKENS_ENV
+            );
+            state
+        }
+    };
     let app = pay_cloud::router(state).layer(TraceLayer::new_for_http());
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

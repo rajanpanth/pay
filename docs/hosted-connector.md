@@ -205,6 +205,15 @@ freezes a tenant without moving funds.
 9. **Ledger is a `RemoteProvider` too**, id `ledger`, with no credential
    fields. The registry becomes the single place a backend is added,
    whether the key is in a TEE, a cloud, or a USB device.
+10. **Connector custody: pay-cloud stores per-tenant Openfort credentials
+    (2026-09-16).** A browser-only host has no CLI and no Touch ID, so
+    something server-side must sign. The credentials come from the same
+    consent driver the CLI onboarding uses, encrypted at rest, and policy is
+    the only control on their use. Chosen over one pay-owned project with a
+    wallet per tenant (rejected on 2026-09-15) because it reuses M1 whole and
+    keeps each user on their own Openfort project. Build order for the Grok
+    connector: A3 transport, A4 OAuth, A2 tenant context, A5 tenant store.
+    A6 (the CLI signing through pay-cloud) is not needed for the connector.
 
 ## Track A: pay-cloud service
 
