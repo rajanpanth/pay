@@ -1,12 +1,41 @@
 # pay-cloud
 
-Local service behind the `gh auth login`-style onboarding flow for the `pay`
-CLI. The CLI opens a browser page served here, the page collects an email and
-redirects back to a loopback listener in the CLI with a one-time code, and the
-CLI redeems the code with PKCE (RFC 7636 S256).
+The hosted half of pay. One axum server, one embedded web app, four jobs:
 
-Milestone 1: everything runs locally, state is in memory, and the exchange
-returns a `pending` stub — no wallet provisioning yet.
+- **Onboarding** for `pay setup --backend cloud`: the `gh auth login`
+  pattern. The CLI opens a page here, the page sends the browser through a
+  wallet provider (Openfort), and the CLI redeems a one-time code with PKCE.
+- **Funding**: the `/fund` page buys USDC with a card through Coinflow for
+  any address, used by the TUI and the web flow alike.
+- **The MCP connector**: `/mcp` serves the pay tools over streamable HTTP
+  to hosts like Grok, Claude and Cursor, behind an OAuth 2.1 authorization
+  server this crate implements (`/.well-known/*`, `/oauth/*`).
+- **Tenants**: a connector subject bound to a wallet, its provider
+  credentials and a spending policy. In memory today; Postgres next.
+
+Everything below runs locally. State is in memory and lost on restart.
+
+## Try it
+
+```sh
+rust/crates/cloud/dev/run.sh
+```
+
+Builds both web bundles and the binaries, starts a mock Openfort so wallet
+creation works with no Openfort account, loads the repo-root `.env`
+(Coinflow sandbox), and starts pay-cloud on `http://127.0.0.1:8402` with
+the connector on. It prints the commands to try: adding the connector to
+Claude Code and authenticating through the consent page, `pay setup
+--backend cloud`, and `pay topup` with a card. `--real-openfort` uses the
+real dashboard; `--public-url` sets the issuer and allowed hosts for a
+tunnel, which Grok needs.
+
+Environment: `PAY_CLOUD_MCP=1` mounts `/mcp` and the OAuth server;
+`PAY_CLOUD_MCP_TOKENS` adds comma-separated static bearer tokens;
+`PAY_CLOUD_MCP_ALLOWED_HOSTS` overrides the `Host` allowlist derived from
+the public URL. `COINFLOW_*` configure funding (see `docs/onramp-coinflow.md`).
+`OPENFORT_BASE_URL` and `OPENFORT_AUTH_PAGE_URL` point the driver at a
+mock or staging.
 
 ## Build the UI
 

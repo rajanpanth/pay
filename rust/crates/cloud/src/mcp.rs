@@ -57,13 +57,15 @@ impl Config {
             "127.0.0.1".to_string(),
             "::1".to_string(),
         ];
-        if let Some(host) = url::Url::parse(&public_url)
+        if let Some((host, port)) = url::Url::parse(&public_url)
             .ok()
             .and_then(|u| u.host_str().map(|h| (h.to_string(), u.port())))
         {
-            allowed_hosts.push(host.0.clone());
-            if let Some(port) = host.1 {
-                allowed_hosts.push(format!("{}:{port}", host.0));
+            if !allowed_hosts.contains(&host) {
+                allowed_hosts.push(host.clone());
+            }
+            if let Some(port) = port {
+                allowed_hosts.push(format!("{host}:{port}"));
             }
         }
         Self {
