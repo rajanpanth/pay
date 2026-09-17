@@ -641,6 +641,13 @@ pub fn resolve_account_for_network(network: &str, file: &AccountsFile) -> Accoun
 pub trait AccountsStore: Send + Sync {
     fn load(&self) -> Result<AccountsFile>;
     fn save(&self, file: &AccountsFile) -> Result<()>;
+
+    /// Where this store's remote accounts keep their credentials. The
+    /// platform secret store by default; pay-cloud's tenant stores carry
+    /// their own so the same signing paths serve both.
+    fn credential_source(&self) -> &dyn crate::remote::CredentialSource {
+        &crate::remote::PlatformCredentials
+    }
 }
 
 /// On-disk YAML store at `~/.config/pay/accounts.yml`.

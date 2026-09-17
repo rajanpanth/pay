@@ -18,7 +18,7 @@ openfort = ["dep:p256", "dep:reqwest"]
 # Card purchases of USDC through Coinflow (`/api/fund/*`, the `/fund` page).
 coinflow = ["dep:reqwest", "dep:bs58"]
 # The hosted connector: pay's MCP tools over streamable HTTP at `/mcp`.
-mcp = ["dep:rmcp", "dep:pay-mcp"]
+mcp = ["dep:rmcp", "dep:pay-mcp", "dep:pay-core", "dep:http"]
 
 [dependencies]
 async-trait = "0.1"
@@ -26,8 +26,10 @@ axum = { workspace = true }
 base64 = { workspace = true }
 bs58 = { workspace = true, optional = true }
 clap = { workspace = true }
+http = { version = "1", optional = true }
 include_dir = "0.7.4"
 mime_guess = { workspace = true }
+pay-core = { workspace = true, optional = true }
 pay-mcp = { workspace = true, optional = true }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"], optional = true }
 rand = { workspace = true }

@@ -8,9 +8,9 @@
 //! refusal is a 401 with the RFC 9728 `WWW-Authenticate` pointer that
 //! starts the OAuth discovery.
 //!
-//! Every accepted request carries a [`Tenant`] in its extensions. Tools do
-//! not read it yet (they still use the process-local account); the tenant
-//! context is the next step.
+//! Every accepted request carries a [`Tenant`] in its extensions;
+//! [`crate::tenants::CloudContext`] turns it into the wallet and policy the
+//! tools act with.
 
 use std::sync::Arc;
 
@@ -145,7 +145,8 @@ impl Auth {
 }
 
 /// Stable, non-reversible id for a token: first 16 hex chars of its SHA-256.
-fn token_fingerprint(token: &str) -> String {
+/// A static token's tenant is bound under this id.
+pub fn token_fingerprint(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
     let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
     format!("tok_{}", &hex[..16])
@@ -158,12 +159,17 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Routes for the connector: `/mcp` and everything under it.
-pub fn router(auth: Auth) -> Router {
+/// Routes for the connector: `/mcp` and everything under it. Each session
+/// gets a `PayMcp` resolving its calls through `context`.
+pub fn router(auth: Auth, context: Arc<dyn pay_mcp::PayContext>) -> Router {
     let transport =
         StreamableHttpServerConfig::default().with_allowed_hosts(auth.cfg.allowed_hosts.clone());
     let service: StreamableHttpService<pay_mcp::PayMcp, LocalSessionManager> =
-        StreamableHttpService::new(|| Ok(pay_mcp::PayMcp::new()), Default::default(), transport);
+        StreamableHttpService::new(
+            move || Ok(pay_mcp::PayMcp::with_context(context.clone())),
+            Default::default(),
+            transport,
+        );
     Router::new()
         .nest_service(PATH, service)
         .layer(middleware::from_fn_with_state(auth, require_bearer))
@@ -212,20 +218,37 @@ pub(crate) mod tests {
     use tower::ServiceExt;
 
     pub(crate) const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
-    const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    pub(crate) const INITIALIZED: &str =
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
     const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
 
     fn app() -> Router {
-        router(Auth {
-            cfg: Arc::new(Config::new(
-                "https://cloud.test",
-                vec!["tok-alpha".to_string(), "tok-beta".to_string()],
-            )),
-            oauth: None,
-        })
+        app_with_tenants(Arc::default())
     }
 
-    async fn mcp_post(
+    pub(crate) fn app_with_tenants(tenants: Arc<crate::tenants::TenantRegistry>) -> Router {
+        router(
+            Auth {
+                cfg: Arc::new(Config::new(
+                    "https://cloud.test",
+                    vec!["tok-alpha".to_string(), "tok-beta".to_string()],
+                )),
+                oauth: None,
+            },
+            Arc::new(crate::tenants::CloudContext::new(tenants)),
+        )
+    }
+
+    pub(crate) async fn mcp_post(
+        app: &Router,
+        bearer: Option<&str>,
+        session: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        mcp_post_inner(app, bearer, session, body).await
+    }
+
+    async fn mcp_post_inner(
         app: &Router,
         bearer: Option<&str>,
         session: Option<&str>,
@@ -259,7 +282,7 @@ pub(crate) mod tests {
     }
 
     /// The JSON payloads of an SSE body.
-    fn sse_json(body: &str) -> Vec<Value> {
+    pub(crate) fn sse_json(body: &str) -> Vec<Value> {
         body.lines()
             .filter_map(|l| l.strip_prefix("data:"))
             .filter_map(|d| serde_json::from_str(d.trim()).ok())

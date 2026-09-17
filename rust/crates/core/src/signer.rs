@@ -245,7 +245,8 @@ pub fn load_signer_for_network_with_intent_and_override(
     let file = store.load()?;
     match select_account(&file, network, account_override)? {
         AccountSelection::Configured { name, account } => {
-            let signer = load_signer_from_account_with_intent_and_override(
+            let signer = load_signer_from_account_with_source(
+                store.credential_source(),
                 &account,
                 &name,
                 network,
@@ -527,8 +528,35 @@ pub fn load_signer_from_account_with_intent_and_override(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<ResolvedSigner> {
+    load_signer_from_account_with_source(
+        &crate::remote::PlatformCredentials,
+        account,
+        name,
+        network,
+        intent,
+        auth_override,
+    )
+}
+
+/// [`load_signer_from_account_with_intent_and_override`] with remote
+/// credentials read from `source` instead of the platform secret store.
+pub fn load_signer_from_account_with_source(
+    source: &dyn crate::remote::CredentialSource,
+    account: &Account,
+    name: &str,
+    network: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<ResolvedSigner> {
     if account.backend == BackendKind::Remote {
-        return crate::remote::load_remote_signer(account, name, network, intent, auth_override);
+        return crate::remote::load_remote_signer_from(
+            source,
+            account,
+            name,
+            network,
+            intent,
+            auth_override,
+        );
     }
 
     let backend = account.descriptor()?;

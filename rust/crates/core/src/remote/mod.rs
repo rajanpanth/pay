@@ -64,6 +64,91 @@ pub fn providers() -> impl Iterator<Item = &'static dyn RemoteProvider> {
     PROVIDERS.iter().copied()
 }
 
+/// Where an account's remote credentials come from.
+///
+/// The CLI reads them from the platform secret store behind Touch ID;
+/// pay-cloud holds them per tenant. An [`AccountsStore`](crate::accounts::AccountsStore)
+/// names its source, so the same signing paths serve both without knowing
+/// which one they are on. The source applies `gate` before handing the
+/// credentials out: that is where a spending policy or a prompt runs.
+pub trait CredentialSource: Send + Sync {
+    fn load(
+        &self,
+        account: &str,
+        provider_id: &str,
+        gate: Gate,
+        intent: &AuthIntent,
+    ) -> Result<Credentials>;
+}
+
+/// The platform secret store, the CLI's source.
+pub struct PlatformCredentials;
+
+impl CredentialSource for PlatformCredentials {
+    fn load(
+        &self,
+        account: &str,
+        provider_id: &str,
+        gate: Gate,
+        intent: &AuthIntent,
+    ) -> Result<Credentials> {
+        let (ks, backend) = platform_keystore(gate)?;
+        if !ks.credential_exists(account) {
+            return Err(Error::Config(format!(
+                "No credentials stored for account `{account}`.\n\
+                 Run `pay account new {account} --backend {provider_id}` to connect it."
+            )));
+        }
+        let blob = ks
+            .load_credential_with_intent(account, intent)
+            .map_err(|e| crate::signer::map_keystore_backend_error(backend, e))?;
+        serde_json::from_slice(&blob).map_err(|e| {
+            Error::Config(format!(
+                "Stored credentials for `{account}` are corrupted ({e}). \
+                 Re-connect the wallet: `pay account destroy {account}` then \
+                 `pay account new {account} --backend {provider_id}`."
+            ))
+        })
+    }
+}
+
+/// Credentials held in memory, gated on every load. pay-cloud's per-tenant
+/// source, and a test double.
+pub struct MemoryCredentials {
+    credentials: Credentials,
+}
+
+impl MemoryCredentials {
+    pub fn new(credentials: Credentials) -> Self {
+        Self { credentials }
+    }
+}
+
+impl CredentialSource for MemoryCredentials {
+    fn load(
+        &self,
+        _account: &str,
+        _provider_id: &str,
+        gate: Gate,
+        intent: &AuthIntent,
+    ) -> Result<Credentials> {
+        match gate {
+            Gate::Disabled => {}
+            Gate::Override(auth) => auth
+                .authenticate(intent)
+                .map_err(|e| Error::Config(format!("Authorization refused: {e}")))?,
+            Gate::Platform => {
+                return Err(Error::Config(
+                    "In-memory credentials have no platform prompt to gate them; \
+                     supply an auth override or disable the gate."
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(self.credentials.clone())
+    }
+}
+
 /// One credential a provider needs in order to sign — an API key, a
 /// secret, a project id.
 pub struct CredentialField {
@@ -191,32 +276,6 @@ pub fn delete_credentials(name: &str, intent: &AuthIntent) -> Result<()> {
         .map_err(|e| crate::signer::map_keystore_backend_error(backend, e))
 }
 
-fn load_credentials(
-    name: &str,
-    provider_id: &str,
-    gated: bool,
-    auth_override: AuthOverride,
-    intent: &AuthIntent,
-) -> Result<Credentials> {
-    let (ks, backend) = platform_keystore(Gate::for_policy(gated, auth_override))?;
-    if !ks.credential_exists(name) {
-        return Err(Error::Config(format!(
-            "No credentials stored for account `{name}`.\n\
-             Run `pay account new {name} --backend {provider_id}` to connect it."
-        )));
-    }
-    let blob = ks
-        .load_credential_with_intent(name, intent)
-        .map_err(|e| crate::signer::map_keystore_backend_error(backend, e))?;
-    serde_json::from_slice(&blob).map_err(|e| {
-        Error::Config(format!(
-            "Stored credentials for `{name}` are corrupted ({e}). \
-             Re-connect the wallet: `pay account destroy {name}` then \
-             `pay account new {name} --backend {provider_id}`."
-        ))
-    })
-}
-
 // ── Account resolution ──────────────────────────────────────────────────────
 
 /// Read an account's provider id, or explain that it is missing.
@@ -269,6 +328,25 @@ pub fn load_remote_signer(
     intent: &AuthIntent,
     auth_override: AuthOverride,
 ) -> Result<ResolvedSigner> {
+    load_remote_signer_from(
+        &PlatformCredentials,
+        account,
+        name,
+        network,
+        intent,
+        auth_override,
+    )
+}
+
+/// [`load_remote_signer`] with the credentials read from `source`.
+pub fn load_remote_signer_from(
+    source: &dyn CredentialSource,
+    account: &Account,
+    name: &str,
+    network: &str,
+    intent: &AuthIntent,
+    auth_override: AuthOverride,
+) -> Result<ResolvedSigner> {
     let provider = account_provider(account, name)?;
 
     let wallet_id = account.account.clone().ok_or_else(|| {
@@ -282,7 +360,12 @@ pub fn load_remote_signer(
     let credentials = if provider.requires_credentials() {
         let gated = account.auth_required_for_network(network);
         let account_intent = intent.with_account_context(name);
-        load_credentials(name, provider.id(), gated, auth_override, &account_intent)?
+        source.load(
+            name,
+            provider.id(),
+            Gate::for_policy(gated, auth_override),
+            &account_intent,
+        )?
     } else {
         // Hardware wallets: nothing stored locally, the device approves.
         Credentials::new()
@@ -438,6 +521,66 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("unknown remote backend `acme-custody`"));
         assert!(msg.contains("openfort"));
+    }
+
+    /// An auth gate that records whether it ran and answers as told.
+    struct Recording {
+        allow: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl crate::keystore::AuthGate for Recording {
+        fn authenticate(&self, _intent: &AuthIntent) -> pay_keystore::Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.allow {
+                Ok(())
+            } else {
+                Err(pay_keystore::Error::AuthDenied(
+                    "declined by policy".to_string(),
+                ))
+            }
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn memory_credentials_apply_the_gate_on_every_load() {
+        let mut creds = Credentials::new();
+        creds.insert("secret_key".to_string(), "sk_test".to_string());
+        let source = MemoryCredentials::new(creds.clone());
+        let intent = AuthIntent::default_payment();
+
+        assert_eq!(
+            source
+                .load("t", "openfort", Gate::Disabled, &intent)
+                .unwrap(),
+            creds
+        );
+
+        let allow = Box::new(Recording {
+            allow: true,
+            calls: Default::default(),
+        });
+        assert!(
+            source
+                .load("t", "openfort", Gate::Override(allow), &intent)
+                .is_ok()
+        );
+
+        let deny = Box::new(Recording {
+            allow: false,
+            calls: Default::default(),
+        });
+        let err = source
+            .load("t", "openfort", Gate::Override(deny), &intent)
+            .unwrap_err();
+        assert!(err.to_string().contains("declined by policy"), "{err}");
+
+        let err = source
+            .load("t", "openfort", Gate::Platform, &intent)
+            .unwrap_err();
+        assert!(err.to_string().contains("no platform prompt"), "{err}");
     }
 
     #[test]

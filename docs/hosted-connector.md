@@ -20,9 +20,18 @@ Done on `feat/pay-cloud`:
   `/oauth/revoke`. Opaque tokens stored hashed, 1 h access, 30 d refresh,
   in memory and bounded. Tested end to end into an MCP session; a live
   curl run against a local server did the same.
-- Not yet: **A2** tenant context in pay-mcp (tools still use the process
-  account), **A5** tenant store and per-tenant Openfort credentials (an
-  approval mints an opaque subject today), Redis sessions, deployment.
+- **A2** `PayContext` in pay-mcp: every tool call resolves a `CallScope`
+  (accounts store, overrides, approval policy, whether local files may be
+  read). `LocalContext` reproduces `pay mcp`; pay-cloud's `CloudContext`
+  resolves the bearer's tenant into a read-only one-account store whose
+  credentials live in memory (`CredentialSource` on `AccountsStore`, the
+  A1 injection seam) and a `PolicyApproval`: per-call ceiling and daily cap
+  from the intent's exact amount (`AuthIntent::amount_minor_units`), then
+  the client's elicitation when it has one. A subject with no wallet is
+  told to finish setup.
+- Not yet: **A5** binding a subject to a provisioned wallet at consent time
+  and persisting tenants (Postgres, credentials encrypted at rest), Redis
+  sessions, deployment.
 
 ## Milestone 1 status (2026-09-15)
 

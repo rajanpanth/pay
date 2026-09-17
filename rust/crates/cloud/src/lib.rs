@@ -37,6 +37,8 @@ pub mod funding;
 pub mod mcp;
 #[cfg(feature = "mcp")]
 pub mod oauth;
+#[cfg(feature = "mcp")]
+pub mod tenants;
 
 static ASSETS: Dir<'_> = include_dir!("$OUT_DIR/cloud-dist");
 
@@ -79,6 +81,9 @@ pub struct AppState {
     /// The connector's OAuth authorization server; mounted with the connector.
     #[cfg(feature = "mcp")]
     oauth: Option<Arc<oauth::Store>>,
+    /// Wallets and policies behind connector subjects.
+    #[cfg(feature = "mcp")]
+    tenants: Arc<tenants::TenantRegistry>,
 }
 
 impl AppState {
@@ -105,7 +110,14 @@ impl AppState {
             mcp: None,
             #[cfg(feature = "mcp")]
             oauth: None,
+            #[cfg(feature = "mcp")]
+            tenants: Arc::default(),
         }
+    }
+
+    #[cfg(feature = "mcp")]
+    pub fn tenants(&self) -> &Arc<tenants::TenantRegistry> {
+        &self.tenants
     }
 
     /// Serve the MCP connector at `/mcp` and its OAuth server.
@@ -287,14 +299,20 @@ pub fn router(state: AppState) -> Router {
         .route("/api/fund/webhook", post(funding::webhook))
         .route("/api/fund/{payment_id}", get(funding::status));
     #[cfg(feature = "mcp")]
-    let mcp = state.mcp.clone().map(|cfg| mcp::Auth {
-        cfg,
-        oauth: state.oauth.clone(),
+    let mcp = state.mcp.clone().map(|cfg| {
+        (
+            mcp::Auth {
+                cfg,
+                oauth: state.oauth.clone(),
+            },
+            Arc::new(tenants::CloudContext::new(state.tenants.clone()))
+                as Arc<dyn pay_mcp::PayContext>,
+        )
     });
     let router = router.with_state(state);
     #[cfg(feature = "mcp")]
     let router = match mcp {
-        Some(auth) => router.merge(mcp::router(auth)),
+        Some((auth, context)) => router.merge(mcp::router(auth, context)),
         None => router,
     };
     router.fallback(get(serve_static))
