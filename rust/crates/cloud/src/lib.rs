@@ -95,6 +95,60 @@ pub struct AppState {
     /// Privy login on the consent page; `None` until configured.
     #[cfg(feature = "privy")]
     privy: Option<Arc<privy::Privy>>,
+    /// Answers "does this wallet hold anything to pay with" after a sign-in.
+    #[cfg(feature = "mcp")]
+    wallet_probe: Arc<dyn WalletProbe>,
+}
+
+/// Whether a wallet holds any stablecoin, asked after a sign-in to decide
+/// if the user is sent to the funding page first. pay-api in production;
+/// tests inject a fixed answer.
+#[cfg(feature = "mcp")]
+#[async_trait::async_trait]
+pub trait WalletProbe: Send + Sync {
+    /// True when the wallet is known to hold nothing. Unsure means false:
+    /// an outage must never insert a detour.
+    async fn holds_nothing(&self, address: &str) -> bool;
+}
+
+/// pay-api's stablecoin balance endpoint (`PAY_API_URL`), five-second cap.
+#[cfg(feature = "mcp")]
+pub struct PayApiProbe;
+
+#[cfg(feature = "mcp")]
+#[async_trait::async_trait]
+impl WalletProbe for PayApiProbe {
+    async fn holds_nothing(&self, address: &str) -> bool {
+        let rpc = pay_core::client::subscription::default_rpc_url_for_network(
+            pay_core::accounts::MAINNET_NETWORK,
+        );
+        let lookup = pay_core::client::balance::get_stablecoin_balances(&rpc, address);
+        match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
+            Ok(Ok(balances)) => {
+                !balances.tokens_unavailable && balances.tokens.iter().all(|t| t.raw_amount == 0)
+            }
+            Ok(Err(e)) => {
+                tracing::info!(%address, error = %e, "balance lookup failed; assuming funded");
+                false
+            }
+            Err(_) => {
+                tracing::info!(%address, "balance lookup timed out; assuming funded");
+                false
+            }
+        }
+    }
+}
+
+/// A probe with a fixed answer, for tests.
+#[cfg(feature = "mcp")]
+pub struct FixedProbe(pub bool);
+
+#[cfg(feature = "mcp")]
+#[async_trait::async_trait]
+impl WalletProbe for FixedProbe {
+    async fn holds_nothing(&self, _address: &str) -> bool {
+        self.0
+    }
 }
 
 impl AppState {
@@ -126,7 +180,21 @@ impl AppState {
             tenants: Arc::default(),
             #[cfg(feature = "privy")]
             privy: None,
+            #[cfg(feature = "mcp")]
+            wallet_probe: Arc::new(PayApiProbe),
         }
+    }
+
+    /// Decide "empty wallet" differently (tests).
+    #[cfg(feature = "mcp")]
+    pub fn with_wallet_probe(mut self, probe: Arc<dyn WalletProbe>) -> Self {
+        self.wallet_probe = probe;
+        self
+    }
+
+    #[cfg(feature = "mcp")]
+    pub fn wallet_probe(&self) -> &dyn WalletProbe {
+        self.wallet_probe.as_ref()
     }
 
     /// Offer Privy login on the consent page, with the user's Privy wallet

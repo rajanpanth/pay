@@ -861,25 +861,21 @@ pub async fn approve(
     };
     let cookie = fresh_login
         .then(|| crate::tenants::cookie::set(&subject, state.public_url().starts_with("https://")));
-    // A tenant bound just now with nothing to pay with: a wallet created
-    // seconds ago, or an existing one holding no stablecoin. When card
-    // purchases are on, send the browser to fund it first; the request
-    // stays pending and the funding page approves it by cookie when the
-    // user is done.
-    let needs_funding = match bound {
-        Some(Bound::Created) => funding_enabled(&state),
-        Some(Bound::Existing { address }) => {
-            funding_enabled(&state) && wallet_is_empty(&address).await
-        }
-        None => false,
-    };
+    // After a Privy sign-in, a wallet with nothing to pay with goes to the
+    // funding page first when card purchases are on: a wallet created
+    // seconds ago, or any wallet pay-api reports as holding no stablecoin.
+    // The request stays pending and the funding page approves it by cookie
+    // when the user is done (or skips).
+    let address = state
+        .tenants()
+        .get(&subject)
+        .map(|t| t.pubkey.clone())
+        .ok_or_else(unknown_request)?;
+    let needs_funding = fresh_login
+        && funding_enabled(&state)
+        && (bound == Some(Bound::Created) || state.wallet_probe().holds_nothing(&address).await);
     if needs_funding {
         store.pending(&id).ok_or_else(unknown_request)?;
-        let address = state
-            .tenants()
-            .get(&subject)
-            .map(|t| t.pubkey.clone())
-            .ok_or_else(unknown_request)?;
         tracing::info!(%subject, %address, "empty wallet: funding before approval");
         let mut response = Json(DecisionResponse {
             redirect: None,
@@ -918,35 +914,13 @@ fn funding_enabled(_state: &AppState) -> bool {
 }
 
 /// How a Privy sign-in bound its tenant, when it did.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "privy"), allow(dead_code))]
 enum Bound {
     /// The wallet was created just now; it holds nothing.
     Created,
     /// An existing Privy wallet was bound for the first time on this server.
-    Existing { address: String },
-}
-
-/// Whether a mainnet wallet holds no stablecoin at all. Best effort: when
-/// the lookup fails or times out, the wallet is treated as funded so a
-/// balance service outage never inserts a detour.
-async fn wallet_is_empty(address: &str) -> bool {
-    let rpc = pay_core::client::subscription::default_rpc_url_for_network(
-        pay_core::accounts::MAINNET_NETWORK,
-    );
-    let lookup = pay_core::client::balance::get_stablecoin_balances(&rpc, address);
-    match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
-        Ok(Ok(balances)) => {
-            !balances.tokens_unavailable && balances.tokens.iter().all(|t| t.raw_amount == 0)
-        }
-        Ok(Err(e)) => {
-            tracing::info!(%address, error = %e, "balance lookup failed; skipping funding detour");
-            false
-        }
-        Err(_) => {
-            tracing::info!(%address, "balance lookup timed out; skipping funding detour");
-            false
-        }
-    }
+    Existing,
 }
 
 /// A Privy access token → a bound tenant subject, and how the tenant was
@@ -979,9 +953,7 @@ async fn approve_with_privy(
     if state.tenants().get(&subject).is_none() {
         let wallet = match privy.solana_wallet(&identity.user_id).await {
             Ok(Some(existing)) => {
-                bound = Some(Bound::Existing {
-                    address: existing.address.clone(),
-                });
+                bound = Some(Bound::Existing);
                 Ok(existing)
             }
             Ok(None) => {
@@ -2416,7 +2388,9 @@ mod tests {
             let state = AppState::with_drivers("https://cloud.test", vec![])
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
                 .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
-                .with_funding(crate::funding::Funding::new(coinflow));
+                .with_funding(crate::funding::Funding::new(coinflow))
+                // Once created, the wallet is treated as funded.
+                .with_wallet_probe(Arc::new(crate::FixedProbe(false)));
             let app = crate::router(state.clone());
             let client_id = register_grok(&app).await;
             let request_id = start_authorization(&app, &client_id, None).await;
@@ -2452,13 +2426,76 @@ mod tests {
             );
             assert!(state.oauth().unwrap().pending(&request_id).is_none());
 
-            // A returning user with a wallet is never detoured.
+            // A returning user whose wallet holds something is never detoured.
             let again = start_authorization(&app, &client_id, None).await;
             let third =
                 post_json_with(&app, &approve_path(&again), json!({}), None, Some(&token)).await;
             assert_eq!(third.status, StatusCode::OK, "{}", third.body);
             assert!(third.json()["redirect"].as_str().unwrap().contains("code="));
             assert_eq!(mock.created.lock().unwrap().len(), 1);
+        }
+
+        /// An existing wallet that pay-api reports empty is funded first too,
+        /// on every Privy sign-in; a cookie approval never detours.
+        #[cfg(feature = "coinflow")]
+        #[tokio::test]
+        async fn an_existing_empty_wallet_is_funded_first() {
+            let mock = Arc::new(MockPrivy::default());
+            mock.wallets.lock().unwrap().insert(
+                USER.to_string(),
+                (
+                    "w_existing".to_string(),
+                    vec![crate::privy::tests::SIGNER.to_string()],
+                ),
+            );
+            let base = mock_privy(mock.clone()).await;
+            let fake = FakeApp::new(&base);
+            let coinflow = crate::funding::Config {
+                api_key: "cf_test".to_string(),
+                env: crate::funding::Env::Sandbox,
+                merchant_id: "pay".to_string(),
+                webhook_key: None,
+                settle_to_customer: false,
+                api_url: "http://127.0.0.1:1".to_string(),
+            };
+            let state = AppState::with_drivers("https://cloud.test", vec![])
+                .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
+                .with_privy(crate::privy::Privy::new(fake.cfg.clone()).unwrap())
+                .with_funding(crate::funding::Funding::new(coinflow))
+                .with_wallet_probe(Arc::new(crate::FixedProbe(true)));
+            let app = crate::router(state.clone());
+            let client_id = register_grok(&app).await;
+            let token = fake.token_for(USER);
+
+            let request_id = start_authorization(&app, &client_id, None).await;
+            let first = post_json_with(
+                &app,
+                &approve_path(&request_id),
+                json!({}),
+                None,
+                Some(&token),
+            )
+            .await;
+            assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+            assert_eq!(first.json()["fund"]["address"], ADDRESS, "{}", first.body);
+            assert!(mock.created.lock().unwrap().is_empty(), "nothing created");
+            let cookie = cookie_of(&first);
+
+            // By cookie (the funding page, done or skipped): straight through.
+            let second =
+                post_json_as(&app, &approve_path(&request_id), json!({}), Some(&cookie)).await;
+            assert!(
+                second.json()["redirect"]
+                    .as_str()
+                    .unwrap()
+                    .contains("code=")
+            );
+
+            // Still empty on the next sign-in: detoured again.
+            let again = start_authorization(&app, &client_id, None).await;
+            let third =
+                post_json_with(&app, &approve_path(&again), json!({}), None, Some(&token)).await;
+            assert_eq!(third.json()["fund"]["request"], again, "{}", third.body);
         }
 
         #[tokio::test]
