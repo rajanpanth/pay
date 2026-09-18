@@ -254,9 +254,15 @@ impl AppState {
     /// The consent page for a pending authorization: `/connect` on the
     /// pages app when configured, else the embedded `/authorize`.
     pub fn consent_page_url(&self, request_id: &str) -> String {
+        format!("{}?request={request_id}", self.consent_page())
+    }
+
+    /// The consent page itself, where a guest also attaches a wallet
+    /// (`?link=<ticket>`).
+    pub fn consent_page(&self) -> String {
         match &self.pages_url {
-            Some(pages) => format!("{pages}/connect?request={request_id}"),
-            None => format!("{}/authorize?request={request_id}", self.public_url),
+            Some(pages) => format!("{pages}/connect"),
+            None => format!("{}/authorize", self.public_url),
         }
     }
 
@@ -416,6 +422,8 @@ pub fn router(state: AppState) -> Router {
             post(oauth::approve),
         )
         .route("/api/oauth/authorize/{request}/deny", post(oauth::deny))
+        .route("/api/oauth/link/{ticket}", get(oauth::link_view))
+        .route("/api/oauth/link/{ticket}", post(oauth::link_complete))
         .route("/api/session/logout", post(oauth::sign_out));
     #[cfg(feature = "coinflow")]
     let router = router
@@ -429,8 +437,10 @@ pub fn router(state: AppState) -> Router {
                 cfg,
                 oauth: state.oauth.clone(),
             },
-            Arc::new(tenants::CloudContext::new(state.tenants.clone()))
-                as Arc<dyn pay_mcp::PayContext>,
+            Arc::new(
+                tenants::CloudContext::new(state.tenants.clone())
+                    .with_link_page(state.consent_page()),
+            ) as Arc<dyn pay_mcp::PayContext>,
         )
     });
     let router = router.with_state(state);

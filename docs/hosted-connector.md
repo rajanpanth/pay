@@ -110,6 +110,17 @@ Done on `feat/pay-cloud`:
   or skipped. pay-cloud sends users there when `PAY_CLOUD_PAGES_URL` is
   set; the embedded pages remain the fallback until the new ones are
   verified live, then they go.
+- **Guests (2026-09-18).** The consent page offers "Continue as guest":
+  Approve with `{"guest": true}` mints a wallet-less `guest_…` subject and
+  the host connects normally. Catalog tools need no wallet; the first tool
+  call that would pay (`curl`, `get_balance`, `topup`) fails with a message
+  carrying a one-time link, `{pages}/connect?link=<ticket>` (30-minute
+  ticket, hash stored in the `TenantRegistry`). That page signs the user in
+  with Privy and `POST /api/oauth/link/{ticket}` attaches the wallet to the
+  guest subject (and binds it under the Privy subject, cookie set), so the
+  host's existing tokens start paying. An empty wallet continues to the
+  onramp, then the user goes back and asks again. Sign-up and funding thus
+  happen the first time money is needed, not at connection time.
 - Not yet: a `/connect` page for limits and revocation, Redis for OAuth
   state and MCP sessions across replicas, funding from inside the consent
   flow (today `topup` hands the user the `/fund` URL), deployment, the

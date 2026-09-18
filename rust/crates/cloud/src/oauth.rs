@@ -823,23 +823,46 @@ pub struct FundNext {
 /// `POST /api/oauth/authorize/{request}/approve`: approve and send the
 /// browser back to the client with a code.
 ///
+/// Body of Approve. Empty means "as this browser's wallet".
+#[derive(Debug, Default, Deserialize)]
+pub struct ApproveBody {
+    /// Connect with no wallet. Catalog tools work; the first paying call
+    /// hands the user a link to attach a wallet.
+    #[serde(default)]
+    pub guest: bool,
+}
+
 /// Who approves is one of: a Privy user, when the request carries
 /// `Authorization: Bearer <privy access token>` (their Privy wallet is
-/// found or created and bound as the tenant); or the wallet this browser's
-/// subject cookie already names. A browser with neither creates a wallet
-/// through `/api/onboard/start` instead, which approves on completion.
+/// found or created and bound as the tenant); the wallet this browser's
+/// subject cookie already names; or a guest (`{"guest": true}`), who gets
+/// a fresh wallet-less subject. A browser with none of these creates a
+/// wallet through `/api/onboard/start` instead, which approves on
+/// completion.
 pub async fn approve(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     let store = oauth_of(&state)?;
+    let body: ApproveBody = serde_json::from_slice(&body).unwrap_or_default();
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|t| !t.is_empty());
+    if body.guest && bearer.is_none() {
+        let subject = format!("{}{}", crate::tenants::GUEST_PREFIX, &random_token()[..24]);
+        let (request, code) = store.approve(&id, &subject).ok_or_else(unknown_request)?;
+        tracing::info!(client_id = %request.client_id, %subject, "oauth authorization approved for a guest");
+        return Ok(Json(DecisionResponse {
+            redirect: Some(code_redirect(&request, &code)),
+            fund: None,
+        })
+        .into_response());
+    }
     let (subject, fresh_login, bound) = match bearer {
         Some(token) => {
             let (subject, bound) = approve_with_privy(&state, token).await?;
@@ -1144,6 +1167,99 @@ pub async fn token(
 pub struct RevokeForm {
     #[serde(default)]
     pub token: Option<String>,
+}
+
+/// What the link page shows for a guest's ticket.
+#[derive(Debug, Serialize)]
+pub struct LinkView {
+    /// The ticket names a wallet-less (guest) connection.
+    pub guest: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub privy: Option<PrivyLogin>,
+}
+
+fn unknown_link() -> ApiError {
+    ApiError::new(
+        StatusCode::NOT_FOUND,
+        "unknown_link",
+        "This link is unknown, used, or expired. Ask your MCP client to pay again to get a fresh one.",
+    )
+}
+
+/// `GET /api/oauth/link/{ticket}`: is this ticket live, and how to sign in.
+pub async fn link_view(
+    State(state): State<AppState>,
+    Path(ticket): Path<String>,
+) -> Result<Json<LinkView>, ApiError> {
+    let subject = state
+        .tenants()
+        .peek_link(&ticket)
+        .ok_or_else(unknown_link)?;
+    Ok(Json(LinkView {
+        guest: state.tenants().get(&subject).is_none(),
+        privy: privy_login(&state),
+    }))
+}
+
+/// The wallet now behind a linked connection.
+#[derive(Debug, Serialize)]
+pub struct LinkResult {
+    pub address: String,
+    /// False when the wallet holds nothing and the page should offer the
+    /// onramp before the user goes back to the host.
+    pub funded: bool,
+}
+
+/// `POST /api/oauth/link/{ticket}` with `Authorization: Bearer <privy
+/// access token>`: attach the signed-in user's wallet to the guest
+/// connection the ticket names. The guest's existing tokens now pay from
+/// that wallet; the browser is remembered as that user.
+pub async fn link_complete(
+    State(state): State<AppState>,
+    Path(ticket): Path<String>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "login_required",
+                "Sign in to link a wallet.",
+            )
+        })?;
+    // Check the ticket before touching Privy, consume it only on success.
+    let guest = state
+        .tenants()
+        .peek_link(&ticket)
+        .ok_or_else(unknown_link)?;
+    let (subject, bound) = approve_with_privy(&state, token).await?;
+    let record = state.tenants().get(&subject).ok_or_else(unknown_request)?;
+    state
+        .tenants()
+        .take_link(&ticket)
+        .ok_or_else(unknown_link)?;
+    let mut linked = (*record).clone();
+    linked.subject = guest.clone();
+    state.tenants().bind(linked);
+    tracing::info!(%guest, %subject, address = %record.pubkey, "guest connection linked to a wallet");
+    let funded = !(funding_enabled(&state)
+        && (bound == Some(Bound::Created)
+            || state.wallet_probe().holds_nothing(&record.pubkey).await));
+    let mut response = Json(LinkResult {
+        address: record.pubkey.clone(),
+        funded,
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        crate::tenants::cookie::set(&subject, state.public_url().starts_with("https://")),
+    );
+    Ok(response)
 }
 
 /// `POST /api/session/logout`: forget this browser's wallet cookie, so the
@@ -1537,6 +1653,14 @@ mod tests {
 
     /// The MCP `topup` tool for this bearer: its text names the wallet.
     async fn topup_text(app: &Router, access: &str) -> String {
+        let message = topup_message(app, access).await;
+        let result = &message["result"];
+        assert_ne!(result["isError"], true, "{message}");
+        result["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    /// The raw JSON-RPC reply to a `topup` call, result or error.
+    async fn topup_message(app: &Router, access: &str) -> Value {
         let init = send(
             app,
             Request::builder()
@@ -1585,9 +1709,7 @@ mod tests {
         )
         .await;
         assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-        let result = &crate::mcp::tests::sse_json(&r.body)[0]["result"];
-        assert_ne!(result["isError"], true, "{}", r.body);
-        result["content"][0]["text"].as_str().unwrap().to_string()
+        crate::mcp::tests::sse_json(&r.body)[0].clone()
     }
 
     async fn post_json(app: &Router, path: &str, body: Value) -> Reply {
@@ -2434,6 +2556,98 @@ mod tests {
             assert_eq!(third.status, StatusCode::OK, "{}", third.body);
             assert!(third.json()["redirect"].as_str().unwrap().contains("code="));
             assert_eq!(mock.created.lock().unwrap().len(), 1);
+        }
+
+        /// A guest connects with no wallet, browses, and is handed a link the
+        /// first time a call needs to pay. Signing in there attaches a wallet
+        /// to the guest connection, whose tokens keep working.
+        #[tokio::test]
+        async fn a_guest_connects_and_links_a_wallet_when_paying() {
+            let (app, state, fake, mock) = privy_app().await;
+            let client_id = register_grok(&app).await;
+            let request_id = start_authorization(&app, &client_id, None).await;
+
+            let approved = post_json_as(
+                &app,
+                &approve_path(&request_id),
+                json!({ "guest": true }),
+                None,
+            )
+            .await;
+            assert_eq!(approved.status, StatusCode::OK, "{}", approved.body);
+            assert!(
+                approved.headers.get(header::SET_COOKIE).is_none(),
+                "guests get no cookie"
+            );
+            assert!(state.tenants().is_empty(), "no wallet bound");
+            let redirect = Url::parse(approved.json()["redirect"].as_str().unwrap()).unwrap();
+            let code = redirect
+                .query_pairs()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v.into_owned())
+                .unwrap();
+            let tokens = post_form(
+                &app,
+                "/oauth/token",
+                &[
+                    ("grant_type", "authorization_code"),
+                    ("client_id", &client_id),
+                    ("code", &code),
+                    ("code_verifier", VERIFIER),
+                    ("redirect_uri", GROK_REDIRECT),
+                ],
+            )
+            .await;
+            assert_eq!(tokens.status, StatusCode::OK, "{}", tokens.body);
+            let access = tokens.json()["access_token"].as_str().unwrap().to_string();
+
+            // Paying needs a wallet: the error carries a one-time link.
+            let refused = topup_message(&app, &access).await;
+            let message = refused["error"]["message"].as_str().unwrap().to_string();
+            assert!(
+                message.contains("https://cloud.test/authorize?link="),
+                "{message}"
+            );
+            let ticket = message
+                .split("?link=")
+                .nth(1)
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .to_string();
+            let view = get(&app, &format!("/api/oauth/link/{ticket}")).await;
+            assert_eq!(view.status, StatusCode::OK, "{}", view.body);
+            assert_eq!(view.json()["guest"], true);
+            assert_eq!(view.json()["privy"]["app_id"], "app_test");
+
+            // No sign-in, no link.
+            let anon =
+                post_json_as(&app, &format!("/api/oauth/link/{ticket}"), json!({}), None).await;
+            assert_eq!(anon.status, StatusCode::UNAUTHORIZED, "{}", anon.body);
+
+            // Sign in with Privy on the link page: a wallet is created and
+            // attached to the guest connection; the browser is remembered.
+            let token = fake.token_for(USER);
+            let linked = post_json_with(
+                &app,
+                &format!("/api/oauth/link/{ticket}"),
+                json!({}),
+                None,
+                Some(&token),
+            )
+            .await;
+            assert_eq!(linked.status, StatusCode::OK, "{}", linked.body);
+            assert_eq!(linked.json()["address"], ADDRESS);
+            assert_eq!(linked.json()["funded"], true, "no funding configured");
+            assert!(cookie_of(&linked).starts_with("pay_subject=sub_"));
+            assert_eq!(mock.created.lock().unwrap().len(), 1);
+            assert_eq!(state.tenants().len(), 2, "guest subject and privy subject");
+
+            // The guest's token now pays from that wallet; the ticket is spent.
+            assert!(topup_text(&app, &access).await.contains(ADDRESS));
+            let spent = get(&app, &format!("/api/oauth/link/{ticket}")).await;
+            assert_eq!(spent.status, StatusCode::NOT_FOUND);
         }
 
         /// An existing wallet that pay-api reports empty is funded first too,

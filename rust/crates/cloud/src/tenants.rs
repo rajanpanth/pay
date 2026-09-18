@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use pay_core::accounts::{Account, AccountsFile, AccountsStore, BackendKind, MAINNET_NETWORK};
 use pay_core::remote::{CredentialSource, Credentials, MemoryCredentials};
@@ -29,6 +30,18 @@ pub const DEFAULT_POLICY: SpendPolicy = SpendPolicy {
 
 /// Account name a connector wallet carries in prompts and receipts.
 pub const CONNECTOR_ACCOUNT: &str = "connector";
+
+/// How long a wallet-link ticket handed to a guest stays valid.
+pub const LINK_TTL: Duration = Duration::from_secs(30 * 60);
+/// Most link tickets held at once; expired ones are swept when full.
+const MAX_LINKS: usize = 4096;
+
+/// Subjects minted for guests: connected, no wallet yet.
+pub const GUEST_PREFIX: &str = "guest_";
+
+pub fn is_guest(subject: &str) -> bool {
+    subject.starts_with(GUEST_PREFIX)
+}
 
 /// The subject for a provider account: stable across sign-ins and
 /// browsers, opaque, and not reversible to the provider's id. This is the
@@ -91,9 +104,18 @@ impl TenantRecord {
     }
 }
 
-/// Every bound tenant, by subject.
+/// A one-time ticket letting a browser attach a wallet to a subject that
+/// has none: minted when a guest's tool call needs to pay, redeemed by the
+/// pages app after a sign-in. Keyed by the ticket's hash.
+struct LinkTicket {
+    subject: String,
+    created_at: Instant,
+}
+
+/// Every bound tenant, by subject, plus the link tickets outstanding.
 pub struct TenantRegistry {
     tenants: Mutex<HashMap<String, Arc<TenantRecord>>>,
+    links: Mutex<HashMap<String, LinkTicket>>,
     ledger: Arc<dyn SpendLedger>,
 }
 
@@ -111,8 +133,49 @@ impl TenantRegistry {
     pub fn with_ledger(ledger: Arc<dyn SpendLedger>) -> Self {
         Self {
             tenants: Mutex::default(),
+            links: Mutex::default(),
             ledger,
         }
+    }
+
+    /// A fresh ticket for `subject`; `None` when the table is full of live
+    /// tickets. The plaintext goes into the tool error, only its hash stays.
+    pub fn mint_link(&self, subject: &str) -> Option<String> {
+        let ticket = crate::onboard::random_token();
+        let now = Instant::now();
+        let mut links = self.links.lock().unwrap();
+        if links.len() >= MAX_LINKS {
+            links.retain(|_, t| now.saturating_duration_since(t.created_at) <= LINK_TTL);
+            if links.len() >= MAX_LINKS {
+                return None;
+            }
+        }
+        links.insert(
+            crate::onboard::sha256_hex(&ticket),
+            LinkTicket {
+                subject: subject.to_string(),
+                created_at: now,
+            },
+        );
+        Some(ticket)
+    }
+
+    /// The subject a live ticket is for, without consuming it.
+    pub fn peek_link(&self, ticket: &str) -> Option<String> {
+        let links = self.links.lock().unwrap();
+        let t = links.get(&crate::onboard::sha256_hex(ticket))?;
+        (Instant::now().saturating_duration_since(t.created_at) <= LINK_TTL)
+            .then(|| t.subject.clone())
+    }
+
+    /// Consume a live ticket.
+    pub fn take_link(&self, ticket: &str) -> Option<String> {
+        let t = self
+            .links
+            .lock()
+            .unwrap()
+            .remove(&crate::onboard::sha256_hex(ticket))?;
+        (Instant::now().saturating_duration_since(t.created_at) <= LINK_TTL).then_some(t.subject)
     }
 
     /// Bind (or rebind) a subject to a wallet.
@@ -238,11 +301,42 @@ pub mod cookie {
 /// pay-mcp context for the hosted connector.
 pub struct CloudContext {
     registry: Arc<TenantRegistry>,
+    /// The page where a wallet-less subject attaches a wallet; the ticket
+    /// goes in `?link=`. `None` leaves the error without a link.
+    link_page: Option<String>,
 }
 
 impl CloudContext {
     pub fn new(registry: Arc<TenantRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            link_page: None,
+        }
+    }
+
+    /// Point wallet-less callers at `page` (`https://pay.sh/connect`).
+    pub fn with_link_page(mut self, page: impl Into<String>) -> Self {
+        self.link_page = Some(page.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// What a paying call tells a subject with no wallet. Guests get a
+    /// one-time link to attach one; the wording is for the host's user.
+    fn no_wallet_message(&self, subject: &str) -> String {
+        let link = self
+            .link_page
+            .as_deref()
+            .and_then(|page| Some(format!("{page}?link={}", self.registry.mint_link(subject)?)));
+        match link {
+            Some(url) => format!(
+                "This connection has no pay wallet yet, so it cannot pay for this call. \
+                 Set one up in a minute at {url} (sign in with your email, add USDC with a \
+                 card), then ask again. Browsing the catalog works without a wallet."
+            ),
+            None => "This connection has no wallet yet. Finish setting up your pay account at \
+                     cloud.pay.sh, then try again."
+                .to_string(),
+        }
     }
 }
 
@@ -263,12 +357,7 @@ impl PayContext for CloudContext {
             )
         })?;
         let record = self.registry.get(&tenant.id).ok_or_else(|| {
-            rmcp::ErrorData::invalid_request(
-                "This connection has no wallet yet. Finish setting up your pay account at \
-                 cloud.pay.sh, then try again."
-                    .to_string(),
-                None,
-            )
+            rmcp::ErrorData::invalid_request(self.no_wallet_message(&tenant.id), None)
         })?;
         Ok(CallScope {
             accounts: Arc::new(TenantAccounts::new(&record)),
@@ -393,6 +482,18 @@ mod tests {
             "sk_rotated"
         );
         assert!(registry.update_credentials("sub_x", |_| {}).is_none());
+    }
+
+    #[test]
+    fn link_tickets_are_single_use_and_name_their_subject() {
+        let registry = TenantRegistry::new();
+        let ticket = registry.mint_link("guest_1").unwrap();
+        assert!(ticket.len() >= 32);
+        assert_eq!(registry.peek_link(&ticket).as_deref(), Some("guest_1"));
+        assert_eq!(registry.take_link(&ticket).as_deref(), Some("guest_1"));
+        assert!(registry.peek_link(&ticket).is_none(), "consumed");
+        assert!(registry.take_link("nope").is_none());
+        assert!(is_guest("guest_abc") && !is_guest("sub_abc"));
     }
 
     #[test]
