@@ -46,6 +46,16 @@ land at that address without leaving pay's own surfaces.
    `customPayInFees` line for later purchases, locked in the checkout token.
 3. A webhook endpoint (`https://cloud.pay.sh/api/fund/webhook`) with an
    `Authorization` value we generate, mirrored into `COINFLOW_WEBHOOK_KEY`.
+4. Direct card entry on our own pages (the SDK's `CoinflowCardNumberInput`
+   and `CoinflowCvvInput`, TokenEx fields) needs the page origins on the
+   merchant's referrer allowlist: `https://pay.sh`, `https://cloud.pay.sh`
+   and `http://localhost:3000` for development. Verified 2026-09-18: the
+   sandbox merchant answers `Referrer … not allowed for merchant
+   solana-foundation` (HTTP 401) on `POST /api/tokenize/iframe/config` for
+   every origin but `sandbox.coinflow.cash`, so the fields never load.
+   Coinflow's PCI page says this path also needs SAQ A-EP. Until then pages
+   embed the hosted checkout for cards (`COINFLOW_CARD_ENTRY=hosted`, the
+   default); `direct` switches to our own fields.
 
 ## What we have today
 

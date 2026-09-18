@@ -2384,6 +2384,7 @@ mod tests {
                 webhook_key: None,
                 settle_to_customer: false,
                 api_url: "http://127.0.0.1:1".to_string(),
+                card_entry: crate::funding::CardEntry::Hosted,
             };
             let state = AppState::with_drivers("https://cloud.test", vec![])
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))
@@ -2457,6 +2458,7 @@ mod tests {
                 webhook_key: None,
                 settle_to_customer: false,
                 api_url: "http://127.0.0.1:1".to_string(),
+                card_entry: crate::funding::CardEntry::Hosted,
             };
             let state = AppState::with_drivers("https://cloud.test", vec![])
                 .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]))

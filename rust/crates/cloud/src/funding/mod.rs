@@ -49,6 +49,11 @@ pub const MERCHANT_ID_ENV: &str = "COINFLOW_MERCHANT_ID";
 pub const WEBHOOK_KEY_ENV: &str = "COINFLOW_WEBHOOK_KEY";
 pub const SETTLE_TO_CUSTOMER_ENV: &str = "COINFLOW_SETTLE_TO_CUSTOMER";
 pub const API_URL_ENV: &str = "COINFLOW_API_URL";
+/// `hosted` (default) or `direct`: whether pages embed Coinflow's hosted
+/// checkout in an iframe, or render card fields themselves through the
+/// Coinflow SDK (TokenEx). Direct entry needs the page's origin on the
+/// merchant's referrer allowlist at Coinflow and PCI SAQ A-EP.
+pub const CARD_ENTRY_ENV: &str = "COINFLOW_CARD_ENTRY";
 
 /// Coinflow environment. Decides the API host and the origin of the hosted
 /// checkout page the browser must trust.
@@ -98,6 +103,19 @@ pub struct Config {
     pub settle_to_customer: bool,
     /// Coinflow API base; the environment's host unless overridden for tests.
     pub api_url: String,
+    /// How pages collect the card.
+    pub card_entry: CardEntry,
+}
+
+/// Where card details are typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardEntry {
+    /// Coinflow's hosted checkout page in an iframe; works from any origin.
+    Hosted,
+    /// The page's own fields via the Coinflow SDK; the origin must be on
+    /// the merchant's allowlist at Coinflow.
+    Direct,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +124,8 @@ pub enum ConfigError {
     BadEnv(String),
     #[error("{MERCHANT_ID_ENV} is required when {API_KEY_ENV} is set")]
     MissingMerchant,
+    #[error("{CARD_ENTRY_ENV} must be `hosted` or `direct`, got `{0}`")]
+    BadCardEntry(String),
 }
 
 impl Config {
@@ -124,6 +144,14 @@ impl Config {
         let settle_to_customer = std::env::var(SETTLE_TO_CUSTOMER_ENV)
             .ok()
             .is_some_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"));
+        let card_entry = match non_empty(std::env::var(CARD_ENTRY_ENV).ok()) {
+            None => CardEntry::Hosted,
+            Some(raw) => match raw.to_ascii_lowercase().as_str() {
+                "hosted" => CardEntry::Hosted,
+                "direct" => CardEntry::Direct,
+                _ => return Err(ConfigError::BadCardEntry(raw)),
+            },
+        };
         Ok(Some(Self {
             api_key,
             env,
@@ -133,6 +161,7 @@ impl Config {
             api_url: non_empty(std::env::var(API_URL_ENV).ok())
                 .map(|u| u.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| env.api_url().to_string()),
+            card_entry,
         }))
     }
 
@@ -487,6 +516,9 @@ pub struct StartResponse {
     pub settlement: Settlement,
     pub payment_methods: &'static [&'static str],
     pub expires_in_minutes: u32,
+    /// Whether the page should embed the hosted checkout or render its
+    /// own card fields.
+    pub card_entry: CardEntry,
 }
 
 fn funding_of(state: &AppState) -> Result<&Funding, ApiError> {
@@ -598,6 +630,7 @@ pub async fn start(
         settlement,
         payment_methods: PAYMENT_METHODS,
         expires_in_minutes: LINK_TTL_MINUTES,
+        card_entry: cfg.card_entry,
     }))
 }
 
@@ -742,6 +775,7 @@ mod tests {
 
     fn test_config(api_url: &str) -> Config {
         Config {
+            card_entry: CardEntry::Hosted,
             api_key: "coinflow_sandbox_test".to_string(),
             env: Env::Sandbox,
             merchant_id: "solana-foundation".to_string(),
@@ -1013,6 +1047,7 @@ mod tests {
         assert_eq!(res["checkout_origin"], "https://sandbox.coinflow.cash");
         assert_eq!(res["env"], "sandbox");
         assert_eq!(res["settlement"], "merchant");
+        assert_eq!(res["card_entry"], "hosted");
         assert_eq!(res["quote"]["total_cents"], 2170);
         assert_eq!(res["quote"]["card_fee_cents"], 111);
         assert_eq!(res["quote"]["other_fee_cents"], 0);
