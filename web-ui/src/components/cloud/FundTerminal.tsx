@@ -1,13 +1,15 @@
 import { useEffect, useRef, useState } from "react";
+import { decisionTarget, type Decision } from "../../cloud/lib/authorize";
 import {
   AMOUNT_PRESETS_CENTS,
   DEFAULT_CENTS,
   buildFundStartRequest,
   buildReturnUrl,
+  continueLabel,
   explorerTxUrl,
   formatUsd,
+  isConnectorFunding,
   parseCoinflowMessage,
-  shortAddress,
   type FundParams,
   type FundStartResponse,
   type FundStatusResponse,
@@ -21,6 +23,11 @@ interface Props {
   start: (body: ReturnType<typeof buildFundStartRequest>) => Promise<FundStartResponse>;
   /** `GET /api/fund/{payment_id}`. */
   status: (paymentId: string) => Promise<FundStatusResponse>;
+  /**
+   * Connector origin: approve the pending OAuth request (by cookie) once the
+   * wallet is funded or funding is skipped; resolves to the host redirect.
+   */
+  approve?: (request: string) => Promise<Decision>;
 }
 
 /** How long the page waits for the on-chain signature before returning anyway. */
@@ -41,13 +48,25 @@ type Step =
  * terminal with the payment id. Only the address is needed, so it serves
  * every backend the same way.
  */
-export function FundTerminal({ params, start, status }: Props) {
+export function FundTerminal({ params, start, status, approve }: Props) {
   const [cents, setCents] = useState<number>(params.cents ?? DEFAULT_CENTS);
   const [step, setStep] = useState<Step>({ kind: "choose" });
   const [error, setError] = useState<string | null>(null);
+  const [leaving, setLeaving] = useState(false);
+  const connector = isConnectorFunding(params) && !!approve;
 
-  const who = params.account ? `${params.account} ` : "";
-  const command = `pay topup ${who}--amount ${formatUsd(cents).replace("$", "")}`;
+  /** Connector origin: approve the pending request and go back to the host. */
+  async function continueToClient() {
+    if (!connector || !params.request || !approve) return;
+    setError(null);
+    setLeaving(true);
+    try {
+      window.location.assign(decisionTarget(await approve(params.request), params.client ?? ""));
+    } catch (err) {
+      setLeaving(false);
+      setError(err instanceof Error ? err.message : "Could not return to your MCP client.");
+    }
+  }
 
   async function handleContinue() {
     if (!params.address) return;
@@ -64,7 +83,7 @@ export function FundTerminal({ params, start, status }: Props) {
 
   if (!params.address) {
     return (
-      <Shell command="pay topup">
+      <Shell>
         <div className="cloud-term-line cloud-term-line--error" role="alert">
           error: this page needs an address. Open it from <code>pay topup</code>.
         </div>
@@ -80,17 +99,13 @@ export function FundTerminal({ params, start, status }: Props) {
         cents={step.cents}
         paymentId={step.paymentId}
         status={status}
+        onContinue={connector ? continueToClient : undefined}
       />
     );
   }
 
   return (
-    <Shell command={command}>
-      <div className="cloud-term-line cloud-term-line--muted">
-        Funding {shortAddress(params.address)}
-        {params.cli ? ` · pay ${params.cli}` : ""}
-      </div>
-
+    <Shell>
       {step.kind === "checkout" ? (
         <Checkout
           checkout={step.checkout}
@@ -105,6 +120,13 @@ export function FundTerminal({ params, start, status }: Props) {
         />
       ) : (
         <div className="cloud-term-lines">
+          {connector && (
+            <div className="cloud-term-line cloud-term-line--muted">
+              Your pay wallet is ready: {params.address}. It is empty, so add some USDC before
+              {" "}
+              {params.client ?? "your MCP client"} starts paying for calls.
+            </div>
+          )}
           <div className="cloud-term-line">
             <span className="cloud-term-prompt">›</span> How much USDC do you want to start with?
           </div>
@@ -139,11 +161,22 @@ export function FundTerminal({ params, start, status }: Props) {
             >
               {step.kind === "starting" ? "Preparing checkout…" : "Continue"}
             </button>
-            <span className="cloud-term-hint">
-              {params.callback
-                ? "Your terminal is waiting for this page."
-                : "Return to your terminal when you are done."}
-            </span>
+            {connector ? (
+              <button
+                type="button"
+                className="cloud-term-button cloud-term-button--ghost"
+                disabled={step.kind === "starting" || leaving}
+                onClick={continueToClient}
+              >
+                {leaving ? "Returning…" : `Skip, ${continueLabel(params).toLowerCase()}`}
+              </button>
+            ) : (
+              <span className="cloud-term-hint">
+                {params.callback
+                  ? "Your terminal is waiting for this page."
+                  : "Return to your terminal when you are done."}
+              </span>
+            )}
           </div>
         </div>
       )}
@@ -157,19 +190,14 @@ export function FundTerminal({ params, start, status }: Props) {
   );
 }
 
-function Shell({ command, children }: { command: string; children: React.ReactNode }) {
+function Shell({ children }: { children: React.ReactNode }) {
   return (
     <section className="cloud-term" aria-label="pay topup">
       <div className="cloud-term-banner">
         <PayWordmark />
         <div className="cloud-term-tagline">Toolchain for agentic payments</div>
       </div>
-      <div className="cloud-term-lines">
-        <div className="cloud-term-line">
-          <span className="cloud-term-prompt">$</span> {command}
-        </div>
-        {children}
-      </div>
+      {children}
     </section>
   );
 }
@@ -261,12 +289,15 @@ function Completion({
   cents,
   paymentId,
   status,
+  onContinue,
 }: {
   params: FundParams;
   checkout: FundStartResponse;
   cents: number;
   paymentId: string;
   status: (paymentId: string) => Promise<FundStatusResponse>;
+  /** Connector origin: approve and return to the host once the USDC landed. */
+  onContinue?: () => Promise<void>;
 }) {
   const [lines, setLines] = useState<ProgressLine[]>([
     { text: `Charged ${formatUsd(checkout.quote.total_cents)}`, state: "done" },
@@ -282,7 +313,10 @@ function Completion({
       const sent: ProgressLine = signature
         ? { text: `Confirmed: ${explorerTxUrl(signature, checkout.env)}`, state: "done" }
         : { text: "USDC is on its way; your terminal will confirm the transfer.", state: "done" };
-      if (params.callback) {
+      if (onContinue) {
+        setLines((l) => [l[0], sent, { text: `${continueLabel(params)}…`, state: "active" }]);
+        void onContinue();
+      } else if (params.callback) {
         setLines((l) => [l[0], sent, { text: "Returning to your terminal", state: "active" }]);
         window.location.assign(buildReturnUrl(params.callback, params.state, paymentId, signature));
       } else {
@@ -315,7 +349,8 @@ function Completion({
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- onContinue is stable for the page's life
   }, [paymentId, params.callback, params.state, params.address, checkout.env, status]);
 
-  return <TerminalProgress title="pay topup" lines={lines} />;
+  return <TerminalProgress title={onContinue ? "pay connect" : "pay topup"} lines={lines} />;
 }

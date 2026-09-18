@@ -8,6 +8,8 @@ import {
   parseCoinflowMessage,
   parseFundParams,
   shortAddress,
+  continueLabel,
+  isConnectorFunding,
 } from "./fund";
 
 const ADDRESS = "CcZFhGwFVkZevr555EZJpWbeq4irboT6zHfrSKWKCy3Z";
@@ -131,5 +133,15 @@ describe("formatting", () => {
     expect(explorerTxUrl("5ig", "sandbox")).toBe(
       "https://explorer.solana.com/tx/5ig?cluster=devnet",
     );
+  });
+
+  it("recognises the connector continuation", () => {
+    const p = parseFundParams("?address=Fg6Pa&request=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk&client=Claude");
+    expect(p.request).toBe("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk");
+    expect(isConnectorFunding(p)).toBe(true);
+    expect(continueLabel(p)).toBe("Continue to Claude");
+    expect(isConnectorFunding(parseFundParams("?address=Fg6Pa"))).toBe(false);
+    expect(isConnectorFunding(parseFundParams("?address=Fg6Pa&request=short"))).toBe(false);
+    expect(continueLabel(parseFundParams("?address=Fg6Pa"))).toBe("Continue to your MCP client");
   });
 });

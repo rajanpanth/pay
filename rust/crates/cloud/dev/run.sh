@@ -90,7 +90,7 @@ pkill -f 'dev/mock_openfort.py' 2>/dev/null || true
 
 if [ -f "$ROOT/.env" ]; then
   set -a; . "$ROOT/.env"; set +a
-  step "Loaded $ROOT/.env (Coinflow: ${COINFLOW_ENV:-unset})"
+  step "Loaded $ROOT/.env (Coinflow: ${COINFLOW_ENV:-unset}; Privy: ${PRIVY_APP_ID:-off})"
 fi
 
 if [ "$REAL_OPENFORT" = 0 ]; then
@@ -153,6 +153,7 @@ $( [ -n "$STATIC_TOKEN" ] && printf '  Header-authenticated host (Grok custom co
 
   Pages:  $PUBLIC_URL/onboard   $PUBLIC_URL/fund?address=<pubkey>   $PUBLIC_URL/authorize
   OAuth:  $PUBLIC_URL/.well-known/oauth-authorization-server
+$( if [ -n "${PRIVY_APP_ID:-}" ]; then printf '  Privy:  consent page signs users in with app %s; wallets get signer %s\n' "$PRIVY_APP_ID" "${PRIVY_SIGNER_ID:-?}"; else printf '  Privy:  off (set PRIVY_APP_ID, PRIVY_APP_SECRET, PRIVY_VERIFICATION_KEY,\n          PRIVY_AUTHORIZATION_PRIVATE_KEY, PRIVY_SIGNER_ID in .env)\n'; fi )
 
 $( if [ "$FUNNEL" = 1 ]; then printf '  Grok custom connector URL:  %s/mcp   (stable: Tailscale Funnel)\n' "$PUBLIC_URL"; elif [ "$TUNNEL" = 1 ]; then printf '  Grok custom connector URL:  %s/mcp\n  (quick tunnels get a new hostname each start; re-add the connector after a restart)\n' "$PUBLIC_URL"; else printf '  For Grok itself you need a public HTTPS URL: rerun with --funnel (Tailscale) or --tunnel (cloudflared),\n  or pass --public-url https://<your-host> behind your own proxy.\n'; fi )
   Ctrl-C stops everything.

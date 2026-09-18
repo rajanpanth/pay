@@ -81,10 +81,39 @@ Done on `feat/pay-cloud`:
   custom schemes only for a known host. Registrations record the host, and
   the consent page names it. Adding a host is one entry; the OAuth server
   itself has no per-host branches.
-- Not yet: persisting tenants and OAuth state (Postgres, credentials
-  encrypted at rest with a KEK from Secret Manager), a `/connect` page for
-  limits and revocation, Redis MCP sessions, funding from inside the
-  consent flow (today `topup` hands the user the `/fund` URL), deployment.
+- **Privy as identity and wallet (2026-09-17).** Decision 11 below. The
+  consent page signs the user in with Privy (`@privy-io/react-auth`, app id
+  served by `GET /api/oauth/authorize/{request}` as `privy.app_id`) and
+  posts the access token as `Authorization: Bearer` to `/approve`.
+  pay-cloud verifies it offline (ES256, `PRIVY_VERIFICATION_KEY`, audience
+  the app id, issuer `privy.io`), takes the DID as the tenant subject
+  (`subject_for("privy", did)`), finds the user's embedded Solana wallet or
+  creates one owned by the user with pay's key quorum as an additional
+  signer and `PRIVY_POLICY_ID`, and binds the tenant. A wallet that predates
+  pay and does not list pay's signer answers `409 signer_required` with the
+  address; the page adds the signer with Privy's `useSigners().addSigners`
+  (only the owner can) and retries. Signing goes through pay-core's new
+  `privy` `RemoteProvider` (solana-keychain `PrivySigner`, fields `app_id`,
+  `app_secret`, `authorization_key`), the same three operator credentials
+  for every tenant. Tested end to end against a mock Privy: register, sign
+  in, wallet created with the signer, code, tokens, `topup` naming the
+  wallet; returning user by cookie and by token; forged token 401; foreign
+  wallet 409. Live against a real Privy app: pending the dashboard set-up.
+- **Pages move to pay-web-ui (2026-09-18).** The consent page is
+  `/connect` in the pay.sh Next.js app (branch `feat/connect` there), with
+  a headless Privy sign-in (`useLoginWithEmail`: our own email and code
+  inputs, no Privy modal) and `/api/connect/*` route handlers proxying to
+  pay-cloud, forwarding `Authorization` and `Cookie` in and `Set-Cookie`
+  out so `pay_subject` lives on pay.sh. A new wallet continues to that
+  app's `/onramp` (Coinflow React SDK, card and Apple/Google Pay) with
+  `request` and `client`, which approves the pending request when funded
+  or skipped. pay-cloud sends users there when `PAY_CLOUD_PAGES_URL` is
+  set; the embedded pages remain the fallback until the new ones are
+  verified live, then they go.
+- Not yet: a `/connect` page for limits and revocation, Redis for OAuth
+  state and MCP sessions across replicas, funding from inside the consent
+  flow (today `topup` hands the user the `/fund` URL), deployment, the
+  xAI report (`docs/grok-connector-report.md`) sent.
 
 ## Milestone 1 status (2026-09-15)
 
@@ -297,6 +326,18 @@ freezes a tenant without moving funds.
     keeps each user on their own Openfort project. Build order for the Grok
     connector: A3 transport, A4 OAuth, A2 tenant context, A5 tenant store.
     A6 (the CLI signing through pay-cloud) is not needed for the connector.
+11. **Connector identity and wallet at Privy; no database for now
+    (2026-09-17).** Supersedes 10 for the connector. Per-tenant Openfort
+    credentials made pay-cloud a custodian of every user's project secret
+    and forced an encrypted store. With Privy the user owns the wallet,
+    pay's authorization key is one additional signer constrained by the
+    user's grant and Privy's policy, identity is Privy's signed token, and
+    pay-cloud holds only the app's operator credentials. The remaining
+    state (OAuth clients, codes, tokens, the daily spend counter) is short
+    lived and stays in memory behind the existing bounded stores; Redis
+    when there is more than one replica. The CLI path is unchanged: a
+    user's own Openfort project and local keychain. Openfort's embedded
+    wallet mode would fit the same shape if one vendor is preferred.
 
 ## Track A: pay-cloud service
 

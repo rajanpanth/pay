@@ -1,23 +1,28 @@
 import { useEffect, useState } from "react";
 import {
+  decisionTarget,
   describeScope,
   providerName,
   type Decision,
   type PendingView,
 } from "../../cloud/lib/authorize";
 import { PayWordmark } from "./PayWordmark";
+import { PrivyApprove } from "./PrivyApprove";
 
 interface Props {
   /** Pending request id from the URL, or null when missing/malformed. */
   requestId: string | null;
   load: (requestId: string) => Promise<PendingView>;
-  approve: (requestId: string) => Promise<Decision>;
+  /** Approve for this browser's wallet, or for the Privy user `privyToken` names. */
+  approve: (requestId: string, privyToken?: string) => Promise<Decision>;
   deny: (requestId: string) => Promise<Decision>;
   /** Create a wallet with a provider; resolves to the provider's consent URL. */
   createWallet: (requestId: string, provider: string) => Promise<string>;
+  /** Forget this browser's wallet cookie, so the page asks for a sign-in. */
+  signOut: () => Promise<void>;
 }
 
-type Choice = "approve" | "deny" | `create:${string}`;
+type Choice = "approve" | "privy" | "deny" | `create:${string}`;
 
 type Phase =
   | { kind: "loading" }
@@ -31,7 +36,14 @@ type Phase =
  * Approve sends the browser back to the host with a code; Deny sends it
  * back with an error. Nothing else happens on this page.
  */
-export function AuthorizeTerminal({ requestId, load, approve, deny, createWallet }: Props) {
+export function AuthorizeTerminal({
+  requestId,
+  load,
+  approve,
+  deny,
+  createWallet,
+  signOut,
+}: Props) {
   const [phase, setPhase] = useState<Phase>(
     requestId
       ? { kind: "loading" }
@@ -55,13 +67,29 @@ export function AuthorizeTerminal({ requestId, load, approve, deny, createWallet
     };
   }, [requestId, load]);
 
+  /** Approve as a signed-in Privy user; server refusals propagate to the caller. */
+  async function approveWithPrivy(view: PendingView, token: string) {
+    if (!requestId) return;
+    setPhase({ kind: "deciding", view, choice: "privy" });
+    try {
+      // A brand-new wallet goes to the funding page first; it approves
+      // the request itself and then returns to the host.
+      const next = decisionTarget(await approve(requestId, token), view.client_name);
+      setPhase({ kind: "redirecting", choice: "privy" });
+      window.location.assign(next);
+    } catch (err) {
+      setPhase({ kind: "ready", view });
+      throw err;
+    }
+  }
+
   async function decide(view: PendingView, choice: Choice) {
     if (!requestId) return;
     setPhase({ kind: "deciding", view, choice });
     try {
       let next: string;
-      if (choice === "approve") next = (await approve(requestId)).redirect;
-      else if (choice === "deny") next = (await deny(requestId)).redirect;
+      if (choice === "approve") next = decisionTarget(await approve(requestId), view.client_name);
+      else if (choice === "deny") next = decisionTarget(await deny(requestId), view.client_name);
       else next = await createWallet(requestId, choice.slice("create:".length));
       setPhase({ kind: "redirecting", choice });
       window.location.assign(next);
@@ -101,8 +129,24 @@ export function AuthorizeTerminal({ requestId, load, approve, deny, createWallet
             </div>
             {phase.view.has_wallet ? (
               <div className="cloud-term-line cloud-term-line--muted">
-                Paying from your pay wallet {phase.view.wallet_address}.
+                Paying from your pay wallet {phase.view.wallet_address}.{" "}
+                <button
+                  type="button"
+                  className="cloud-term-link"
+                  disabled={phase.kind === "deciding"}
+                  onClick={() => {
+                    void signOut().then(() => window.location.reload());
+                  }}
+                >
+                  not you? sign out
+                </button>
               </div>
+            ) : phase.view.privy ? (
+              <PrivyApprove
+                login={phase.view.privy}
+                busy={phase.kind === "deciding"}
+                onApprove={(token) => approveWithPrivy(phase.view, token)}
+              />
             ) : (
               <div className="cloud-term-line">
                 <span className="cloud-term-prompt">›</span> You need a pay wallet first. Sign
@@ -127,7 +171,7 @@ export function AuthorizeTerminal({ requestId, load, approve, deny, createWallet
                     : "Approve"}
                 </button>
               ) : (
-                phase.view.providers.map((provider) => (
+                (phase.view.privy ? [] : phase.view.providers).map((provider) => (
                   <button
                     key={provider}
                     type="button"
@@ -155,7 +199,7 @@ export function AuthorizeTerminal({ requestId, load, approve, deny, createWallet
 
         {phase.kind === "redirecting" && (
           <div className="cloud-term-line cloud-term-line--muted">
-            {phase.choice === "approve"
+            {phase.choice === "approve" || phase.choice === "privy"
               ? "✔ Approved. Returning to your MCP client…"
               : phase.choice === "deny"
                 ? "✖ Denied. Returning to your MCP client…"

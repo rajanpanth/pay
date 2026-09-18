@@ -40,6 +40,8 @@ pub mod hosts;
 pub mod mcp;
 #[cfg(feature = "mcp")]
 pub mod oauth;
+#[cfg(feature = "privy")]
+pub mod privy;
 #[cfg(feature = "mcp")]
 pub mod tenants;
 
@@ -75,6 +77,9 @@ pub struct AppState {
     by_state: Arc<Mutex<HashMap<String, String>>>,
     drivers: Arc<Vec<Box<dyn drivers::WalletDriver>>>,
     public_url: String,
+    /// Where the browser pages live when they are not the embedded ones:
+    /// the pay.sh web app, which proxies its API calls back here.
+    pages_url: Option<String>,
     /// Card purchases through Coinflow; `None` until configured.
     #[cfg(feature = "coinflow")]
     funding: Option<Arc<funding::Funding>>,
@@ -87,6 +92,9 @@ pub struct AppState {
     /// Wallets and policies behind connector subjects.
     #[cfg(feature = "mcp")]
     tenants: Arc<tenants::TenantRegistry>,
+    /// Privy login on the consent page; `None` until configured.
+    #[cfg(feature = "privy")]
+    privy: Option<Arc<privy::Privy>>,
 }
 
 impl AppState {
@@ -107,6 +115,7 @@ impl AppState {
             by_state: Arc::default(),
             drivers: Arc::new(drivers),
             public_url: public_url.into().trim_end_matches('/').to_string(),
+            pages_url: None,
             #[cfg(feature = "coinflow")]
             funding: None,
             #[cfg(feature = "mcp")]
@@ -115,7 +124,22 @@ impl AppState {
             oauth: None,
             #[cfg(feature = "mcp")]
             tenants: Arc::default(),
+            #[cfg(feature = "privy")]
+            privy: None,
         }
+    }
+
+    /// Offer Privy login on the consent page, with the user's Privy wallet
+    /// as the tenant's wallet.
+    #[cfg(feature = "privy")]
+    pub fn with_privy(mut self, privy: privy::Privy) -> Self {
+        self.privy = Some(Arc::new(privy));
+        self
+    }
+
+    #[cfg(feature = "privy")]
+    pub fn privy(&self) -> Option<&privy::Privy> {
+        self.privy.as_deref()
     }
 
     #[cfg(feature = "mcp")]
@@ -150,6 +174,22 @@ impl AppState {
 
     pub fn public_url(&self) -> &str {
         &self.public_url
+    }
+
+    /// Serve the consent page from `url` (the pay.sh web app) instead of the
+    /// embedded one. That app proxies `/api/oauth/*` and `/api/fund/*` here.
+    pub fn with_pages_url(mut self, url: impl Into<String>) -> Self {
+        self.pages_url = Some(url.into().trim_end_matches('/').to_string());
+        self
+    }
+
+    /// The consent page for a pending authorization: `/connect` on the
+    /// pages app when configured, else the embedded `/authorize`.
+    pub fn consent_page_url(&self, request_id: &str) -> String {
+        match &self.pages_url {
+            Some(pages) => format!("{pages}/connect?request={request_id}"),
+            None => format!("{}/authorize?request={request_id}", self.public_url),
+        }
     }
 
     /// Where a provider's consent page should send the browser back.
@@ -307,7 +347,8 @@ pub fn router(state: AppState) -> Router {
             "/api/oauth/authorize/{request}/approve",
             post(oauth::approve),
         )
-        .route("/api/oauth/authorize/{request}/deny", post(oauth::deny));
+        .route("/api/oauth/authorize/{request}/deny", post(oauth::deny))
+        .route("/api/session/logout", post(oauth::sign_out));
     #[cfg(feature = "coinflow")]
     let router = router
         .route("/api/fund/start", post(funding::start))

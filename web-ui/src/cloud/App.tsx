@@ -5,6 +5,8 @@ import { TerminalLink } from "../components/cloud/TerminalLink";
 import { TerminalProgress, type ProgressLine } from "../components/cloud/TerminalProgress";
 import { WelcomeCard } from "../components/cloud/WelcomeCard";
 import {
+  ApiRequestError,
+  approveHeaders,
   buildConnectorStartRequest,
   isAuthorizePath,
   parseAuthorizeRequest,
@@ -28,12 +30,17 @@ import {
 interface ApiError {
   error?: string;
   message?: string;
+  details?: Record<string, unknown>;
 }
 
-async function postJson<T>(path: string, body: unknown): Promise<T> {
+async function postJson<T>(
+  path: string,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Promise<T> {
   const res = await fetch(path, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
   });
   return unwrap<T>(res);
@@ -46,7 +53,12 @@ async function getJson<T>(path: string): Promise<T> {
 async function unwrap<T>(res: Response): Promise<T> {
   const json = (await res.json().catch(() => ({}))) as ApiError & T;
   if (!res.ok) {
-    throw new Error(json.message ?? `Request failed (${res.status})`);
+    throw new ApiRequestError(
+      json.message ?? `Request failed (${res.status})`,
+      json.error,
+      res.status,
+      json.details,
+    );
   }
   return json;
 }
@@ -73,7 +85,10 @@ export function App() {
         <AuthorizeTerminal
           requestId={parseAuthorizeRequest(window.location.search)}
           load={(id) => getJson<PendingView>(api(id))}
-          approve={(id) => postJson<Decision>(`${api(id)}/approve`, {})}
+          approve={(id, token) => postJson<Decision>(`${api(id)}/approve`, {}, approveHeaders(token))}
+          signOut={async () => {
+            await fetch("/api/session/logout", { method: "POST" });
+          }}
           deny={(id) => postJson<Decision>(`${api(id)}/deny`, {})}
           createWallet={async (id, provider) => {
             const res = await postJson<{ consent?: string }>(
@@ -95,6 +110,9 @@ export function App() {
           params={parseFundParams(window.location.search)}
           start={(body) => postJson<FundStartResponse>("/api/fund/start", body)}
           status={(id) => getJson<FundStatusResponse>(`/api/fund/${encodeURIComponent(id)}`)}
+          approve={(request) =>
+            postJson<Decision>(`/api/oauth/authorize/${encodeURIComponent(request)}/approve`, {})
+          }
         />
       </main>
     );

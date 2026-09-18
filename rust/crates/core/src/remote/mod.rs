@@ -31,6 +31,7 @@
 #[cfg(feature = "ledger")]
 pub mod ledger;
 pub mod openfort;
+pub mod privy;
 
 use std::collections::BTreeMap;
 
@@ -45,6 +46,7 @@ use crate::{Error, Result};
 /// The registered remote backends, by [`RemoteProvider::id`].
 static PROVIDERS: &[&dyn RemoteProvider] = &[
     &openfort::Openfort,
+    &privy::Privy,
     #[cfg(feature = "ledger")]
     &ledger::Ledger,
 ];
@@ -480,6 +482,7 @@ mod tests {
         assert_eq!(provider("openfort").map(|p| p.id()), Some("openfort"));
         assert!(provider("not-a-backend").is_none());
         assert!(provider_ids().contains(&"openfort"));
+        assert_eq!(provider("privy").map(|p| p.id()), Some("privy"));
     }
 
     /// Every registered provider must declare at least one credential and

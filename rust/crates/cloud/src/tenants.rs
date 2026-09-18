@@ -224,6 +224,15 @@ pub mod cookie {
         }
         HeaderValue::from_str(&cookie).expect("cookie is ascii")
     }
+
+    /// `Set-Cookie` that deletes the subject cookie.
+    pub fn clear(secure: bool) -> HeaderValue {
+        let mut cookie = format!("{NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+        if secure {
+            cookie.push_str("; Secure");
+        }
+        HeaderValue::from_str(&cookie).expect("cookie is ascii")
+    }
 }
 
 /// pay-mcp context for the hosted connector.
@@ -338,6 +347,10 @@ mod tests {
             "{text}"
         );
         assert!(!cookie::set("s", false).to_str().unwrap().contains("Secure"));
+        assert_eq!(
+            cookie::clear(true).to_str().unwrap(),
+            "pay_subject=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax; Secure"
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(

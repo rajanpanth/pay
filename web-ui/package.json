@@ -16,6 +16,7 @@
     "test:proxy": "tsx proxy/e2e.ts"
   },
   "dependencies": {
+    "@privy-io/react-auth": "^3.43.0",
     "@solana/kit": "^6.10.0",
     "@solana/mpp": "^0.5.2",
     "cors": "^2.8.6",

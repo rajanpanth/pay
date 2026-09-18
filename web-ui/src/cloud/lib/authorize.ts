@@ -17,6 +17,54 @@ export interface PendingView {
   wallet_address?: string;
   /** Wallet providers that can create one (`openfort`). */
   providers: string[];
+  /** Privy login offered by this server: sign in, then approve with the token. */
+  privy?: PrivyLogin;
+}
+
+export interface PrivyLogin {
+  app_id: string;
+  /** pay's key quorum id, the signer a user wallet must list. */
+  signer_id: string;
+  policy_id?: string;
+}
+
+/** A pay-cloud JSON error, with its machine-readable code and extras. */
+export class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string | undefined,
+    public readonly status: number,
+    public readonly details: Record<string, unknown> | undefined,
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
+}
+
+/** What the page must add to the user's wallet before approving again. */
+export interface SignerRequired {
+  address: string;
+  signerId: string;
+  policyIds: string[];
+}
+
+/**
+ * Approve answered `signer_required`: the user's Privy wallet predates pay
+ * and does not list pay's key as a signer. Returns what `addSigners` needs.
+ */
+export function signerRequired(err: unknown): SignerRequired | null {
+  if (!(err instanceof ApiRequestError) || err.code !== "signer_required") return null;
+  const d = err.details ?? {};
+  const address = typeof d.address === "string" ? d.address : "";
+  const signerId = typeof d.signer_id === "string" ? d.signer_id : "";
+  if (!address || !signerId) return null;
+  const policyId = typeof d.policy_id === "string" ? d.policy_id : null;
+  return { address, signerId, policyIds: policyId ? [policyId] : [] };
+}
+
+/** Headers for Approve when the user signed in with Privy. */
+export function approveHeaders(privyToken?: string | null): Record<string, string> {
+  return privyToken ? { authorization: `Bearer ${privyToken}` } : {};
 }
 
 /** Body of `POST /api/onboard/start` from the consent page. */
@@ -39,9 +87,28 @@ export function buildConnectorStartRequest(
   return { provider, authorization_request: requestId };
 }
 
-/** What Approve and Deny return. */
+/** What Approve and Deny return: where to go, or a wallet to fund first. */
 export interface Decision {
-  redirect: string;
+  redirect?: string;
+  /** The wallet was just created and is empty; fund it, then approve again. */
+  fund?: { address: string; request: string };
+}
+
+/** The funding page for a just-created wallet, continuing to the host afterwards. */
+export function fundContinuationUrl(
+  fund: { address: string; request: string },
+  clientName: string,
+): string {
+  const q = new URLSearchParams({ address: fund.address, request: fund.request });
+  if (clientName) q.set("client", clientName);
+  return `/fund?${q.toString()}`;
+}
+
+/** Where a decision sends the browser. Throws when the server sent neither field. */
+export function decisionTarget(decision: Decision, clientName: string): string {
+  if (decision.redirect) return decision.redirect;
+  if (decision.fund) return fundContinuationUrl(decision.fund, clientName);
+  throw new Error("The server did not say where to go next.");
 }
 
 /** `/authorize` or `/authorize/` and nothing else. */

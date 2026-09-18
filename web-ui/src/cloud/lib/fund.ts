@@ -22,6 +22,13 @@ export interface FundParams {
   cli?: string;
   /** Preselected amount in cents, when the CLI passes one. */
   cents?: number;
+  /**
+   * Connector origin: the pending OAuth request to approve once the wallet
+   * is funded (or funding is skipped). Set by the consent page, not the CLI.
+   */
+  request?: string;
+  /** Connector origin: the host's name, for "Continue to Claude". */
+  client?: string;
 }
 
 /** Amounts offered on the page, in USD cents. */
@@ -82,7 +89,19 @@ export function parseFundParams(search: string): FundParams {
     account: pick("account"),
     cli: pick("cli"),
     cents: Number.isInteger(cents) && cents > 0 ? cents : undefined,
+    request: pick("request"),
+    client: pick("client"),
   };
+}
+
+/** The page was reached from the consent flow and must approve when done. */
+export function isConnectorFunding(params: FundParams): boolean {
+  return !!params.request && /^[A-Za-z0-9_-]{16,128}$/.test(params.request);
+}
+
+/** Where the connector flow goes after funding, for the page's wording. */
+export function continueLabel(params: FundParams): string {
+  return `Continue to ${params.client?.trim() || "your MCP client"}`;
 }
 
 /** `/fund` or `/fund/` and nothing else. */

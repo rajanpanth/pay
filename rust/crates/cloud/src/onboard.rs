@@ -217,6 +217,9 @@ pub struct ApiError {
     pub status: StatusCode,
     pub error: &'static str,
     pub message: String,
+    /// Machine-readable extras for errors the page acts on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -225,7 +228,13 @@ impl ApiError {
             status,
             error,
             message: message.into(),
+            details: None,
         }
+    }
+
+    pub fn with_details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(details);
+        self
     }
 
     pub fn bad_request(error: &'static str, message: impl Into<String>) -> Self {
@@ -245,6 +254,7 @@ impl ApiError {
             status: StatusCode::SERVICE_UNAVAILABLE,
             error: "busy",
             message: "Too many sign-ins are in progress. Try again in a few minutes.".to_string(),
+            details: None,
         }
     }
 
@@ -259,6 +269,7 @@ impl ApiError {
                 error: "provisioning",
                 message: "This sign-in is already being completed. Return to your terminal."
                     .to_string(),
+                details: None,
             },
             crate::ClaimError::Completed => Self::bad_request(
                 "already_completed",
@@ -285,6 +296,7 @@ impl ApiError {
             status,
             error: code,
             message: err.to_string(),
+            details: None,
         }
     }
 }

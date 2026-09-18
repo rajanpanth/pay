@@ -127,12 +127,13 @@ pay-kit = { package = "solana-pay-kit", git = "https://github.com/solana-foundat
     "confidential",
     "testkit",
 ] }
-# Direct dep solely to enable optional signer backends (`openfort`, and
-# `ledger` later) on the solana-keychain instance pay-kit re-exports; the kit
+# Direct dep solely to enable optional signer backends (`openfort`, `privy`,
+# `ledger`) on the solana-keychain instance pay-kit re-exports; the kit
 # does not forward those features. Same git source and rev as the kit's own
 # pin so cargo resolves a single keychain.
 solana-keychain = { version = "2.0.0-beta.1", git = "https://github.com/solana-foundation/solana-keychain", rev = "6461a18cc39d4700d589b1eb981f8ddd71c09e8d", default-features = false, features = [
     "openfort",
+    "privy",
 ] }
 
 # Solana primitives (pinned to versions used by solana-mpp)

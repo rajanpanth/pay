@@ -10,8 +10,11 @@ The hosted half of pay. One axum server, one embedded web app, four jobs:
 - **The MCP connector**: `/mcp` serves the pay tools over streamable HTTP
   to hosts like Grok, Claude and Cursor, behind an OAuth 2.1 authorization
   server this crate implements (`/.well-known/*`, `/oauth/*`).
-- **Tenants**: a connector subject bound to a wallet, its provider
-  credentials and a spending policy. In memory today; Postgres next.
+- **Tenants**: a connector subject bound to a wallet and a spending policy.
+  With Privy configured, the consent page signs the user in with Privy and
+  the user's Privy wallet (pay's key as an additional signer) is the
+  tenant's wallet; pay-cloud then holds only the app's operator
+  credentials, nothing per user.
 
 Everything below runs locally. State is in memory and lost on restart.
 
@@ -36,6 +39,23 @@ Environment: `PAY_CLOUD_MCP=1` mounts `/mcp` and the OAuth server;
 the public URL. `COINFLOW_*` configure funding (see `docs/onramp-coinflow.md`).
 `OPENFORT_BASE_URL` and `OPENFORT_AUTH_PAGE_URL` point the driver at a
 mock or staging.
+
+`PAY_CLOUD_PAGES_URL` moves the consent page to the pay.sh web app
+(`/connect` there, which proxies `/api/oauth/*` and `/api/fund/*` back
+here); unset, the embedded `/authorize` page is used.
+
+Privy login on the consent page needs, from dashboard.privy.io:
+`PRIVY_APP_ID` and `PRIVY_APP_SECRET` (App settings),
+`PRIVY_AUTHORIZATION_PRIVATE_KEY` (a `wallet-auth:…` P-256 private key) and
+`PRIVY_SIGNER_ID` (the key quorum registered for its public key; the
+dashboard's Authorization keys page creates both, or `POST /v1/key_quorums`
+with a locally generated key). Token signatures are checked against the
+app's JWKS, fetched once at startup from auth.privy.io (`PRIVY_JWKS_URL` to
+override, or `PRIVY_VERIFICATION_KEY` for a single PEM). Optional:
+`PRIVY_POLICY_ID` to attach a wallet policy to wallets pay-cloud creates,
+`PRIVY_API_BASE_URL` for a mock. The dashboard must also list the server's
+origin under allowed origins. Put them in the repo-root `.env`; `dev/run.sh`
+loads it.
 
 ## Build the UI
 

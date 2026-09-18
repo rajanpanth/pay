@@ -42,6 +42,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .clone()
         .unwrap_or_else(|| format!("http://{}:{}", args.bind, args.port));
     let state = AppState::new(public_url.clone());
+    let state = match std::env::var("PAY_CLOUD_PAGES_URL")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        Some(pages) => {
+            info!(%pages, "consent page served by the pages app");
+            state.with_pages_url(pages)
+        }
+        None => state,
+    };
     info!(public_url, drivers = ?state.driver_ids(), "wallet drivers");
     #[cfg(feature = "coinflow")]
     let state = match pay_cloud::funding::Config::from_env()? {
@@ -85,6 +96,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!(
                 "MCP connector disabled: set {}=1 to enable",
                 pay_cloud::mcp::ENABLE_ENV
+            );
+            state
+        }
+    };
+    #[cfg(feature = "privy")]
+    let state = match pay_cloud::privy::Config::from_env()? {
+        Some(cfg) => {
+            info!(
+                app_id = %cfg.app_id,
+                signer_id = %cfg.signer_id,
+                policy = cfg.policy_id.as_deref().unwrap_or("none"),
+                api = %cfg.api_base,
+                jwks = %cfg.jwks_url,
+                "Privy login enabled on the consent page"
+            );
+            let privy = pay_cloud::privy::Privy::connect(cfg).await?;
+            info!(keys = privy.key_count(), "Privy verification keys loaded");
+            state.with_privy(privy)
+        }
+        None => {
+            info!(
+                "Privy login disabled: set {} (and the other PRIVY_* variables) to enable",
+                pay_cloud::privy::APP_ID_ENV
             );
             state
         }
