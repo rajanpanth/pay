@@ -35,6 +35,8 @@ pub use onboard::{OnboardSession, SESSION_TTL};
 #[cfg(feature = "coinflow")]
 pub mod funding;
 #[cfg(feature = "mcp")]
+pub mod hosts;
+#[cfg(feature = "mcp")]
 pub mod mcp;
 #[cfg(feature = "mcp")]
 pub mod oauth;
@@ -471,6 +473,7 @@ pub(crate) mod tests {
             for (k, v) in url::form_urlencoded::parse(fragment.trim_start_matches('#').as_bytes()) {
                 match k.as_ref() {
                     "api_key" => grant.api_key = v.into_owned(),
+                    "project_id" => grant.project_id = Some(v.into_owned()),
                     "state" => state = Some(v.into_owned()),
                     _ => {}
                 }
@@ -478,6 +481,13 @@ pub(crate) mod tests {
             let state =
                 state.ok_or_else(|| drivers::DriverError::InvalidGrant("no state".into()))?;
             Ok((grant, state))
+        }
+        fn refresh_credentials(
+            &self,
+            credentials: &mut std::collections::BTreeMap<String, String>,
+            grant: &drivers::ConsentGrant,
+        ) {
+            credentials.insert("secret_key".to_string(), grant.api_key.clone());
         }
         async fn provision(
             &self,

@@ -190,6 +190,16 @@ impl WalletDriver for Openfort {
         url.to_string()
     }
 
+    /// The secret API key comes fresh from each consent; the wallet secret
+    /// registered on the project stays.
+    fn refresh_credentials(
+        &self,
+        credentials: &mut std::collections::BTreeMap<String, String>,
+        grant: &ConsentGrant,
+    ) {
+        credentials.insert(SECRET_KEY_FIELD.to_string(), grant.api_key.clone());
+    }
+
     fn parse_grant(&self, fragment: &str) -> Result<(ConsentGrant, String), Error> {
         parse_consent_fragment(fragment)
     }

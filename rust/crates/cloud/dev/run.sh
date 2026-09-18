@@ -10,6 +10,7 @@
 #   rust/crates/cloud/dev/run.sh --static-token <token>   # header auth + a mock wallet for it
 #   rust/crates/cloud/dev/run.sh --anonymous              # DEV ONLY: no-auth hosts act as that wallet
 #   rust/crates/cloud/dev/run.sh --tunnel --anonymous     # Grok demo: quick tunnel + no-auth mock wallet
+#   rust/crates/cloud/dev/run.sh --funnel --anonymous     # same, on a stable Tailscale Funnel hostname
 #
 # Reads the repo-root .env (Coinflow sandbox settings) when present.
 # Ctrl-C stops everything.
@@ -24,6 +25,7 @@ SKIP_BUILD=0
 STATIC_TOKEN=""
 ANONYMOUS=0
 TUNNEL=0
+FUNNEL=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -34,6 +36,7 @@ while [ $# -gt 0 ]; do
     --static-token) STATIC_TOKEN="$2"; shift 2 ;;
     --anonymous) ANONYMOUS=1; shift ;;
     --tunnel) TUNNEL=1; shift ;;
+    --funnel) FUNNEL=1; shift ;;
     -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
@@ -55,11 +58,22 @@ if [ "$TUNNEL" = 1 ]; then
   cloudflared tunnel --url "http://127.0.0.1:$PORT" > "$TUNNEL_LOG" 2>&1 &
   PIDS+=($!)
   for _ in $(seq 1 40); do
-    PUBLIC_URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" | head -1)"
+    PUBLIC_URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" | head -1 || true)"
     [ -n "$PUBLIC_URL" ] && break
     sleep 1
   done
   [ -n "$PUBLIC_URL" ] || { echo "the tunnel did not report a hostname (see $TUNNEL_LOG)" >&2; exit 1; }
+fi
+
+if [ "$FUNNEL" = 1 ]; then
+  # Tailscale Funnel: a stable HTTPS hostname on the tailnet's domain that
+  # survives restarts, unlike a quick tunnel. Needs `tailscale up` and
+  # Funnel enabled for the tailnet (the command says how if it is not).
+  command -v tailscale >/dev/null || { echo "tailscale not found" >&2; exit 1; }
+  step "Exposing 127.0.0.1:$PORT through Tailscale Funnel"
+  tailscale funnel --bg "$PORT" >/dev/null
+  HOST="$(tailscale status --json | python3 -c 'import sys,json; print(json.load(sys.stdin)["Self"]["DNSName"].rstrip("."))')"
+  PUBLIC_URL="https://$HOST"
 fi
 
 PUBLIC_URL="${PUBLIC_URL:-http://127.0.0.1:$PORT}"
@@ -83,6 +97,11 @@ if [ "$REAL_OPENFORT" = 0 ]; then
   step "Starting mock Openfort on http://127.0.0.1:$MOCK_PORT"
   python3 "$ROOT/rust/crates/cloud/dev/mock_openfort.py" "$MOCK_PORT" &
   PIDS+=($!)
+  # pay-cloud may provision dev wallets against the mock at startup.
+  for _ in $(seq 1 50); do
+    curl -fsS -o /dev/null "http://127.0.0.1:$MOCK_PORT/v2/accounts" 2>/dev/null && break
+    sleep 0.2
+  done
   export OPENFORT_BASE_URL="http://127.0.0.1:$MOCK_PORT"
   export OPENFORT_AUTH_PAGE_URL="http://127.0.0.1:$MOCK_PORT"
 else
@@ -108,8 +127,11 @@ fi
 step "Starting pay-cloud on http://127.0.0.1:$PORT (public URL $PUBLIC_URL)"
 "$ROOT/rust/target/debug/pay-cloud" --port "$PORT" --public-url "$PUBLIC_URL" &
 PIDS+=($!)
-sleep 1
-curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null || { echo "pay-cloud did not start" >&2; exit 1; }
+for _ in $(seq 1 50); do
+  curl -fsS -o /dev/null "http://127.0.0.1:$PORT/health" 2>/dev/null && break
+  sleep 0.2
+done
+curl -fsS -o /dev/null "http://127.0.0.1:$PORT/health" 2>/dev/null || { echo "pay-cloud did not start; its output is above" >&2; exit 1; }
 
 cat <<EOF
 
@@ -132,7 +154,7 @@ $( [ -n "$STATIC_TOKEN" ] && printf '  Header-authenticated host (Grok custom co
   Pages:  $PUBLIC_URL/onboard   $PUBLIC_URL/fund?address=<pubkey>   $PUBLIC_URL/authorize
   OAuth:  $PUBLIC_URL/.well-known/oauth-authorization-server
 
-$( [ "$TUNNEL" = 1 ] && printf '  Grok custom connector URL:  %s/mcp\n  (quick tunnels get a new hostname each start; re-add the connector after a restart)\n' "$PUBLIC_URL" || printf '  For Grok itself you need a public HTTPS URL: rerun with --tunnel (needs cloudflared),\n  or pass --public-url https://<your-host> behind your own proxy.\n' )
+$( if [ "$FUNNEL" = 1 ]; then printf '  Grok custom connector URL:  %s/mcp   (stable: Tailscale Funnel)\n' "$PUBLIC_URL"; elif [ "$TUNNEL" = 1 ]; then printf '  Grok custom connector URL:  %s/mcp\n  (quick tunnels get a new hostname each start; re-add the connector after a restart)\n' "$PUBLIC_URL"; else printf '  For Grok itself you need a public HTTPS URL: rerun with --funnel (Tailscale) or --tunnel (cloudflared),\n  or pass --public-url https://<your-host> behind your own proxy.\n'; fi )
   Ctrl-C stops everything.
 EOF
 

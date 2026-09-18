@@ -51,6 +51,9 @@ pub struct Client {
     pub response_types: Vec<String>,
     pub token_endpoint_auth_method: String,
     pub client_id_issued_at: u64,
+    /// Which known host this is (`grok`, `claude`, …), or `generic`.
+    #[serde(skip)]
+    pub host: &'static str,
     /// SHA-256 of the client secret, for `client_secret_*` clients.
     #[serde(skip)]
     secret_hash: Option<String>,
@@ -102,9 +105,13 @@ struct TokenRecord {
     expires_at: Instant,
 }
 
+/// Time source, so expiry is testable without waiting.
+pub type Clock = std::sync::Arc<dyn Fn() -> Instant + Send + Sync>;
+
 /// Everything the authorization server remembers.
 pub struct Store {
     public_url: String,
+    clock: Clock,
     clients: Mutex<HashMap<String, Client>>,
     pending: Mutex<HashMap<String, PendingAuthorization>>,
     codes: Mutex<HashMap<String, CodeGrant>>,
@@ -175,13 +182,22 @@ fn insert_bounded<V>(
 
 impl Store {
     pub fn new(public_url: &str) -> Self {
+        Self::with_clock(public_url, std::sync::Arc::new(Instant::now))
+    }
+
+    pub fn with_clock(public_url: &str, clock: Clock) -> Self {
         Self {
             public_url: public_url.trim_end_matches('/').to_string(),
+            clock,
             clients: Mutex::default(),
             pending: Mutex::default(),
             codes: Mutex::default(),
             tokens: Mutex::default(),
         }
+    }
+
+    fn now(&self) -> Instant {
+        (self.clock)()
     }
 
     pub fn issuer(&self) -> &str {
@@ -203,9 +219,10 @@ impl Store {
             return Err(invalid("redirect_uris must list at least one URI."));
         }
         for uri in &req.redirect_uris {
-            validate_redirect_uri(uri)
+            crate::hosts::redirect_allowed(uri)
                 .map_err(|why| invalid(&format!("redirect_uri `{uri}`: {why}")))?;
         }
+        let host = crate::hosts::identify(req.client_name.as_deref(), &req.redirect_uris);
         let auth_method = req
             .token_endpoint_auth_method
             .clone()
@@ -244,8 +261,9 @@ impl Store {
             response_types,
             token_endpoint_auth_method: auth_method,
             client_id_issued_at: unix_now(),
+            host: host.id,
             secret_hash: secret.as_deref().map(sha256_hex),
-            created_at: Instant::now(),
+            created_at: self.now(),
         };
         let mut clients = self.clients.lock().unwrap();
         // Clients never expire on their own; when the table is full the
@@ -292,7 +310,7 @@ impl Store {
 
     /// Park a validated authorization request for the consent page.
     pub fn create_pending(&self, request: PendingAuthorization) -> Result<(), ApiError> {
-        let now = Instant::now();
+        let now = self.now();
         let mut pending = self.pending.lock().unwrap();
         if insert_bounded(&mut pending, request.id.clone(), request, |p| {
             now.saturating_duration_since(p.created_at) > REQUEST_TTL
@@ -310,7 +328,7 @@ impl Store {
     pub fn pending(&self, id: &str) -> Option<PendingAuthorization> {
         let pending = self.pending.lock().unwrap();
         let request = pending.get(id)?;
-        (Instant::now().saturating_duration_since(request.created_at) <= REQUEST_TTL)
+        (self.now().saturating_duration_since(request.created_at) <= REQUEST_TTL)
             .then(|| request.clone())
     }
 
@@ -318,7 +336,7 @@ impl Store {
     /// Returns the code, or `None` when the request is unknown or expired.
     pub fn approve(&self, id: &str, subject: &str) -> Option<(PendingAuthorization, String)> {
         let request = self.pending.lock().unwrap().remove(id)?;
-        if Instant::now().saturating_duration_since(request.created_at) > REQUEST_TTL {
+        if self.now().saturating_duration_since(request.created_at) > REQUEST_TTL {
             return None;
         }
         let code = random_token();
@@ -328,9 +346,9 @@ impl Store {
             code_challenge: request.code_challenge.clone(),
             subject: subject.to_string(),
             scope: request.scope.clone(),
-            created_at: Instant::now(),
+            created_at: self.now(),
         };
-        let now = Instant::now();
+        let now = self.now();
         let mut codes = self.codes.lock().unwrap();
         insert_bounded(&mut codes, sha256_hex(&code), grant, |g| {
             now.saturating_duration_since(g.created_at) > CODE_TTL
@@ -360,7 +378,7 @@ impl Store {
             .unwrap()
             .remove(&sha256_hex(code))
             .ok_or_else(|| TokenError::invalid_grant("unknown or already used code"))?;
-        if Instant::now().saturating_duration_since(grant.created_at) > CODE_TTL {
+        if self.now().saturating_duration_since(grant.created_at) > CODE_TTL {
             return Err(TokenError::invalid_grant("the code has expired"));
         }
         if grant.client_id != client_id {
@@ -405,7 +423,7 @@ impl Store {
                 "the token was issued to another client",
             ));
         }
-        if Instant::now() > record.expires_at {
+        if self.now() > record.expires_at {
             return Err(TokenError::invalid_grant("the refresh token has expired"));
         }
         drop(tokens);
@@ -415,7 +433,7 @@ impl Store {
     fn issue(&self, client_id: &str, subject: &str, scope: &str) -> TokenResponse {
         let access_token = random_token();
         let refresh_token = random_token();
-        let now = Instant::now();
+        let now = self.now();
         let mut tokens = self.tokens.lock().unwrap();
         for (token, kind, ttl) in [
             (&access_token, TokenKind::Access, ACCESS_TTL),
@@ -452,30 +470,9 @@ impl Store {
     pub fn authenticate(&self, access_token: &str) -> Option<Tenant> {
         let tokens = self.tokens.lock().unwrap();
         let record = tokens.get(&sha256_hex(access_token))?;
-        (record.kind == TokenKind::Access && Instant::now() <= record.expires_at).then(|| Tenant {
+        (record.kind == TokenKind::Access && self.now() <= record.expires_at).then(|| Tenant {
             id: record.subject.clone(),
         })
-    }
-}
-
-/// `https://` anywhere, or `http://` on loopback (RFC 8252 native apps).
-fn validate_redirect_uri(uri: &str) -> Result<Url, &'static str> {
-    let url = Url::parse(uri).map_err(|_| "not a URL")?;
-    if url.fragment().is_some() {
-        return Err("must not have a fragment");
-    }
-    match url.scheme() {
-        "https" => Ok(url),
-        "http"
-            if matches!(
-                url.host_str(),
-                Some("127.0.0.1") | Some("localhost") | Some("[::1]")
-            ) =>
-        {
-            Ok(url)
-        }
-        "http" => Err("http is only allowed on loopback"),
-        _ => Err("must use https"),
     }
 }
 
@@ -557,6 +554,7 @@ pub async fn register(State(state): State<AppState>, body: Bytes) -> Result<Resp
         client_id = %client.client_id,
         name = client.client_name.as_deref().unwrap_or("-"),
         auth = %client.token_endpoint_auth_method,
+        host = client.host,
         "oauth client registered"
     );
     let mut body = serde_json::to_value(&client).expect("client serializes");
@@ -710,6 +708,8 @@ pub struct PendingView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wallet_address: Option<String>,
     pub providers: Vec<&'static str>,
+    /// Known host id (`grok`, `claude`, …) or `generic`.
+    pub host: &'static str,
 }
 
 /// `GET /api/oauth/authorize/{request}`
@@ -731,12 +731,14 @@ pub async fn pending_view(
     Ok(Json(PendingView {
         client_name: client
             .client_name
-            .unwrap_or_else(|| "An MCP client".to_string()),
+            .clone()
+            .unwrap_or_else(|| crate::hosts::by_id(client.host).display_name.to_string()),
         redirect_host,
         scope: request.scope,
         has_wallet: wallet.is_some(),
         wallet_address: wallet.map(|w| w.pubkey.clone()),
         providers: state.driver_ids(),
+        host: client.host,
     }))
 }
 
@@ -984,6 +986,7 @@ mod tests {
         let (client, secret) = store.register(grok_registration()).unwrap();
         assert!(client.client_id.starts_with("cli_"));
         assert_eq!(client.client_name.as_deref(), Some("Grok"));
+        assert_eq!(client.host, "grok");
         assert_eq!(client.token_endpoint_auth_method, "none");
         assert!(secret.is_none(), "public clients get no secret");
         assert_eq!(
@@ -1145,15 +1148,70 @@ mod tests {
         );
     }
 
+    /// Expiry, driven by a clock the test owns.
     #[test]
-    fn redirect_uri_rules() {
-        assert!(validate_redirect_uri("https://grok.com/cb").is_ok());
-        assert!(validate_redirect_uri("http://localhost:3000/cb").is_ok());
-        assert!(validate_redirect_uri("http://[::1]:3000/cb").is_ok());
-        assert!(validate_redirect_uri("http://grok.com/cb").is_err());
-        assert!(validate_redirect_uri("https://grok.com/cb#frag").is_err());
-        assert!(validate_redirect_uri("grok://cb").is_err());
-        assert!(validate_redirect_uri("nope").is_err());
+    fn everything_expires_on_schedule() {
+        let now = std::sync::Arc::new(Mutex::new(Instant::now()));
+        let clock_now = now.clone();
+        let store = Store::with_clock(
+            "https://cloud.test",
+            std::sync::Arc::new(move || *clock_now.lock().unwrap()),
+        );
+        let advance = |d: Duration| {
+            let mut t = now.lock().unwrap();
+            *t += d;
+        };
+        let (client, _) = store.register(grok_registration()).unwrap();
+        // Requests are stamped from the same clock the store reads.
+        let pending_now = |client: &Client| {
+            let mut request = pending_for(client);
+            request.created_at = *now.lock().unwrap();
+            request
+        };
+
+        // A pending request outlives nothing past REQUEST_TTL.
+        let request = pending_now(&client);
+        store.create_pending(request.clone()).unwrap();
+        advance(REQUEST_TTL + Duration::from_secs(1));
+        assert!(store.pending(&request.id).is_none());
+        assert!(store.approve(&request.id, "sub").is_none());
+
+        // A code dies after CODE_TTL.
+        let request = pending_now(&client);
+        store.create_pending(request.clone()).unwrap();
+        let (_, code) = store.approve(&request.id, "sub_1").unwrap();
+        advance(CODE_TTL + Duration::from_secs(1));
+        assert_eq!(
+            store
+                .exchange_code(&client.client_id, &code, VERIFIER, None)
+                .unwrap_err()
+                .description,
+            "the code has expired"
+        );
+
+        // An access token dies after ACCESS_TTL, the refresh token after
+        // REFRESH_TTL.
+        let request = pending_now(&client);
+        store.create_pending(request.clone()).unwrap();
+        let (_, code) = store.approve(&request.id, "sub_1").unwrap();
+        let tokens = store
+            .exchange_code(&client.client_id, &code, VERIFIER, None)
+            .unwrap();
+        advance(ACCESS_TTL - Duration::from_secs(1));
+        assert!(store.authenticate(&tokens.access_token).is_some());
+        advance(Duration::from_secs(2));
+        assert!(store.authenticate(&tokens.access_token).is_none());
+        let rotated = store
+            .refresh(&client.client_id, &tokens.refresh_token)
+            .unwrap();
+        advance(REFRESH_TTL + Duration::from_secs(1));
+        assert_eq!(
+            store
+                .refresh(&client.client_id, &rotated.refresh_token)
+                .unwrap_err()
+                .description,
+            "the refresh token has expired"
+        );
     }
 
     // ── HTTP: the flow a host like Grok drives ─────────────────────────
@@ -1596,6 +1654,112 @@ mod tests {
         )
         .await;
         assert_eq!(after.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Start an authorization for `client_id` and return the pending id.
+    async fn start_authorization(app: &Router, client_id: &str, cookie: Option<&str>) -> String {
+        let reply = get_as(app, &authorize_path(client_id, &[]), cookie).await;
+        assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+        reply.query("request").unwrap()
+    }
+
+    /// Complete the provider hop for `request_id` as a fresh browser.
+    async fn complete_with_provider(app: &Router, request_id: &str, fragment: &str) -> Reply {
+        let started = post_json(
+            app,
+            "/api/onboard/start",
+            json!({ "provider": "fake", "authorization_request": request_id }),
+        )
+        .await;
+        assert_eq!(started.status, StatusCode::OK, "{}", started.body);
+        post_json(
+            app,
+            "/api/onboard/fake/complete",
+            json!({ "fragment": fragment }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_returning_provider_account_gets_its_wallet_back_without_a_cookie() {
+        let state = AppState::with_drivers(
+            "https://cloud.test",
+            vec![Box::new(crate::tests::FakeDriver)],
+        )
+        .with_mcp(crate::mcp::Config::new("https://cloud.test", vec![]));
+        let app = crate::router(state.clone());
+        let client_id = register_grok(&app).await;
+
+        // First sign-in from one browser: a wallet is created for project pro_1.
+        let first_request = start_authorization(&app, &client_id, None).await;
+        let first = complete_with_provider(
+            &app,
+            &first_request,
+            &format!("#api_key=sk_one&project_id=pro_1&state={first_request}"),
+        )
+        .await;
+        assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+        let first_cookie = cookie_of(&first);
+        assert_eq!(state.tenants().len(), 1);
+
+        // Second sign-in, a different browser (no cookie), the same provider
+        // account with a rotated key: same wallet, no second tenant, the
+        // key refreshed, and the new browser gets the same subject cookie.
+        let second_request = start_authorization(&app, &client_id, None).await;
+        let second = complete_with_provider(
+            &app,
+            &second_request,
+            &format!("#api_key=sk_rotated&project_id=pro_1&state={second_request}"),
+        )
+        .await;
+        assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+        assert_eq!(second.json()["address"], first.json()["address"]);
+        assert_eq!(cookie_of(&second), first_cookie, "same subject");
+        assert_eq!(state.tenants().len(), 1, "no second wallet");
+        let subject = first_cookie.trim_start_matches("pay_subject=");
+        assert_eq!(
+            state.tenants().get(subject).unwrap().credentials["secret_key"],
+            "sk_rotated"
+        );
+
+        // A different provider account is a different tenant.
+        let third_request = start_authorization(&app, &client_id, None).await;
+        let third = complete_with_provider(
+            &app,
+            &third_request,
+            &format!("#api_key=sk_two&project_id=pro_2&state={third_request}"),
+        )
+        .await;
+        assert_eq!(third.status, StatusCode::OK, "{}", third.body);
+        assert_ne!(cookie_of(&third), first_cookie);
+        assert_eq!(state.tenants().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_forged_or_stale_cookie_grants_nothing() {
+        let app = app();
+        let client_id = register_grok(&app).await;
+        let request_id =
+            start_authorization(&app, &client_id, Some("pay_subject=sub_forged")).await;
+        let view = get_as(
+            &app,
+            &format!("/api/oauth/authorize/{request_id}"),
+            Some("pay_subject=sub_forged"),
+        )
+        .await;
+        assert_eq!(view.json()["has_wallet"], false, "{}", view.body);
+        let approved = post_json_as(
+            &app,
+            &format!("/api/oauth/authorize/{request_id}/approve"),
+            json!({}),
+            Some("pay_subject=sub_forged"),
+        )
+        .await;
+        assert_eq!(approved.status, StatusCode::CONFLICT, "{}", approved.body);
+        assert_eq!(approved.json()["error"], "no_wallet");
+        // Nothing was minted for the forged subject.
+        let (status, _) = (approved.status, ());
+        assert_ne!(status, StatusCode::OK);
     }
 
     #[tokio::test]

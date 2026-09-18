@@ -62,6 +62,25 @@ Done on `feat/pay-cloud`:
     in-band login where a tool hands out a link and the returned session is
     bound to a tenant, which needs Grok to keep a session across calls.
     The header names Grok sends are being logged to find any handle.
+- **Identity and hosts (2026-09-17).** A tenant's subject is now derived
+  from the provider account (`sha256(provider:project_id)`), not minted at
+  random: a user who signs in to the same Openfort project from any browser
+  gets the same wallet back, no second wallet is provisioned, a rotated API
+  key is carried into the stored credentials (`WalletDriver::
+  refresh_credentials`), and the `pay_subject` cookie is only a shortcut
+  to that subject. A forged cookie names no tenant and is refused. The
+  OAuth store takes a clock, and expiry of requests, codes, access and
+  refresh tokens is tested on schedule.
+
+  `hosts.rs` is the registry of MCP hosts as OAuth clients: Grok, Claude,
+  ChatGPT/Codex, Cursor, Claude Code, Codex CLI, each with the redirect
+  URIs it registers (exact HTTPS callbacks, per-connector prefixes,
+  loopback paths, or a custom scheme such as `cursor://`) and observed
+  quirks (dynamic registration, static header, whether OAuth completes).
+  The redirect policy follows from it: HTTPS anywhere, HTTP on loopback,
+  custom schemes only for a known host. Registrations record the host, and
+  the consent page names it. Adding a host is one entry; the OAuth server
+  itself has no per-host branches.
 - Not yet: persisting tenants and OAuth state (Postgres, credentials
   encrypted at rest with a KEK from Secret Manager), a `/connect` page for
   limits and revocation, Redis MCP sessions, funding from inside the

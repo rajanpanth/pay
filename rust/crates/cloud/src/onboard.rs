@@ -594,6 +594,17 @@ pub async fn complete(
     let session = state
         .claim_provisioning(&echoed_state, driver.id())
         .map_err(ApiError::from_claim)?;
+
+    // A connector user who already has a wallet under this provider account
+    // gets it back, whatever browser they are in: no second wallet.
+    #[cfg(feature = "mcp")]
+    if let Some(authorization) = session.authorization.as_deref()
+        && let Some(existing) = returning_tenant(&state, driver, &grant)
+    {
+        state.take_session(&session.code);
+        return complete_for_returning_connector(&state, authorization, driver, &grant, existing);
+    }
+
     let wallet = match driver.provision(&grant).await {
         Ok(wallet) => wallet,
         Err(err) => {
@@ -605,7 +616,14 @@ pub async fn complete(
     tracing::info!(provider = driver.id(), address = %address, "wallet provisioned");
 
     if let Some(authorization) = session.authorization.as_deref() {
-        return complete_for_connector(&state, &echoed_state, authorization, driver.id(), wallet);
+        return complete_for_connector(
+            &state,
+            &echoed_state,
+            authorization,
+            driver,
+            &grant,
+            wallet,
+        );
     }
 
     let redirect = session.redirect_url();
@@ -621,19 +639,86 @@ pub async fn complete(
     .into_response())
 }
 
-/// Connector origin of a completion: the wallet becomes a tenant for a new
-/// subject, the pending authorization is approved for that subject, and
-/// the browser learns its subject so the next client reuses the wallet.
+/// The tenant already bound to the provider account this grant belongs to.
+#[cfg(feature = "mcp")]
+fn returning_tenant(
+    state: &AppState,
+    driver: &dyn crate::drivers::WalletDriver,
+    grant: &crate::drivers::ConsentGrant,
+) -> Option<std::sync::Arc<crate::tenants::TenantRecord>> {
+    #[cfg(feature = "mcp")]
+    {
+        let identity = driver.account_identity(grant)?;
+        state
+            .tenants()
+            .get(&crate::tenants::subject_for(driver.id(), &identity))
+    }
+}
+
+/// A returning connector user: approve for the existing subject, carry a
+/// rotated key into the stored credentials, and refresh the browser cookie.
+#[cfg(feature = "mcp")]
+fn complete_for_returning_connector(
+    state: &AppState,
+    authorization: &str,
+    driver: &dyn crate::drivers::WalletDriver,
+    grant: &crate::drivers::ConsentGrant,
+    existing: std::sync::Arc<crate::tenants::TenantRecord>,
+) -> Result<Response, ApiError> {
+    #[cfg(feature = "mcp")]
+    {
+        use crate::tenants::cookie;
+        let oauth = state.oauth().ok_or_else(|| {
+            ApiError::bad_request("connector_disabled", "This server has no MCP connector.")
+        })?;
+        state
+            .tenants()
+            .update_credentials(&existing.subject, |c| driver.refresh_credentials(c, grant));
+        let (request, code) = oauth.approve(authorization, &existing.subject).ok_or_else(|| {
+            ApiError::bad_request(
+                "unknown_request",
+                "The sign-in request expired while you signed in. Start again from your MCP client.",
+            )
+        })?;
+        tracing::info!(
+            subject = %existing.subject,
+            client_id = %request.client_id,
+            address = %existing.pubkey,
+            "connector tenant recognised, wallet reused"
+        );
+        let mut response = Json(CompleteResponse {
+            origin: "connector",
+            redirect: crate::oauth::code_redirect(&request, &code),
+            provider: driver.id().to_string(),
+            address: existing.pubkey.clone(),
+        })
+        .into_response();
+        response.headers_mut().insert(
+            axum::http::header::SET_COOKIE,
+            cookie::set(
+                &existing.subject,
+                state.public_url().starts_with("https://"),
+            ),
+        );
+        Ok(response)
+    }
+}
+
+/// Connector origin of a completion: the wallet becomes a tenant for the
+/// provider account's subject, the pending authorization is approved for
+/// that subject, and the browser learns its subject so the next client
+/// reuses the wallet without a provider round-trip.
 fn complete_for_connector(
     state: &AppState,
     echoed_state: &str,
     authorization: &str,
-    provider_id: &str,
+    driver: &dyn crate::drivers::WalletDriver,
+    grant: &crate::drivers::ConsentGrant,
     wallet: ProvisionedWallet,
 ) -> Result<Response, ApiError> {
     #[cfg(not(feature = "mcp"))]
     {
-        let _ = (state, echoed_state, authorization, provider_id, wallet);
+        let _ = (state, echoed_state, authorization, driver, grant, wallet);
         Err(ApiError::bad_request(
             "connector_disabled",
             "This server has no MCP connector.",
@@ -646,7 +731,12 @@ fn complete_for_connector(
             ApiError::bad_request("connector_disabled", "This server has no MCP connector.")
         })?;
         let address = wallet.address.clone();
-        let subject = format!("sub_{}", random_token());
+        // Stable per provider account; a grant with no account identity
+        // (a provider that has none) falls back to this wallet's address.
+        let subject = match driver.account_identity(grant) {
+            Some(identity) => crate::tenants::subject_for(driver.id(), &identity),
+            None => crate::tenants::subject_for(driver.id(), &format!("wallet:{address}")),
+        };
         let record = TenantRecord::from_wallet(&subject, &wallet);
         if !state.attach_wallet(echoed_state, wallet) {
             return Err(ApiError::invalid_grant());
@@ -663,7 +753,7 @@ fn complete_for_connector(
         let mut response = Json(CompleteResponse {
             origin: "connector",
             redirect,
-            provider: provider_id.to_string(),
+            provider: driver.id().to_string(),
             address,
         })
         .into_response();

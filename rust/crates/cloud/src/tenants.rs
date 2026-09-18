@@ -30,6 +30,16 @@ pub const DEFAULT_POLICY: SpendPolicy = SpendPolicy {
 /// Account name a connector wallet carries in prompts and receipts.
 pub const CONNECTOR_ACCOUNT: &str = "connector";
 
+/// The subject for a provider account: stable across sign-ins and
+/// browsers, opaque, and not reversible to the provider's id. This is the
+/// identity a tenant hangs on; the browser cookie is only a shortcut to it.
+pub fn subject_for(provider_id: &str, account_identity: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("{provider_id}:{account_identity}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sub_{}", &hex[..32])
+}
+
 /// One tenant's wallet and rules.
 #[derive(Clone)]
 pub struct TenantRecord {
@@ -119,6 +129,22 @@ impl TenantRegistry {
 
     pub fn remove(&self, subject: &str) -> Option<Arc<TenantRecord>> {
         self.tenants.lock().unwrap().remove(subject)
+    }
+
+    /// Replace a tenant's credentials in place (a returning user's rotated
+    /// key). `None` when the subject is unknown.
+    pub fn update_credentials(
+        &self,
+        subject: &str,
+        update: impl FnOnce(&mut Credentials),
+    ) -> Option<Arc<TenantRecord>> {
+        let mut tenants = self.tenants.lock().unwrap();
+        let current = tenants.get(subject)?;
+        let mut record = (**current).clone();
+        update(&mut record.credentials);
+        let record = Arc::new(record);
+        tenants.insert(subject.to_string(), record.clone());
+        Some(record)
     }
 
     pub fn len(&self) -> usize {
@@ -323,6 +349,37 @@ mod tests {
         none.insert(header::COOKIE, "theme=dark".parse().unwrap());
         assert_eq!(cookie::subject(&none), None);
         assert_eq!(cookie::subject(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn subjects_are_stable_opaque_and_provider_scoped() {
+        let a = subject_for("openfort", "pro_123");
+        assert_eq!(a, subject_for("openfort", "pro_123"));
+        assert_ne!(a, subject_for("openfort", "pro_124"));
+        assert_ne!(a, subject_for("circle", "pro_123"));
+        assert!(a.starts_with("sub_") && a.len() == 36, "{a}");
+        assert!(!a.contains("pro_123"));
+    }
+
+    #[test]
+    fn credentials_can_be_refreshed_in_place() {
+        let registry = TenantRegistry::new();
+        registry.bind(record("sub_1"));
+        let updated = registry
+            .update_credentials("sub_1", |c| {
+                c.insert("secret_key".to_string(), "sk_rotated".to_string());
+            })
+            .unwrap();
+        assert_eq!(updated.credentials["secret_key"], "sk_rotated");
+        assert_eq!(
+            updated.credentials["wallet_secret"], "ws",
+            "untouched fields stay"
+        );
+        assert_eq!(
+            registry.get("sub_1").unwrap().credentials["secret_key"],
+            "sk_rotated"
+        );
+        assert!(registry.update_credentials("sub_x", |_| {}).is_none());
     }
 
     #[test]
