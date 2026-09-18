@@ -840,10 +840,10 @@ pub async fn approve(
         .and_then(|v| v.trim().strip_prefix("Bearer "))
         .map(str::trim)
         .filter(|t| !t.is_empty());
-    let (subject, fresh_login, new_wallet) = match bearer {
+    let (subject, fresh_login, bound) = match bearer {
         Some(token) => {
-            let (subject, new_wallet) = approve_with_privy(&state, token).await?;
-            (subject, true, new_wallet)
+            let (subject, bound) = approve_with_privy(&state, token).await?;
+            (subject, true, bound)
         }
         None => (
             crate::tenants::cookie::subject(&headers)
@@ -856,22 +856,31 @@ pub async fn approve(
                     )
                 })?,
             false,
-            false,
+            None,
         ),
     };
     let cookie = fresh_login
         .then(|| crate::tenants::cookie::set(&subject, state.public_url().starts_with("https://")));
-    // A wallet created seconds ago holds nothing. When card purchases are
-    // on, send the browser to fund it first; the request stays pending and
-    // the funding page approves it by cookie when the user is done.
-    if new_wallet && funding_enabled(&state) {
+    // A tenant bound just now with nothing to pay with: a wallet created
+    // seconds ago, or an existing one holding no stablecoin. When card
+    // purchases are on, send the browser to fund it first; the request
+    // stays pending and the funding page approves it by cookie when the
+    // user is done.
+    let needs_funding = match bound {
+        Some(Bound::Created) => funding_enabled(&state),
+        Some(Bound::Existing { address }) => {
+            funding_enabled(&state) && wallet_is_empty(&address).await
+        }
+        None => false,
+    };
+    if needs_funding {
         store.pending(&id).ok_or_else(unknown_request)?;
         let address = state
             .tenants()
             .get(&subject)
             .map(|t| t.pubkey.clone())
             .ok_or_else(unknown_request)?;
-        tracing::info!(%subject, %address, "new wallet: funding before approval");
+        tracing::info!(%subject, %address, "empty wallet: funding before approval");
         let mut response = Json(DecisionResponse {
             redirect: None,
             fund: Some(FundNext {
@@ -908,13 +917,49 @@ fn funding_enabled(_state: &AppState) -> bool {
     false
 }
 
-/// A Privy access token → a bound tenant subject, and whether its wallet
-/// was created just now. Verifies the token, then binds the user's Solana
-/// wallet on first sight. A wallet pay's key cannot sign for is reported
-/// as `signer_required` with what the page needs to add the signer
+/// How a Privy sign-in bound its tenant, when it did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Bound {
+    /// The wallet was created just now; it holds nothing.
+    Created,
+    /// An existing Privy wallet was bound for the first time on this server.
+    Existing { address: String },
+}
+
+/// Whether a mainnet wallet holds no stablecoin at all. Best effort: when
+/// the lookup fails or times out, the wallet is treated as funded so a
+/// balance service outage never inserts a detour.
+async fn wallet_is_empty(address: &str) -> bool {
+    let rpc = pay_core::client::subscription::default_rpc_url_for_network(
+        pay_core::accounts::MAINNET_NETWORK,
+    );
+    let lookup = pay_core::client::balance::get_stablecoin_balances(&rpc, address);
+    match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
+        Ok(Ok(balances)) => {
+            !balances.tokens_unavailable && balances.tokens.iter().all(|t| t.raw_amount == 0)
+        }
+        Ok(Err(e)) => {
+            tracing::info!(%address, error = %e, "balance lookup failed; skipping funding detour");
+            false
+        }
+        Err(_) => {
+            tracing::info!(%address, "balance lookup timed out; skipping funding detour");
+            false
+        }
+    }
+}
+
+/// A Privy access token → a bound tenant subject, and how the tenant was
+/// bound when this sign-in did it (`None` for a tenant already known).
+/// Verifies the token, then binds the user's Solana wallet on first
+/// sight. A wallet pay's key cannot sign for is reported as
+/// `signer_required` with what the page needs to add the signer
 /// client-side.
 #[cfg(feature = "privy")]
-async fn approve_with_privy(state: &AppState, token: &str) -> Result<(String, bool), ApiError> {
+async fn approve_with_privy(
+    state: &AppState,
+    token: &str,
+) -> Result<(String, Option<Bound>), ApiError> {
     let privy = state.privy().ok_or_else(|| {
         ApiError::bad_request(
             "login_unavailable",
@@ -930,12 +975,17 @@ async fn approve_with_privy(state: &AppState, token: &str) -> Result<(String, bo
         )
     })?;
     let subject = crate::privy::subject_for_user(&identity.user_id);
-    let mut created = false;
+    let mut bound = None;
     if state.tenants().get(&subject).is_none() {
         let wallet = match privy.solana_wallet(&identity.user_id).await {
-            Ok(Some(existing)) => Ok(existing),
+            Ok(Some(existing)) => {
+                bound = Some(Bound::Existing {
+                    address: existing.address.clone(),
+                });
+                Ok(existing)
+            }
             Ok(None) => {
-                created = true;
+                bound = Some(Bound::Created);
                 privy.create_wallet(&identity.user_id).await
             }
             Err(e) => Err(e),
@@ -959,14 +1009,17 @@ async fn approve_with_privy(state: &AppState, token: &str) -> Result<(String, bo
                 "policy_id": privy.policy_id(),
             })));
         }
-        tracing::info!(%subject, address = %wallet.address, created, "privy tenant bound");
+        tracing::info!(%subject, address = %wallet.address, ?bound, "privy tenant bound");
         state.tenants().bind(privy.tenant_record(&subject, &wallet));
     }
-    Ok((subject, created))
+    Ok((subject, bound))
 }
 
 #[cfg(not(feature = "privy"))]
-async fn approve_with_privy(_state: &AppState, _token: &str) -> Result<(String, bool), ApiError> {
+async fn approve_with_privy(
+    _state: &AppState,
+    _token: &str,
+) -> Result<(String, Option<Bound>), ApiError> {
     Err(ApiError::bad_request(
         "login_unavailable",
         "This server does not offer Privy login.",
